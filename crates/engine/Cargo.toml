@@ -1,0 +1,8 @@
+[package]
+name = "clrecoder-engine"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder 键盘统计纯函数状态机"
+
+[dependencies]
+clrecoder-core = { path = "../core" }

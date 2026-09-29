@@ -1,0 +1,28 @@
+[package]
+name = "clrecoder-collector"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder 提权采集进程：raw_input/gamepad/apps → aggregator → store；pipe 服务端；selftest"
+
+# 进程名必须是 cl-recoder-collector.exe（PLAN §2.1/§8-S13 bundle.resources 锚定此名）。
+[[bin]]
+name = "cl-recoder-collector"
+path = "src/main.rs"
+
+[dependencies]
+clrecoder-core = { path = "../core" }
+clrecoder-engine = { path = "../engine" }
+clrecoder-store = { path = "../store" }
+# Win32_System_IO：windows 0.62 中所有带 OVERLAPPED 参数的 API（含命名管道必需的
+# ReadFile/WriteFile/ConnectNamedPipe，S8 §4.4）被该 feature 门控，白名单内的
+# Win32_System_Pipes/Win32_Storage_FileSystem 本身不够。
+windows = { workspace = true, features = ["Win32_System_IO", "Win32_System_Console"] }
+# serde_json（白名单内，§9.1）：NDJSON 一行请求/一行响应的编解码（S8 §4.4）。
+serde_json = { workspace = true }
+gilrs = { workspace = true }
+crossbeam-channel = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

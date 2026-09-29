@@ -1,0 +1,12 @@
+[package]
+name = "clrecoder-core"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder 跨进程共享契约：code 空间、事件、IPC 协议、Qt 键码、日期工具"
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,24 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 前端
+node_modules/
+ui/dist/
+*.tsbuildinfo
+
+# Tauri 生成物（capabilities schema 等）
+/src-tauri/gen/
+
+# 日志与临时文件
+*.log
+*.tmp
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 本地工作流草稿
+.zcode/

@@ -1,0 +1,13 @@
+[package]
+name = "clrecoder-store"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder SQLite schema/迁移与全部读写 SQL 的唯一归属"
+
+[dependencies]
+clrecoder-core = { path = "../core" }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

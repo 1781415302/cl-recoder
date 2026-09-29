@@ -1,0 +1,23 @@
+[package]
+name = "cl-recoder"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder GUI 进程（Tauri v2，中完整性）：托盘与窗口、全部 commands、导入/导出"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-single-instance = { workspace = true }
+tauri-plugin-autostart = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+windows = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+clrecoder-core = { path = "../crates/core" }
+clrecoder-store = { path = "../crates/store" }

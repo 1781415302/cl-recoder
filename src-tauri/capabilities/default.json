@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "CL Recoder 主窗口默认权限（S1 最小接线；S10/S12 按 commands 需要扩充）",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "autostart:default"
+  ]
+}

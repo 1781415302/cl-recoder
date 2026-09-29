@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CL Recoder",
+  "version": "0.1.0",
+  "identifier": "com.clrecoder.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CL Recoder",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 960,
+        "minHeight": 600,
+        "center": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "../target/release/cl-recoder-collector.exe": "cl-recoder-collector.exe",
+      "../scripts/install-collector-task.ps1": "scripts/install-collector-task.ps1",
+      "../scripts/uninstall-collector-task.ps1": "scripts/uninstall-collector-task.ps1",
+      "../scripts/check-task.ps1": "scripts/check-task.ps1"
+    }
+  }
+}

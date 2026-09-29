@@ -1,0 +1,58 @@
+# CL Recoder 工作区（PLAN §3/§8-S1）
+# 依赖白名单见 [workspace.dependencies]——一次性锁定（PLAN §9.1），后续 stage 不再改动。
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/engine",
+    "crates/store",
+    "crates/collector",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# release 适度优化：thin LTO + 单 codegen unit + 剥离符号。
+# 注意：不设 panic="abort"——PLAN §9.4 要求采集线程 catch_unwind 兜底，必须保留 unwind。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[workspace.dependencies]
+# —— PLAN §9.1 白名单（版本已对照 crates.io 核实，2026-09-28）——
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+crossbeam-channel = "0.5"
+regex = "1"
+dirs = "6"
+rusqlite = { version = "0.40", features = ["bundled"] }
+gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+# —— PLAN §9.2 明示授权的可选项（错误类型细化 / 日志选型），随 S1 一并锁定 ——
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
