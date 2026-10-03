@@ -14,15 +14,23 @@ export function fmtCompact(n: number): string {
   }).format(n);
 }
 
-/** 秒 → "3 小时 24 分" / "12 分 30 秒" / "45 秒" */
+/** 秒 → 完整非零单位时长（§4.7，天→小时→分→秒，单位内零值跳过）：
+ * 90061 → "1天1小时1分1秒"、3661 → "1小时1分1秒"、60 → "1分"；
+ * 0/负数/非法非有限值 → "0秒"，非整数向下取整。
+ * 仍接收秒数值；表格 value 保持数值，仅 render/排行文字、title、aria 使用本函数，
+ * SQL 排序与导出不受影响（ImportReport.durationMs 等毫秒场景不用本函数）。 */
 export function fmtDuration(totalSeconds: number): string {
-  const s = Math.max(0, Math.round(totalSeconds));
-  const h = Math.floor(s / 3600);
+  const s = Number.isFinite(totalSeconds) ? Math.max(0, Math.floor(totalSeconds)) : 0;
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  if (h > 0) return `${h} 小时 ${m} 分`;
-  if (m > 0) return `${m} 分 ${sec} 秒`;
-  return `${sec} 秒`;
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}天`);
+  if (h > 0) parts.push(`${h}小时`);
+  if (m > 0) parts.push(`${m}分`);
+  if (sec > 0) parts.push(`${sec}秒`);
+  return parts.length > 0 ? parts.join("") : "0秒";
 }
 
 /** "YYYY-MM-DD" → 本地 Date（避免 UTC 解析偏移一天） */

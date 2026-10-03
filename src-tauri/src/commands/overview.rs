@@ -15,7 +15,8 @@ pub struct OverviewDto {
     pub days: Vec<DayDto>,
     /// `to` 日按设备种类拆分（前端当"今日"）
     pub today: TodayDto,
-    /// 设备列表（lifetime total）
+    /// 设备列表（total 为所选 `[from, to]` 区间总量，usability-runtime-v3 §4.6；
+    /// lifetime 口径见 get_devices 的 DeviceRow.total）
     pub devices: Vec<OverviewDeviceDto>,
 }
 
@@ -51,7 +52,8 @@ pub struct OverviewDeviceDto {
     pub kind: DeviceKind,
     /// 显示名
     pub name: String,
-    /// lifetime 总计数
+    /// 所选闭区间 `[from, to]` 总计数（usability-runtime-v3 §4.6：非 lifetime，
+    /// 与 days 同口径；区间内零输入的设备仍列出且为 0）
     pub total: u64,
 }
 
@@ -156,8 +158,74 @@ mod tests {
         let js = serde_json::to_string(&dto).unwrap();
         assert!(js.contains(r#""days":[{"day":"2026-09-28","total":8}]"#), "{js}");
         assert!(js.contains(r#""today":{"keys":5,"clicks":3,"gamepad":0}"#), "{js}");
-        // devices 是 lifetime total（键盘 5、鼠标 3），与 days 的 8（合计）不同口径
+        // devices total 是所选区间总量（§4.6；本例范围覆盖全部数据，数值与 lifetime 相同），
+        // 按 id 升序（键盘 5、鼠标 3），与 days 的 8（全种类当日合计）口径不同
         assert!(js.contains(r#""devices":[{"id":1,"kind":"keyboard","name":"测试键盘","total":5},"#), "{js}");
         assert!(js.contains(r#"{"id":2,"kind":"mouse","name":"测试鼠标","total":3}]"#), "{js}");
+    }
+
+    /// §4.6（usability-runtime-v3）：Overview.devices.total 为所选闭区间 SUM——
+    /// 昨天 100 / 今天 2 / 多日 102；区间内零输入设备仍在场且 total=0（日期条件在 ON）；
+    /// today 仍为 to 日拆分；camelCase 线形状不变。
+    #[test]
+    fn usability_v3_overview_devices_total_is_range_sum_wire_shape_unchanged() {
+        let f = TempFile::new("overview-range", "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        let kb = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0x04D9,
+                pid: 0x0169,
+                name: "测试键盘".into(),
+            })
+            .unwrap();
+        let ms = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 1,
+                pid: 2,
+                name: "测试鼠标".into(),
+            })
+            .unwrap();
+        w.flush(&FlushBatch {
+            input: vec![
+                (kb, "2026-09-27".into(), 0x1E, 100), // 昨天
+                (kb, "2026-09-28".into(), 0x1E, 2),   // 今天
+                (ms, "2026-09-27".into(), 1, 50),     // 鼠标只有昨天
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        drop(w);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+
+        // 多日闭区间：键盘 102（100+2）、鼠标 50
+        let multi = query_overview(&conn, "2026-09-27", "2026-09-28").unwrap();
+        assert_eq!(
+            multi.days.iter().map(|d| (d.day.as_str(), d.total)).collect::<Vec<_>>(),
+            vec![("2026-09-27", 150), ("2026-09-28", 2)]
+        );
+        assert_eq!(multi.devices.len(), 2);
+        assert_eq!((multi.devices[0].id, multi.devices[0].total), (kb, 102));
+        assert_eq!((multi.devices[1].id, multi.devices[1].total), (ms, 50));
+        // today 仍为 to 日拆分：今天只有键盘 2
+        assert_eq!((multi.today.keys, multi.today.clicks, multi.today.gamepad), (2, 0, 0));
+
+        // 单日区间 [今天, 今天]：今天零输入的鼠标不得被过滤，total=0
+        let today_only = query_overview(&conn, "2026-09-28", "2026-09-28").unwrap();
+        assert_eq!(today_only.devices.len(), 2, "区间内零输入设备不得被日期条件过滤掉");
+        assert_eq!((today_only.devices[0].total, today_only.devices[1].total), (2, 0));
+
+        // camelCase 线形状逐字不变（total=102 为区间值）
+        let js = serde_json::to_string(&multi).unwrap();
+        assert!(
+            js.contains(r#""devices":[{"id":1,"kind":"keyboard","name":"测试键盘","total":102},"#),
+            "{js}"
+        );
+        assert!(js.contains(r#"{"id":2,"kind":"mouse","name":"测试鼠标","total":50}]"#), "{js}");
     }
 }

@@ -12,6 +12,7 @@ import type {
   CollectorStatus,
   ComboRowLabeled,
   DeviceRow,
+  DiagnosticsInfo,
   ExportReport,
   ImportReport,
   KeyDailyRowLabeled,
@@ -19,6 +20,7 @@ import type {
   Overview,
   Settings,
   SettingsPatch,
+  TaskPolicy,
   TopKeyRow,
   WpAppRow,
   WpComboRow,
@@ -108,12 +110,12 @@ export function getWpMouse(from: string, to: string): Promise<WpMouseRow[]> {
 
 /** get_wp_mouse_buttons(from, to, limit) -> Vec<WpMouseButtonRow> */
 export function getWpMouseButtons(from: string, to: string, limit: number): Promise<WpMouseButtonRow[]> {
-  return call("get_wp_mouse_buttons", { from, to, limit }, () => mock.mockWpMouseButtons(limit));
+  return call("get_wp_mouse_buttons", { from, to, limit }, () => mock.mockWpMouseButtons(from, to, limit));
 }
 
 /** get_wp_mouse_scrolls(from, to, limit) -> Vec<WpMouseScrollRow> */
 export function getWpMouseScrolls(from: string, to: string, limit: number): Promise<WpMouseScrollRow[]> {
-  return call("get_wp_mouse_scrolls", { from, to, limit }, () => mock.mockWpMouseScrolls(limit));
+  return call("get_wp_mouse_scrolls", { from, to, limit }, () => mock.mockWpMouseScrolls(from, to, limit));
 }
 
 /* ===== 动作类（§4.7 逐字对齐） ===== */
@@ -168,6 +170,26 @@ export function collectorAutostartDisable(): Promise<void> {
 /** collector_start_now() -> Result<(), String> */
 export function collectorStartNow(): Promise<void> {
   return call("collector_start_now", undefined, () => mock.mockStartNow());
+}
+
+/** collector_autostart_repair() -> Result<(), String>（S2 §4.3：修复既有任务三项策略，一次 UAC） */
+export function collectorAutostartRepair(): Promise<void> {
+  return call("collector_autostart_repair", undefined, () => mock.mockAutostartRepair());
+}
+
+/** get_collector_task_policy() -> TaskPolicy（S2 §4.3：只读三项策略，仅 Settings 活动时查询） */
+export function getCollectorTaskPolicy(): Promise<TaskPolicy> {
+  return call("get_collector_task_policy", undefined, () => mock.mockTaskPolicy());
+}
+
+/** get_diagnostics_info() -> DiagnosticsInfo（S1 §4.1：GUI sink 日志状态） */
+export function getDiagnosticsInfo(): Promise<DiagnosticsInfo> {
+  return call("get_diagnostics_info", undefined, () => mock.mockDiagnosticsInfo());
+}
+
+/** open_diagnostics_directory() -> Result<(), String>（S1 §4.1：打开后端固定的日志目录） */
+export function openDiagnosticsDirectory(): Promise<void> {
+  return call("open_diagnostics_directory", undefined, () => mock.mockOpenDiagnosticsDirectory());
 }
 
 /** get_settings() -> Settings */

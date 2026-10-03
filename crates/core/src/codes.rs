@@ -62,13 +62,13 @@ pub enum GamepadButton {
     North = 3,
     /// 西（X / 方块）
     West = 4,
-    /// 左Trigger（LT，模拟量上穿 0.33 计 1 次）
+    /// 左肩（LB；gilrs 枚举名 LeftTrigger 在 XInput 后端映射的是物理肩键，非模拟扳机）
     LeftTrigger = 5,
-    /// 左Trigger2（LT 深行程）
+    /// 左扳机（LT，模拟量上穿 0.33 计 1 次）
     LeftTrigger2 = 6,
-    /// 右Trigger（RT）
+    /// 右肩（RB；gilrs 枚举名 RightTrigger 在 XInput 后端映射的是物理肩键）
     RightTrigger = 7,
-    /// 右Trigger2（RT 深行程）
+    /// 右扳机（RT，模拟量上穿 0.33 计 1 次）
     RightTrigger2 = 8,
     /// 选择键（Back/Share）
     Select = 9,

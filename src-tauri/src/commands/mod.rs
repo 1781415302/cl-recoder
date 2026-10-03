@@ -10,8 +10,10 @@
 
 pub mod apps;
 pub mod collector_ctl;
+pub mod collector_health;
 pub mod combos;
 pub mod devices;
+pub mod diagnostics;
 pub mod export;
 pub mod import;
 pub mod keys;
@@ -77,10 +79,16 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         collector_ctl::collector_autostart_enable,
         collector_ctl::collector_autostart_disable,
         collector_ctl::collector_start_now,
+        // 采集器任务修复与只读策略（S2 §4.3：前端均无参数）
+        collector_ctl::collector_autostart_repair,
+        collector_ctl::get_collector_task_policy,
         // 设置
         settings::get_settings,
         settings::set_settings,
         devices::set_device_nickname,
+        // 诊断日志（S1 §4.1：GUI sink 状态 + 打开日志目录；前端均无参数）
+        diagnostics::get_diagnostics_info,
+        diagnostics::open_diagnostics_directory,
     ]
 }
 

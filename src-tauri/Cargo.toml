@@ -21,3 +21,5 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 clrecoder-core = { path = "../crates/core" }
 clrecoder-store = { path = "../crates/store" }
+# S1（§4.1）：gui 角色 sink（gui.log）+ 旧 gui_log! 宏的持久化适配入口。
+clrecoder-diagnostics = { path = "../crates/diagnostics" }

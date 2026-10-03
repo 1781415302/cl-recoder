@@ -50,15 +50,15 @@ impl TopKeyRowDto {
 }
 
 /// 设备 id → 种类（label 分派需要；§4.1 消歧靠 devices.kind）。
+/// usability-runtime-v3 §4.6：走 store 主键直查（`device_kind_by_id`，不做全历史 SUM），
+/// `None` 复用原 `UnknownDeviceKind` 错误。
 pub(crate) fn device_kind(
     conn: &rusqlite::Connection,
     device_id: i64,
 ) -> store::Result<clrecoder_core::codes::DeviceKind> {
-    let rows = reader::devices(conn)?;
-    rows.into_iter()
-        .find(|d| d.id == device_id)
-        .map(|d| d.kind)
-        .ok_or_else(|| clrecoder_store::StoreError::UnknownDeviceKind(format!("device_id={device_id} 不存在")))
+    reader::device_kind_by_id(conn, device_id)?.ok_or_else(|| {
+        clrecoder_store::StoreError::UnknownDeviceKind(format!("device_id={device_id} 不存在"))
+    })
 }
 
 /// 内部查询：逐日明细 + label 填充（测试直连）。
@@ -186,6 +186,138 @@ mod tests {
                 r#"{{"day":"2026-09-27","code":44,"count":4,"label":"{}"}}"#,
                 keylabel::key_label(0x2C)
             )
+        );
+    }
+
+    /// §4.6（usability-runtime-v3）：kind 读取走 store 主键直查；`None`
+    /// 复用原 `UnknownDeviceKind` 错误（含 device_id 的中文文案不变）。
+    #[test]
+    fn usability_v3_device_kind_by_id_none_maps_to_unknown_kind_error() {
+        let f = TempFile::new("keys-kind", "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        let ms = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 1,
+                pid: 2,
+                name: "测试鼠标".into(),
+            })
+            .unwrap();
+        drop(w);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+
+        assert_eq!(device_kind(&conn, ms).unwrap(), DeviceKind::Mouse);
+        let err = device_kind(&conn, 999).unwrap_err();
+        match err {
+            clrecoder_store::StoreError::UnknownDeviceKind(msg) => {
+                assert_eq!(msg, "device_id=999 不存在", "{msg}");
+            }
+            other => panic!("应复用 UnknownDeviceKind 错误，实际: {other}"),
+        }
+    }
+
+    /// U2（usability-runtime-v3 §4.6）：临时 DB 里手柄 code 3..=8 按验收点指定 count
+    /// （31/42/53/64/75/86）写入，查询层 label 走统一后的 17 码物理标签表——
+    /// 3=Y（北）、4=X（西）、5=LB（左肩）、6=LT（左扳机）、7=RB（右肩）、8=RT（右扳机）——
+    /// count 原样返回（存储码与历史 count 不动，仅显示纠正）；
+    /// 同码鼠标设备按 `devices.kind` 消歧（§4.1 禁止按 code 值域判断种类）：
+    /// label 走鼠标静态表、count 与手柄行互不混淆。
+    #[test]
+    fn usability_v3_gamepad_u2_labels_counts_intact_mouse_disambiguated() {
+        let f = TempFile::new("keys-gp", "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        let gp = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Gamepad,
+                vid: 0,
+                pid: 0,
+                name: "Xbox Controller".into(),
+            })
+            .unwrap();
+        let ms = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 1,
+                pid: 2,
+                name: "测试鼠标".into(),
+            })
+            .unwrap();
+        w.flush(&FlushBatch {
+            input: vec![
+                // 手柄：验收点指定值（3=31/4=42/5=53/6=64/7=75/8=86）
+                (gp, "2026-09-28".into(), 3, 31),
+                (gp, "2026-09-28".into(), 4, 42),
+                (gp, "2026-09-28".into(), 5, 53),
+                (gp, "2026-09-28".into(), 6, 64),
+                (gp, "2026-09-28".into(), 7, 75),
+                (gp, "2026-09-28".into(), 8, 86),
+                // 鼠标同码（3=中键、4=侧键X1、5=侧键X2），count 与手柄行互异
+                (ms, "2026-09-28".into(), 3, 7),
+                (ms, "2026-09-28".into(), 4, 8),
+                (ms, "2026-09-28".into(), 5, 9),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        drop(w);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+
+        let expect: [(u16, u64, &str); 6] = [
+            (3, 31, "Y（北）"),
+            (4, 42, "X（西）"),
+            (5, 53, "LB（左肩）"),
+            (6, 64, "LT（左扳机）"),
+            (7, 75, "RB（右肩）"),
+            (8, 86, "RT（右扳机）"),
+        ];
+
+        // 逐日明细：6 行，label/count 逐码断言（count 原样）
+        let daily = query_key_daily(&conn, gp, "2026-09-01", "2026-09-30").unwrap();
+        assert_eq!(daily.len(), 6);
+        for (code, count, label) in expect {
+            let row = daily
+                .iter()
+                .find(|r| r.code == code)
+                .unwrap_or_else(|| panic!("手柄逐日缺 code {code} 行"));
+            assert_eq!((row.count, row.label.as_str()), (count, label), "code {code}");
+        }
+
+        // Top-N：label 与逐日一致、total 原样（单日各行，total 即当日 count），count 降序
+        let top = query_top_keys(&conn, gp, "2026-09-01", "2026-09-30", 10).unwrap();
+        assert_eq!(top.len(), 6);
+        assert_eq!((top[0].code, top[0].total, top[0].label.as_str()), (8, 86, "RT（右扳机）"));
+        for (code, count, label) in expect {
+            let row = top
+                .iter()
+                .find(|r| r.code == code)
+                .unwrap_or_else(|| panic!("Top-N 缺 code {code} 行"));
+            assert_eq!((row.total, row.label.as_str()), (count, label), "code {code}");
+        }
+
+        // 鼠标同码按 kind 消歧：label 走鼠标静态表、count 原样，不含任何手柄标签
+        let ms_daily = query_key_daily(&conn, ms, "2026-09-01", "2026-09-30").unwrap();
+        assert_eq!(ms_daily.len(), 3);
+        let ms_expect: [(u16, u64, &str); 3] =
+            [(3, 7, "中键"), (4, 8, "侧键X1（后退）"), (5, 9, "侧键X2（前进）")];
+        for (code, count, label) in ms_expect {
+            let row = ms_daily
+                .iter()
+                .find(|r| r.code == code)
+                .unwrap_or_else(|| panic!("鼠标逐日缺 code {code} 行"));
+            assert_eq!((row.count, row.label.as_str()), (count, label), "鼠标 code {code}");
+        }
+        assert!(
+            ms_daily.iter().all(|r| r.label != "Y（北）" && r.label != "X（西）"),
+            "鼠标结果混入手柄标签: {:?}",
+            ms_daily.iter().map(|r| r.label.as_str()).collect::<Vec<_>>()
         );
     }
 }

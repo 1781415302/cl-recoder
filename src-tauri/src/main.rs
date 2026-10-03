@@ -13,22 +13,28 @@
 //! 控制管道（§4.4）转发，管道不可达时打开主窗口给引导态而非报错。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// GUI 侧调试日志（§9.2："简单 println 均可，release 默认静默"；与 collector 的
-/// debug_log! 同策略）：仅设置 `CLRECODER_DEBUG` 环境变量时输出 stderr，其余场合零输出。
+/// GUI 侧调试日志（§9.2 / §4.1-S1 适配）：stderr 部分沿用原诊断习惯——仅设置
+/// `CLRECODER_DEBUG` 环境变量时输出（与 collector 的 debug_log! 同策略）；同时把消息
+/// 转交 [`crate::commands::diagnostics::record_gui_message`] 做持久化适配（按既有
+/// INFO/WARN/ERROR 前缀识别级别 + 固定 gui 事件码 + 60s/code 限频；诊断 sink 未初始化
+/// 时静默丢弃）。`CLRECODER_DEBUG` 只影响 stderr 回显，不影响持久日志是否启用（§4.1）。
 /// 宏定义于 crate root 且先于 mod 声明——全部子模块可见（`crate::gui_log!` 引用）。
 #[macro_export]
 macro_rules! gui_log {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
         if std::env::var_os("CLRECODER_DEBUG").is_some() {
             eprintln!("[cl-recoder] {}", format_args!($($arg)*));
         }
-    };
+        $crate::commands::diagnostics::record_gui_message(format_args!($($arg)*));
+    }};
 }
 
 mod commands;
 mod db;
 mod keylabel;
 mod state;
+// S3（§4.4）：原生窗口 UI 活动快照——active 的唯一权威，前端经事件 + get_ui_activity 消费。
+mod ui_activity;
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
@@ -54,6 +60,8 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = win.show();
         let _ = win.set_focus();
     }
+    // S3（§4.4）：显式 show 之后发布——读取实际 visible/minimized 状态（统一发布入口）。
+    ui_activity::refresh(app);
 }
 
 /// 探测 collector 是否处于暂停（`None` = 管道不可达，即未运行，§5.1）。
@@ -109,24 +117,44 @@ fn spawn_toggle_pause(app: tauri::AppHandle, item: tauri::menu::MenuItem<tauri::
 /// 保证托盘与设置页对 settings.json 的写入同一套规则。
 fn toggle_gui_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     let st = app.state::<state::AppState>().inner().clone();
-    let current = st.settings.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let current = st
+        .settings
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let next = !current.gui_autostart;
-    let patch = commands::settings::SettingsPatch { gui_autostart: Some(next), ..Default::default() };
+    let patch = commands::settings::SettingsPatch {
+        gui_autostart: Some(next),
+        ..Default::default()
+    };
     let plugin_app = app.clone();
-    let result = commands::settings::apply_patch(&current, &patch, move |gui| match gui {
-        None => Ok(()),
-        Some(true) => {
-            use tauri_plugin_autostart::ManagerExt;
-            plugin_app.autolaunch().enable().map_err(|e| format!("启用 GUI 自启失败: {e}"))
-        }
-        Some(false) => {
-            use tauri_plugin_autostart::ManagerExt;
-            plugin_app.autolaunch().disable().map_err(|e| format!("停用 GUI 自启失败: {e}"))
-        }
-    }, &db::settings_path());
+    let result = commands::settings::apply_patch(
+        &current,
+        &patch,
+        move |gui| match gui {
+            None => Ok(()),
+            Some(true) => {
+                use tauri_plugin_autostart::ManagerExt;
+                plugin_app
+                    .autolaunch()
+                    .enable()
+                    .map_err(|e| format!("启用 GUI 自启失败: {e}"))
+            }
+            Some(false) => {
+                use tauri_plugin_autostart::ManagerExt;
+                plugin_app
+                    .autolaunch()
+                    .disable()
+                    .map_err(|e| format!("停用 GUI 自启失败: {e}"))
+            }
+        },
+        &db::settings_path(),
+    );
     match result {
         Ok(next_settings) => {
-            *st.settings.write().unwrap_or_else(std::sync::PoisonError::into_inner) = next_settings;
+            *st.settings
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next_settings;
             let _ = item.set_checked(next);
             gui_log!("INFO: 托盘切换 GUI 开机自启 → {next}");
         }
@@ -157,7 +185,13 @@ fn main() {
         // S10：托管 GUI 全局状态（ro 连接 + settings，§3 state.rs）。
         // AppState::new 不失败：stats.db 缺失/损坏 → 内存兜底连接（§5.1 引导态空数据）。
         .setup(|app| {
+            // —— S1 诊断初始化（§4.1）——single-instance 插件已成立（二次启动进程已在
+            // 插件期退出），此处先开 gui.log 并安装 facade adapter，**再**构造 AppState：
+            // 防止同角色两个进程争轮转；AppState::new 里的 gui_log! 因此可被持久化适配。
+            app.manage(commands::diagnostics::init_gui_diagnostics());
             app.manage(state::AppState::new());
+            // S3（§4.4）：UI 活动状态（初始 revision=0/inactive），事件 + get_ui_activity 共用。
+            app.manage(ui_activity::UiActivityState::new());
             let st = app.state::<state::AppState>().inner().clone();
 
             // —— S12 首启引导 —— first_run_done=false：自动弹出主窗口（默认无窗口启动，§8-S1）。
@@ -174,14 +208,22 @@ fn main() {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
-                let mut next =
-                    st.settings.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                // S3（§4.4）：首启 show 之后显式发布（读实际状态 → active）。
+                ui_activity::refresh(app.handle());
+                let mut next = st
+                    .settings
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 next.first_run_done = true;
                 match next.save_to(&db::settings_path()) {
                     Ok(()) => {
-                        *st.settings.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            next;
-                        gui_log!("INFO: 首启引导——已弹出主窗口（引导启用采集器），first_run_done=true");
+                        *st.settings
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+                        gui_log!(
+                            "INFO: 首启引导——已弹出主窗口（引导启用采集器），first_run_done=true"
+                        );
                     }
                     Err(e) => {
                         gui_log!("WARN: first_run_done 落盘失败（下次启动仍弹引导窗）: {e}")
@@ -190,8 +232,7 @@ fn main() {
             }
 
             // —— S12 托盘 —— 菜单契约：打开仪表盘 / 暂停-恢复 / 开机自启 / 退出。
-            let open_item =
-                MenuItem::with_id(app, ID_OPEN, "打开仪表盘", true, None::<&str>)?;
+            let open_item = MenuItem::with_id(app, ID_OPEN, "打开仪表盘", true, None::<&str>)?;
             let pause_item =
                 MenuItem::with_id(app, ID_TOGGLE_PAUSE, "暂停统计", true, None::<&str>)?;
             let autostart_checked = st
@@ -209,14 +250,20 @@ fn main() {
             )?;
             let sep = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, ID_QUIT, "退出", true, None::<&str>)?;
-            let menu =
-                Menu::with_items(app, &[&open_item, &pause_item, &autostart_item, &sep, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[&open_item, &pause_item, &autostart_item, &sep, &quit_item],
+            )?;
 
             let pause_for_menu = pause_item.clone();
             let autostart_for_menu = autostart_item.clone();
 
             TrayIconBuilder::with_id(TRAY_ID)
-                .icon(app.default_window_icon().expect("bundle 图标必须存在").clone())
+                .icon(
+                    app.default_window_icon()
+                        .expect("bundle 图标必须存在")
+                        .clone(),
+                )
                 .tooltip("CL Recoder")
                 .menu(&menu)
                 // Windows（tray-icon 平台实现）：右键抬起弹菜单；左键抬起走下方
@@ -227,6 +274,9 @@ fn main() {
                     ID_TOGGLE_PAUSE => spawn_toggle_pause(app.clone(), pause_for_menu.clone()),
                     ID_AUTOSTART => toggle_gui_autostart(app, &autostart_for_menu),
                     ID_QUIT => {
+                        commands::diagnostics::record_gui_event(
+                            clrecoder_diagnostics::Level::Info, "service.stopped", "GUI 已退出",
+                        );
                         // 退出仅结束 GUI；采集器是独立进程继续统计（§1 故障隔离）。
                         app.cleanup_before_exit();
                         app.exit(0);
@@ -251,17 +301,41 @@ fn main() {
             Ok(())
         })
         // S12 关闭到托盘：主窗口点 × → 阻止关闭并隐藏，进程驻留托盘（§2.1）。
+        // S3（§4.4）：Focused/Resized 读取实际状态（失焦但可见保持 active；最小化/还原在
+        // Windows 上表现为 Resized），Destroyed 置 inactive——原生状态是 UI 活动的唯一权威。
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
+            if window.label() != "main" {
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     let _ = window.hide();
+                    ui_activity::refresh(window.app_handle());
                     gui_log!("INFO: 主窗口关闭请求 → 隐藏到托盘");
                 }
+                WindowEvent::Focused(_) | WindowEvent::Resized(_) => {
+                    ui_activity::refresh(window.app_handle());
+                }
+                WindowEvent::Destroyed => ui_activity::mark_destroyed(window.app_handle()),
+                _ => {}
             }
         })
         // S10：注册全部 Tauri commands（§4.7 契约，commands/mod.rs 汇总）。
-        .invoke_handler(commands::handler())
+        // S3（§4.4）：get_ui_activity 与既有 commands 联合注册——commands::handler() 保持原样
+        //（mod.rs 不在本 Stage 文件清单），两个 handler 命令集不相交且对未知命令都返回
+        // false，这里按命令名分发组合，语义不变。
+        .invoke_handler({
+            let ui_activity_handler: Box<tauri::ipc::InvokeHandler<tauri::Wry>> =
+                Box::new(tauri::generate_handler![ui_activity::get_ui_activity]);
+            let commands_handler = commands::handler();
+            move |invoke| {
+                if invoke.message.command() == ui_activity::COMMAND_GET_UI_ACTIVITY {
+                    return ui_activity_handler(invoke);
+                }
+                commands_handler(invoke)
+            }
+        })
         .run(tauri::generate_context!())
         .expect("CL Recoder GUI 启动失败");
 }

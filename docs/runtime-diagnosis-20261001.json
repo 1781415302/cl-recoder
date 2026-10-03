@@ -1,0 +1,207 @@
+{
+  "runtime": {
+    "observed_at": "2026-10-01T18:16:09.1021312+08:00",
+    "logical_processors": 24,
+    "sample_seconds": 10.26,
+    "pipe_success": 20,
+    "pipe_total": 20,
+    "latency_median_ms": 0.94,
+    "latency_max_ms": 22.39,
+    "first_status": {
+      "index": 0,
+      "ok": true,
+      "milliseconds": 22.39,
+      "data": {
+        "paused": false,
+        "version": "0.1.0",
+        "started_at": "2026-10-01T15:40:00+08:00",
+        "last_event_at": "2026-10-01T18:15:58+08:00",
+        "events_seen": 179863
+      }
+    },
+    "last_status": {
+      "index": 19,
+      "ok": true,
+      "milliseconds": 0.55,
+      "data": {
+        "paused": false,
+        "version": "0.1.0",
+        "started_at": "2026-10-01T15:40:00+08:00",
+        "last_event_at": "2026-10-01T18:16:08+08:00",
+        "events_seen": 180126
+      }
+    },
+    "failures": [],
+    "resources": [
+      {
+        "pid": 113052,
+        "name": "cl-recoder",
+        "started": "2026-10-01T16:53:54.0782572+08:00",
+        "single_core_cpu_percent": 0,
+        "machine_cpu_percent": 0,
+        "working_set_mb": 7.73,
+        "private_bytes_mb": 8.28,
+        "threads": 36,
+        "handles": 366
+      },
+      {
+        "pid": 122992,
+        "name": "cl-recoder-collector",
+        "started": "2026-10-01T15:39:59.8997129+08:00",
+        "single_core_cpu_percent": 1.066,
+        "machine_cpu_percent": 0.044,
+        "working_set_mb": 3.55,
+        "private_bytes_mb": 4.3,
+        "threads": 9,
+        "handles": 215
+      },
+      {
+        "pid": 159196,
+        "name": "conhost",
+        "started": "2026-10-01T15:39:59.9383015+08:00",
+        "single_core_cpu_percent": 0,
+        "machine_cpu_percent": 0,
+        "working_set_mb": 0.15,
+        "private_bytes_mb": 3.25,
+        "threads": 3,
+        "handles": 207
+      },
+      {
+        "pid": 160472,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.1726124+08:00",
+        "single_core_cpu_percent": 0.457,
+        "machine_cpu_percent": 0.019,
+        "working_set_mb": 19.88,
+        "private_bytes_mb": 38.52,
+        "threads": 45,
+        "handles": 1388
+      },
+      {
+        "pid": 127680,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.2265786+08:00",
+        "single_core_cpu_percent": 0,
+        "machine_cpu_percent": 0,
+        "working_set_mb": 0.48,
+        "private_bytes_mb": 3.82,
+        "threads": 8,
+        "handles": 189
+      },
+      {
+        "pid": 152236,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.3674565+08:00",
+        "single_core_cpu_percent": 10.353,
+        "machine_cpu_percent": 0.431,
+        "working_set_mb": 28.93,
+        "private_bytes_mb": 88.04,
+        "threads": 57,
+        "handles": 655
+      },
+      {
+        "pid": 160212,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.3718010+08:00",
+        "single_core_cpu_percent": 0,
+        "machine_cpu_percent": 0,
+        "working_set_mb": 5.29,
+        "private_bytes_mb": 11.99,
+        "threads": 18,
+        "handles": 328
+      },
+      {
+        "pid": 142600,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.3969944+08:00",
+        "single_core_cpu_percent": 0,
+        "machine_cpu_percent": 0,
+        "working_set_mb": 0.98,
+        "private_bytes_mb": 7.36,
+        "threads": 10,
+        "handles": 189
+      },
+      {
+        "pid": 158676,
+        "name": "msedgewebview2",
+        "started": "2026-10-01T16:53:54.4823705+08:00",
+        "single_core_cpu_percent": 12.637,
+        "machine_cpu_percent": 0.527,
+        "working_set_mb": 140.99,
+        "private_bytes_mb": 247.47,
+        "threads": 35,
+        "handles": 357
+      }
+    ]
+  },
+  "database": {
+    "read_only": true,
+    "quick_check": [
+      "ok"
+    ],
+    "quick_check_ms": 124.72,
+    "journal_mode": "wal",
+    "schema_version": 2,
+    "table_rows": {
+      "devices": 5,
+      "input_daily": 198,
+      "combo_daily": 20,
+      "app_daily": 94,
+      "mouse_move_daily": 4,
+      "wp_import_meta": 1,
+      "wp_key_daily": 31905,
+      "wp_combo_daily": 17841,
+      "wp_app_daily": 17651,
+      "wp_mouse_daily": 555,
+      "wp_mouse_buttons_daily": 1123,
+      "wp_mouse_scroll_daily": 2221
+    },
+    "today": "2026-10-01",
+    "today_counts_by_kind": {
+      "keyboard": 6446,
+      "mouse": 3552
+    },
+    "own_input_date_range": [
+      "2026-09-28",
+      "2026-10-01"
+    ],
+    "query_benchmark": {
+      "current_devices_lifetime_aggregation": {
+        "median_ms": 0.0341,
+        "max_ms": 0.1057,
+        "samples": 5
+      },
+      "direct_device_kind_by_id": {
+        "median_ms": 0.0018,
+        "max_ms": 0.0318,
+        "samples": 5
+      }
+    }
+  },
+  "gui_including_webview2": {
+    "machine_cpu_percent": 0.977,
+    "single_core_cpu_percent": 23.447,
+    "working_set_mb": 204.28,
+    "private_bytes_mb": 405.48
+  },
+  "scheduled_task": {
+    "execution_time_limit_hours": 72,
+    "stop_on_battery": true,
+    "start_on_battery": false,
+    "last_run": "2026-10-01T15:39:59+08:00",
+    "state": "Running",
+    "predicted_time_limit_if_same_run_continues": "2026-10-04T15:39:59+08:00"
+  },
+  "crash_history": {
+    "collector_app_error_1000_last_2_days": 10,
+    "latest": "2026-10-01T09:27:06+08:00",
+    "crashes_after_fixed_collector_start": 0
+  },
+  "release_sha256": "CA5EA3F3181A01619680AC04FBC7E705F707F0B36BE47D81FB654AF818794221",
+  "notes": [
+    "CPU is a 10.26-second sample including read-only diagnostic status requests, normalized over 24 visible logical processors.",
+    "GUI-associated top-level windows were subsequently observed visible; no controlled hidden/visible comparison or profiler session was performed.",
+    "SQLite used mode=ro, query_only=ON and a consistent read transaction; quick_check is a structural check, not a full application data audit.",
+    "No source, scheduled task, production process lifecycle, or user statistics were changed."
+  ]
+}

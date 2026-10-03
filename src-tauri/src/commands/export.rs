@@ -6,6 +6,9 @@
 //! - JSON：单文件全量，顶层键逐字按 §4.10（`schema_version`/`generated_at`/`range`/
 //!   `devices`/`input_daily`/`combos`/`apps`/`whatpulse`——文件格式键名为 plan 原文），
 //!   数组元素 = §4.7 同名 TS 类型（camelCase DTO）；scope=own 省略 whatpulse 节点。
+//!   文件格式 v2（correctness-v2 §4.7）：`input_daily` 每行带设备外键 `deviceId`
+//!   （由外层设备循环注入，不从 code/label 猜测）；`schema_version=2` 只是导出文件
+//!   格式版本，与 SQLite schema_migrations 无关；v1 旧文件保留原样，无反向导入。
 //!
 //! `path` 参数约定（前端对接，S12 按此传参）：`format="csv"` 时 `path` 为**目录**
 //! （带扩展名时取其父目录，兼容保存框回传文件名）；`format="json"` 时 `path` 为**文件**。
@@ -21,7 +24,6 @@ use clrecoder_core::codes::DeviceKind;
 use clrecoder_core::day;
 use clrecoder_store::reader;
 
-use super::keys::KeyDailyRowLabeled;
 use super::wp;
 
 /// CSV UTF-8 BOM（§4.10：Excel 中文兼容）。
@@ -318,7 +320,24 @@ pub fn export_csv(
     Ok(files)
 }
 
-/// JSON 导出（§4.10 单文件全量；顶层键逐字按 plan 原文，元素 = §4.7 camelCase DTO）。
+/// JSON 导出 input_daily 行（correctness-v2 §4.7 导出专用 DTO，camelCase）：
+/// 在 §4.7 `KeyDailyRowLabeled` 基础上增加设备外键；GUI 查询 DTO（keys.rs）不变。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportInputDailyRow {
+    /// 所属设备 id（外层设备循环注入，不从 code/label 猜测；须存在于根 devices[].id）
+    device_id: i64,
+    /// 日期
+    day: String,
+    /// 归一化 scancode（或鼠标/手柄 code）
+    code: u16,
+    /// 当日次数
+    count: u64,
+    /// 显示名（GUI keylabel 填充）
+    label: String,
+}
+
+/// JSON 导出（§4.10 单文件全量；v2 文件格式：input_daily 每行带设备外键 deviceId）。
 /// 返回 (文件路径, 数组元素总数)。
 pub fn export_json(
     conn: &rusqlite::Connection,
@@ -328,16 +347,28 @@ pub fn export_json(
     file: &Path,
 ) -> Result<(PathBuf, u64), ExportError> {
     let devices = super::devices::query_devices(conn)?;
-    // input_daily：全设备逐日（§4.10 "KeyDailyRowLabeled 全设备逐日"）
-    let mut input_daily: Vec<KeyDailyRowLabeled> = Vec::new();
+    // input_daily：全设备逐日 + 设备外键（correctness-v2 §4.7：deviceId 由外层设备
+    // 循环注入；设备顺序 = query_devices 的 id 顺序，每设备维持 reader 的 day/code 排序）
+    let mut input_daily: Vec<ExportInputDailyRow> = Vec::new();
     for d in &devices {
-        input_daily.extend(super::keys::query_key_daily(conn, d.id, from, to)?);
+        input_daily.extend(
+            super::keys::query_key_daily(conn, d.id, from, to)?.into_iter().map(|r| {
+                ExportInputDailyRow {
+                    device_id: d.id,
+                    day: r.day,
+                    code: r.code,
+                    count: r.count,
+                    label: r.label,
+                }
+            }),
+        );
     }
     let combos = super::combos::query_combos(conn, from, to, u32::MAX)?;
     let apps = super::apps::query_apps(conn, from, to, u32::MAX)?;
 
     let mut root = serde_json::json!({
-        "schema_version": 1,
+        // 导出文件格式版本 v2（非 SQLite schema_migrations 版本）
+        "schema_version": 2,
         "generated_at": day::now_local_rfc3339(),
         "range": { "from": from, "to": to },
         "devices": devices,
@@ -622,8 +653,8 @@ mod tests {
         assert!(rows > 0);
         let text = std::fs::read_to_string(out.as_ref()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("JSON 必须可解析");
-        // §4.10 顶层键逐字
-        assert_eq!(v["schema_version"], 1);
+        // §4.10 顶层键逐字（schema_version=2 为导出文件格式版本，非 SQLite 迁移版本）
+        assert_eq!(v["schema_version"], 2);
         assert!(v["generated_at"].as_str().unwrap().len() == 25);
         assert_eq!(v["range"]["from"], FROM);
         assert_eq!(v["range"]["to"], TO);
@@ -631,8 +662,9 @@ mod tests {
         assert!(v["input_daily"].as_array().unwrap().len() >= 3);
         assert_eq!(v["combos"].as_array().unwrap().len(), 1);
         assert_eq!(v["apps"].as_array().unwrap().len(), 2);
-        // 元素 = §4.7 camelCase TS 形状
+        // 元素 = §4.7 camelCase TS 形状（v2：input_daily 每行带 deviceId 外键）
         assert!(v["devices"][0].get("firstSeen").is_some(), "{}", v["devices"][0]);
+        assert!(v["input_daily"][0].get("deviceId").is_some(), "{}", v["input_daily"][0]);
         assert!(v["input_daily"][0].get("label").is_some(), "{}", v["input_daily"][0]);
         assert!(v["apps"][0].get("name").is_some(), "{}", v["apps"][0]);
         // scope=own 省略 whatpulse
@@ -649,6 +681,231 @@ mod tests {
         }
         assert_eq!(wp_node["keys"][0]["label"], "A");
         assert!(wp_node["mouse"].as_array().is_some_and(|a| a.is_empty()), "fixture 无 wp 鼠标数据");
+    }
+
+    /// v2 外键 fixture（correctness-v2 §4.7）：两个键盘同 day 同 code 各自独立 + 鼠标 + 手柄 + wp 镜像。
+    fn seed_v2(tag: &str) -> (TempFile, rusqlite::Connection) {
+        let f = TempFile::new(tag, "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        let kb1 = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0x04D9,
+                pid: 0x0169,
+                name: "键盘A".into(),
+            })
+            .unwrap();
+        let kb2 = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0x1234,
+                pid: 0x5678,
+                name: "键盘B".into(),
+            })
+            .unwrap();
+        let ms = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 1,
+                pid: 2,
+                name: "测试鼠标".into(),
+            })
+            .unwrap();
+        let gp = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Gamepad,
+                vid: 3,
+                pid: 4,
+                name: "测试手柄".into(),
+            })
+            .unwrap();
+        w.flush(&FlushBatch {
+            input: vec![
+                (kb1, "2026-09-28".into(), 0x1E, 10), // 与 kb2 同 day 同 code → 独立两行
+                (kb2, "2026-09-28".into(), 0x1E, 7),
+                (kb1, "2026-09-27".into(), 0x2C, 4),
+                (ms, "2026-09-28".into(), 1, 5),
+                (gp, "2026-09-28".into(), 1, 3),
+            ],
+            combos: vec![("2026-09-28".into(), mods::CTRL, 0x2E, 2)],
+            apps: vec![("2026-09-28".into(), "code.exe".into(), 60, 8, 2)],
+            ..Default::default()
+        })
+        .unwrap();
+        w.rebuild_wp_tables(&WpImportBatch {
+            meta: WpMetaRow {
+                imported_at: "2026-09-28T12:00:00+08:00".into(),
+                source_path: r"C:\wp\whatpulse.db".into(),
+                source_size: Some(1024),
+                date_min: Some("2026-09-28".into()),
+                date_max: Some("2026-09-28".into()),
+                note: String::new(),
+            },
+            keys: vec![WpKeyDailyRow {
+                day: "2026-09-28".into(),
+                qt_key: 0x41,
+                label: "A".into(),
+                count: 55,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        drop(w);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        (f, conn)
+    }
+
+    /// 验收点（correctness-v2 §8.2-S7）：v2 `input_daily` 每行带 `deviceId` 外键；
+    /// 两键盘同 day/code 独立成行；鼠标/手柄 id 在场且均在根 devices 内；
+    /// 每设备记录维持 day/code 排序；序列化逐字 camelCase（deviceId 在场、device_id 缺席）；
+    /// rows 仍为各数组元素合计，不因新增字段变化。
+    #[test]
+    fn correctness_v2_json_input_daily_rows_carry_device_foreign_key() {
+        let (_f, conn) = seed_v2("export-fk");
+        let out = TempFile::new("export-fk", "json");
+
+        let (path, rows) = export_json(&conn, Scope::Own, FROM, TO, out.as_ref()).unwrap();
+        assert_eq!(path, out.as_ref().to_path_buf());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.as_ref()).unwrap()).unwrap();
+
+        assert_eq!(v["schema_version"], 2, "JSON 文件格式版本 v2（非 SQLite 迁移版本）");
+
+        // 根 devices 按现有查询 id 顺序
+        let devices = v["devices"].as_array().unwrap();
+        let ids: Vec<i64> = devices.iter().map(|d| d["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4], "{devices:?}");
+
+        // 两键盘同 day/code（2026-09-28 code 30）各自独立成行，不合并、不串号
+        let daily = v["input_daily"].as_array().unwrap();
+        let row_of = |dev: i64| {
+            daily
+                .iter()
+                .find(|r| r["deviceId"].as_i64() == Some(dev) && r["code"] == 30)
+                .unwrap_or_else(|| panic!("deviceId={dev} 缺 2026-09-28 code=30 行: {daily:?}"))
+        };
+        let r1 = row_of(1);
+        let r2 = row_of(2);
+        assert_eq!(r1["day"], "2026-09-28");
+        assert_eq!(r1["count"], 10);
+        assert_eq!(r1["label"], "A", "QWERTY 下 0x1E 应为 A");
+        assert_eq!(r2["day"], "2026-09-28");
+        assert_eq!(r2["count"], 7);
+        assert_eq!(r2["label"], "A");
+
+        // 每条 deviceId 必须在根 devices 存在；鼠标/手柄 id 在场
+        for r in daily {
+            let dev = r["deviceId"].as_i64().expect("deviceId 必须存在且为数字");
+            assert!(ids.contains(&dev), "deviceId={dev} 不在 devices {ids:?}: {r}");
+        }
+        assert!(daily.iter().any(|r| r["deviceId"] == 3), "鼠标行缺 deviceId: {daily:?}");
+        assert!(daily.iter().any(|r| r["deviceId"] == 4), "手柄行缺 deviceId: {daily:?}");
+
+        // 每设备记录维持 day/code 排序（外层循环分设备注入）
+        for dev in &ids {
+            let dev_rows: Vec<(String, u64)> = daily
+                .iter()
+                .filter(|r| r["deviceId"].as_i64() == Some(*dev))
+                .map(|r| (r["day"].as_str().unwrap().to_string(), r["code"].as_u64().unwrap()))
+                .collect();
+            let mut sorted = dev_rows.clone();
+            sorted.sort();
+            assert_eq!(dev_rows, sorted, "deviceId={dev} 须按 day/code 有序");
+        }
+
+        // camelCase 逐字：deviceId 在场，snake_case device_id 缺席
+        let js = serde_json::to_string(&daily[0]).unwrap();
+        assert!(js.contains(r#""deviceId":"#), "{js}");
+        assert!(!js.contains("device_id"), "不得序列化 snake_case: {js}");
+
+        // rows = devices + input_daily + combos + apps 元素数精确合计（新增字段不影响 rows）
+        let expect = devices.len() as u64
+            + daily.len() as u64
+            + v["combos"].as_array().unwrap().len() as u64
+            + v["apps"].as_array().unwrap().len() as u64;
+        assert_eq!(rows, expect, "rows 须等于各数组元素合计");
+        assert_eq!(daily.len(), 5, "5 条输入记录（含同 day/code 两键盘独立行）: {daily:?}");
+    }
+
+    /// 验收点（S7）：日期过滤——无数据日期导出得空数组（devices 为全量仍在场），
+    /// 有数据日期精确过滤；两种情形 rows 都等于元素合计。
+    #[test]
+    fn correctness_v2_json_date_filter_and_empty_arrays() {
+        let (_f, conn) = seed_v2("export-filter");
+
+        // 范围外（数据都在 2026-09-28）：三数组全空
+        let miss = TempFile::new("export-filter-miss", "json");
+        let (_, rows) =
+            export_json(&conn, Scope::Own, "2026-09-29", "2026-09-30", miss.as_ref()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(miss.as_ref()).unwrap()).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert!(v["input_daily"].as_array().unwrap().is_empty(), "范围外不得有输入行");
+        assert!(v["combos"].as_array().unwrap().is_empty(), "范围外不得有组合行");
+        assert!(v["apps"].as_array().unwrap().is_empty(), "范围外不得有应用行");
+        assert_eq!(v["devices"].as_array().unwrap().len(), 4, "devices 为全量，不随范围过滤");
+        assert_eq!(rows, 4, "空数组时 rows = devices 数");
+
+        // 命中 2026-09-28：仅该日 4 条输入（09-27 的 kb1 0x2C 被过滤）
+        let hit = TempFile::new("export-filter-hit", "json");
+        let (_, rows_hit) =
+            export_json(&conn, Scope::Own, "2026-09-28", "2026-09-28", hit.as_ref()).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(hit.as_ref()).unwrap()).unwrap();
+        let daily = v2["input_daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 4, "仅 2026-09-28 的 4 条输入: {daily:?}");
+        assert!(daily.iter().all(|r| r["day"] == "2026-09-28"), "{daily:?}");
+        assert_eq!(v2["combos"].as_array().unwrap().len(), 1);
+        assert_eq!(v2["apps"].as_array().unwrap().len(), 1);
+        let expect = v2["devices"].as_array().unwrap().len() as u64
+            + daily.len() as u64
+            + v2["combos"].as_array().unwrap().len() as u64
+            + v2["apps"].as_array().unwrap().len() as u64;
+        assert_eq!(rows_hit, expect, "命中范围 rows 同样精确");
+    }
+
+    /// 验收点（S7）：scope=wp 仍导出 own 根字段（v2 + deviceId）并追加 whatpulse 节点，
+    /// 不得改成 WP-only；rows = own 四数组 + whatpulse 六数组元素精确合计。
+    #[test]
+    fn correctness_v2_json_wp_scope_appends_whatpulse_and_rows_exact() {
+        let (_f, conn) = seed_v2("export-wp2");
+        let out = TempFile::new("export-wp2", "json");
+        let (_, rows) = export_json(&conn, Scope::Wp, FROM, TO, out.as_ref()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.as_ref()).unwrap()).unwrap();
+
+        // own 根字段齐全且为 v2 形状
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["devices"].as_array().unwrap().len(), 4);
+        let daily = v["input_daily"].as_array().unwrap();
+        assert!(daily.iter().all(|r| r["deviceId"].as_i64().is_some()), "{daily:?}");
+        assert_eq!(v["combos"].as_array().unwrap().len(), 1);
+        assert_eq!(v["apps"].as_array().unwrap().len(), 1);
+
+        let wp = v.get("whatpulse").expect("wp 导出必须在 own 根字段外追加 whatpulse 节点");
+        for k in ["meta", "keys", "combos", "apps", "mouse", "buttons", "scrolls"] {
+            assert!(wp.get(k).is_some(), "whatpulse 缺 {k}");
+        }
+        assert_eq!(wp["keys"][0]["label"], "A");
+        assert_eq!(wp["keys"][0]["count"], 55);
+
+        // rows = own 四数组 + whatpulse 六数组元素合计（meta 为对象不计）
+        let arr_len = |x: &serde_json::Value| x.as_array().map_or(0, |a| a.len()) as u64;
+        let expect = v["devices"].as_array().unwrap().len() as u64
+            + daily.len() as u64
+            + arr_len(&v["combos"])
+            + arr_len(&v["apps"])
+            + arr_len(&wp["keys"])
+            + arr_len(&wp["combos"])
+            + arr_len(&wp["apps"])
+            + arr_len(&wp["mouse"])
+            + arr_len(&wp["buttons"])
+            + arr_len(&wp["scrolls"]);
+        assert_eq!(rows, expect, "wp scope rows 须等于各数组元素合计");
     }
 
     /// CSV 转义规则（RFC 4180）。

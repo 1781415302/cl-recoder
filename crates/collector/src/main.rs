@@ -2,11 +2,19 @@
 //!
 //! 进程形态与启动流程（§5.1）：
 //! 1. 全局单实例互斥体（`Local\clrecoder-collector-singleton`，第二实例立即退出）；
-//! 2. 打开/迁移统计库 `%LOCALAPPDATA%\ClRecoder\stats.db`（WAL；打开失败 → 日志 + 退出码非 0，§5.3）；
-//! 3. 起 raw_input / gamepad / apps 三采集线程 + aggregator（engine_loop）+ pipe 服务端
+//! 2. 诊断日志（usability-runtime-v3 §4.1）：**guard 成立后**才开 collector 角色 sink
+//!    （`%LOCALAPPDATA%\ClRecoder\logs\collector.log`，256KiB 轮转 + 按 code 60s 限频）
+//!    并安装受控 log facade adapter 一次——本项目 target 的 Warn/Error 同步落盘，
+//!    必要 Info 走显式代码（`service.started` / `service.stopped`）；sink 失败明确
+//!    stderr-only 降级，日志绝不成为业务失败来源；
+//! 3. 打开/迁移统计库 `%LOCALAPPDATA%\ClRecoder\stats.db`（WAL；打开失败 → 日志 + 退出码非 0，§5.3）；
+//! 4. 起 raw_input / gamepad / apps 三采集线程 + aggregator（engine_loop）+ pipe 服务端
 //!    （`\\.\pipe\clrecoder-control`，status / set_paused / shutdown 经共享 [`Flags`] 生效）；
-//! 4. 常驻等 `shutdown`（pipe 命令置位）→ join aggregator（排空 + 终账 + 最后一批 flush）
+//! 5. 常驻等 `shutdown`（pipe 命令置位）→ join aggregator（排空 + 终账 + 最后一批 flush）
 //!    → join pipe 服务 → 退出。
+//!
+//! 日志初始化按运行模式分派（§4.1 先解析 mode）：生产 Run 不初始化旧 env_logger；
+//! selftest 单独沿用既有 stderr logger；Version/Help 不碰任何日志。
 //!
 //! 诊断模式（见 [`selftest`]，均不建互斥体、不起 pipe）：
 //! - `--selftest N`：真实采集 N 秒，事件以 `kind|device|code|down` 打印到 stdout 并写库；
@@ -15,6 +23,7 @@
 //! 模块边界（PLAN §2.5 禁止耦合清单）：collector 不做键名翻译、不知道 WhatPulse 存在、
 //! 无 UI、无网络。
 
+mod app_time;
 mod apps;
 mod device;
 mod engine_loop;
@@ -29,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clrecoder_core::event::AggEvent;
+use clrecoder_diagnostics::{DiagnosticLog, Level, LogConfig, Role};
 use clrecoder_store::writer::Writer;
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, GetLastError};
@@ -82,7 +92,8 @@ fn hide_console_window() {
 }
 
 fn real_main() -> i32 {
-    init_logger();
+    // §4.1 先解析 mode：生产 Run 不得先初始化旧 env_logger；selftest 单独初始化
+    // 既有 stderr logger；Version/Help 不碰任何日志。
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mode, db_override) = match parse_args(&args) {
         Ok(parsed) => parsed,
@@ -92,6 +103,9 @@ fn real_main() -> i32 {
             return 2;
         }
     };
+    if mode_uses_stderr_logger(mode) {
+        init_logger();
+    }
     match mode {
         Mode::Version => {
             println!("cl-recoder-collector {}", env!("CARGO_PKG_VERSION"));
@@ -109,6 +123,14 @@ fn real_main() -> i32 {
             run_service(db_override)
         }
     }
+}
+
+/// 运行模式 → 是否初始化既有 stderr env_logger（§4.1 mode-first 分派）：
+/// selftest 自检模式沿用既有 stderr logger；生产 Run **不得**先走 env_logger——
+/// 单实例 guard 成立后开角色文件并安装新 adapter（见 [`run_service`]）；
+/// Version/Help 不碰任何日志。
+fn mode_uses_stderr_logger(mode: Mode) -> bool {
+    matches!(mode, Mode::Selftest(_) | Mode::Inject)
 }
 
 /// 解析命令行。`--db` 在所有模式下可用（自检/调试用途；生产缺省见 [`default_db_path`]）。
@@ -154,22 +176,29 @@ fn parse_args(args: &[String]) -> Result<(Mode, Option<PathBuf>), String> {
 }
 
 /// 常驻采集模式（§5.1 启动流程）。返回进程退出码。
+///
+/// §4.1 顺序约束：单实例 guard 成立 → 开角色 sink 并安装 facade adapter（一次）→
+/// 其余业务。所有 [`DiagnosticLog::record`] 都是锁内同步 `write_all`，返回即落盘，
+/// 因此 `main` 随后的 `std::process::exit` 不会丢日志（flush-before-exit）。
 fn run_service(db_override: Option<PathBuf>) -> i32 {
-    // 1) 单实例互斥体：第二实例立即退出（§5.1）
+    // 1) 单实例互斥体：第二实例立即退出（§5.1）。guard 必须先于日志初始化——
+    //    第二实例不创建角色文件，避免同角色两进程争轮转（§4.1）。
     let _instance = match acquire_single_instance() {
         Ok(Some(guard)) => guard,
-        Ok(None) => {
-            log::info!("已有 collector 实例在运行，本实例退出");
-            return 0;
-        }
+        // 本进程此时尚未开 sink、未装 logger，无日志可写，静默退出
+        Ok(None) => return 0,
         Err(e) => {
-            log::error!("创建单实例互斥体失败: {e}");
             eprintln!("cl-recoder-collector: 创建单实例互斥体失败: {e}");
             return 1;
         }
     };
 
-    // 2) 打开/迁移 DB：失败 → 日志 + 退出码非 0（§5.3"DB 损坏"行）
+    // 2) 诊断日志（§4.1）：guard 成立后开 collector.log 并安装 facade adapter（一次）。
+    //    sink 失败 → 明确 stderr-only 降级（不装 adapter、不回退 env_logger）；
+    //    此后 log::warn!/error! 经 adapter 同步进角色文件（按 target 限频 60s/桶）。
+    let diagnostics = init_diagnostics();
+
+    // 3) 打开/迁移 DB：失败 → facade error 进文件 + stderr 直写；退出码非 0（§5.3"DB 损坏"行）
     let db_path = db_override.unwrap_or_else(default_db_path);
     let writer = match Writer::open(&db_path) {
         Ok(w) => Arc::new(w),
@@ -180,30 +209,52 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
         }
     };
 
-    // 3) 共享状态：Flags（ipc_server 写 / aggregator+main 读）、RuntimeStatus（aggregator 记 /
+    // 4) 共享状态：Flags（ipc_server 写 / aggregator+main 读）、RuntimeStatus（aggregator 记 /
     //    ipc_server 读）、FgState（apps 线程写 / aggregator 读）
     let flags = Arc::new(Flags::default());
     let status = Arc::new(RuntimeStatus::new(env!("CARGO_PKG_VERSION")));
     let fg = Arc::new(Mutex::new(FgState { exe: EXE_UNKNOWN.to_string(), since: Instant::now() }));
 
-    // 4) 事件通道 + 线程组装（§5.1 顺序：aggregator 先于采集线程就绪，事件不空跑）
+    // 5) 事件通道 + 线程组装（§5.1 顺序：aggregator 先于采集线程就绪，事件不空跑）
     let (tx, rx) = crossbeam_channel::unbounded::<AggEvent>();
     let aggregator = engine_loop::spawn(rx, Arc::clone(&writer), Arc::clone(&flags), Arc::clone(&fg), Arc::clone(&status));
     let _raw_input = raw_input::spawn(tx.clone());
     let _gamepad = gamepad::spawn(tx.clone());
     let _apps = apps::spawn(tx, Arc::clone(&fg));
     let ipc = ipc_server::spawn(Arc::clone(&flags), Arc::clone(&status));
+    // 显式 Info 事件代码（§4.1 受控类别）：service.started——有界日志的启动锚点
+    if let Some(d) = &diagnostics {
+        d.record(
+            Level::Info,
+            "service.started",
+            &format!("collector 启动（版本 {}，库 {}）", env!("CARGO_PKG_VERSION"), db_path.display()),
+        );
+    }
     log::info!("collector 就绪（版本 {}，库 {}）", env!("CARGO_PKG_VERSION"), db_path.display());
 
-    // 5) 常驻等待 shutdown（pipe `shutdown` 命令置位，§4.4）
+    // 6) 常驻等待 shutdown（pipe `shutdown` 命令置位，§4.4）
     while !flags.shutdown.load(Ordering::Acquire) {
         std::thread::sleep(SHUTDOWN_POLL);
     }
 
-    // 6) 收尾：aggregator 排空余事件 → 前台秒数终账 → 最后一批 flush → 退出；
+    // 7) 收尾：aggregator 排空余事件 → 前台秒数终账 → 最后一批 flush → 退出；
     //    pipe 服务线程随 shutdown 旗标退出。两者都 join（丢尾批 ≤0.5s 属 §5.3 已接受损耗）。
     let _ = aggregator.join();
+    // join 前自连唤醒兜底：worker 在置位与唤醒之间出意外时，accept 可能仍阻塞在
+    // ConnectNamedPipe；反复 prod_pipe 直到 accept 线程结束，再 join。
+    // ~20ms 间隔，防止 ipc.join() 无界挂死。
+    loop {
+        ipc_server::prod_pipe();
+        if ipc.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let _ = ipc.join();
+    // 显式 Info 事件代码：service.stopped（§4.1）；同步写返回即落盘，随后 exit 不丢日志
+    if let Some(d) = &diagnostics {
+        d.record(Level::Info, "service.stopped", "collector 已优雅退出");
+    }
     log::info!("collector 已优雅退出");
     0
 }
@@ -247,8 +298,56 @@ fn default_selftest_db() -> PathBuf {
     PathBuf::from("stats.db")
 }
 
-/// 日志初始化（§9.2：release 默认静默——仅 error 到 stderr，第三方库（gilrs 等）的
-/// warn 噪声一并静默；`RUST_LOG=warn/info` 可按需调高）。
+/// 生产诊断日志目录（§4.1 后端固定）：`%LOCALAPPDATA%\ClRecoder\logs`。
+/// 定位失败（异常用户配置）退化到当前目录 `logs`——极可能 open 失败走 stderr-only
+/// 降级，绝不 panic。
+fn default_log_dir() -> PathBuf {
+    match dirs::data_local_dir() {
+        Some(base) => base.join("ClRecoder").join("logs"),
+        None => {
+            eprintln!("cl-recoder-collector: 无法定位 %LOCALAPPDATA%，诊断日志目录退化到当前目录 logs");
+            PathBuf::from("logs")
+        }
+    }
+}
+
+/// 打开 collector 角色 sink 并安装受控 facade adapter（§4.1：仅 Run 模式、单实例 guard
+/// 成立后调用一次）。返回 `None` = sink 打开失败，已明确 stderr-only 降级
+/// （不装 adapter、不回退 env_logger）；sink 在场时返回 `Some`，生命周期日志
+/// （`service.started`/`service.stopped`）继续用它显式 record。
+#[must_use]
+fn init_diagnostics() -> Option<Arc<DiagnosticLog>> {
+    init_diagnostics_with(default_log_dir())
+}
+
+/// [`init_diagnostics`] 的 hermetic 注入版（测试用临时目录；生产走 `%LOCALAPPDATA%`）。
+///
+/// adapter 安装失败（`SetLoggerError`，全局 logger 已被占用）→ stderr 报告 + 显式代码
+/// `log.adapter_install_failed` 直接 record 落盘证据，绝不忽略错误后宣称持久日志已接线；
+/// sink 本身仍可用于直接 record。
+fn init_diagnostics_with(dir: PathBuf) -> Option<Arc<DiagnosticLog>> {
+    let sink = match DiagnosticLog::open(LogConfig { directory: dir, role: Role::Collector }) {
+        Ok(sink) => Arc::new(sink),
+        Err(e) => {
+            // sink 失败：明确 stderr-only 降级——日志不成为业务失败来源（§4.1）
+            eprintln!("cl-recoder-collector: 打开诊断日志失败，本进程 stderr-only 降级: {e}");
+            return None;
+        }
+    };
+    // stderr debug 沿用原诊断习惯（CLRECODER_DEBUG）；持久日志是否启用与它无关
+    let debug_stderr = std::env::var_os("CLRECODER_DEBUG").is_some();
+    if let Err(e) = clrecoder_diagnostics::install_project_log_adapter(Arc::clone(&sink), debug_stderr) {
+        let msg = format!("诊断日志 facade adapter 安装失败（持久日志不可用）: {e}");
+        eprintln!("cl-recoder-collector: {msg}");
+        // 直接 record（不经 facade——facade 此刻可能正不可用）；失败只丢本条证据
+        let _ = sink.record(Level::Error, "log.adapter_install_failed", &msg);
+    }
+    Some(sink)
+}
+
+/// 自检模式 stderr 日志初始化（§9.2：release 默认静默——仅 error 到 stderr，第三方库
+/// （gilrs 等）的 warn 噪声一并静默；`RUST_LOG=warn/info` 可按需调高）。
+/// 仅 selftest 模式调用；生产 Run 的日志见 [`init_diagnostics`]（§4.1 mode-first）。
 fn init_logger() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
         .try_init();
@@ -273,6 +372,31 @@ mod tests {
 
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// §4.1 mode-first：生产 Run 不得先初始化旧 env_logger（guard 成立后开角色文件 +
+    /// adapter）；selftest 单独沿用既有 stderr logger；Version/Help 不碰任何日志。
+    #[test]
+    fn usability_v3_mode_dispatch_keeps_env_logger_out_of_production_run() {
+        assert!(!mode_uses_stderr_logger(Mode::Run), "Run 不得走旧 env_logger");
+        assert!(!mode_uses_stderr_logger(Mode::Version), "Version 不碰任何日志");
+        assert!(!mode_uses_stderr_logger(Mode::Help), "Help 不碰任何日志");
+        assert!(mode_uses_stderr_logger(Mode::Selftest(1)), "selftest 用既有 stderr logger");
+        assert!(mode_uses_stderr_logger(Mode::Inject), "selftest-inject 用既有 stderr logger");
+    }
+
+    /// §4.1 sink 失败 → 明确 stderr-only 降级：返回 None、不 panic、不装全局 logger，
+    /// 日志不成为业务失败来源。
+    #[test]
+    fn usability_v3_sink_failure_degrades_to_stderr_only_without_panic() {
+        // 目录路径被文件占据 → create_dir_all 必失败
+        let blocker = std::env::temp_dir()
+            .join(format!("clrecoder-collector-openfail-{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"placeholder").expect("写占位文件");
+        let sink = init_diagnostics_with(blocker.join("logs"));
+        std::fs::remove_file(&blocker).expect("清理占位文件");
+        assert!(sink.is_none(), "sink 打开失败必须返回 None（stderr-only 降级）");
     }
 
     #[test]

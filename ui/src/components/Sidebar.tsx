@@ -1,5 +1,11 @@
-// 桌面侧边导航（§4.9：图标 + 文字、当前项高亮、宽 240px）+ 采集器运行状态（icon+文字，不只靠颜色）。
-import { useCollectorStatus } from "../api/queries";
+// 桌面侧边导航（§4.9：图标 + 文字、当前项高亮、宽 240px）+ 采集器健康状态。
+// 健康（usability-runtime-v3 §4.2）：按 health 分类显示，不以 running=false 一律显示"未运行"——
+// unreachable/access_denied/unknown 各有文案与配色，无凭据不臆断。
+import { useQuery } from "@tanstack/react-query";
+import * as client from "../api/client";
+import { uiQueryPolicy } from "../api/queryPolicy";
+import type { CollectorHealth } from "../api/types";
+import { useAppActivity } from "../lib/AppActivityProvider";
 import {
   IconApps,
   IconCombos,
@@ -33,28 +39,39 @@ const NAV: NavItem[] = [
   { id: "settings", label: "设置", icon: <IconSettings /> },
 ];
 
+/** §4.2 健康分类 → 徽标文案/配色。unknown/access_denied 不显示"未运行"（无凭据不臆断）。 */
+const HEALTH_CHIP: Record<CollectorHealth, { text: string; cls: string; dot: string }> = {
+  running: { text: "采集中", cls: "chip chip-positive", dot: "var(--color-positive)" },
+  paused: { text: "已暂停", cls: "chip chip-accent", dot: "var(--color-accent)" },
+  not_running: { text: "未运行", cls: "chip", dot: "var(--color-text-placeholder)" },
+  unreachable: { text: "无响应", cls: "chip chip-danger", dot: "var(--color-danger)" },
+  access_denied: { text: "访问受限", cls: "chip chip-danger", dot: "var(--color-danger)" },
+  unknown: { text: "状态未知", cls: "chip", dot: "var(--color-text-placeholder)" },
+};
+const CHIP_PENDING = { text: "检测中…", cls: "chip", dot: "var(--color-text-placeholder)" };
+
 function CollectorChip() {
-  const { data } = useCollectorStatus();
-  let cls = "chip";
-  let text = "未运行";
-  if (data?.running) {
-    text = data.paused ? "已暂停" : "采集中";
-    cls = data.paused ? "chip chip-accent" : "chip chip-positive";
-  }
+  const activity = useAppActivity();
+  // §4.5 activity gating：仅活动时 500ms 轮询。Sidebar 常驻，是 ["collectorStatus"] 的
+  // 唯一轮询者——设置页以同一 queryKey 消费该缓存，不另起定时器（避免双倍管道探测）。
+  const { data } = useQuery({
+    queryKey: ["collectorStatus"],
+    queryFn: () => client.collectorStatus(),
+    ...uiQueryPolicy(activity.active, 500),
+  });
+  const chip = data ? HEALTH_CHIP[data.health] : CHIP_PENDING;
   return (
-    <div className={cls} title="采集器状态（近实时刷新）">
+    <div className={chip.cls} title={data?.diagnosticMessage ?? "采集器状态（近实时刷新）"}>
       <span
         aria-hidden="true"
         style={{
           width: 8,
           height: 8,
           borderRadius: "50%",
-          background: data?.running
-            ? data.paused ? "var(--color-accent)" : "var(--color-positive)"
-            : "var(--color-text-placeholder)",
+          background: chip.dot,
         }}
       />
-      {text}
+      {chip.text}
     </div>
   );
 }

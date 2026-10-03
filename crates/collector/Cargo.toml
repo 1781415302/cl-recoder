@@ -13,6 +13,8 @@ path = "src/main.rs"
 clrecoder-core = { path = "../core" }
 clrecoder-engine = { path = "../engine" }
 clrecoder-store = { path = "../store" }
+# S1（§4.1）：collector 角色 sink（collector.log）+ 受控 log facade adapter。
+clrecoder-diagnostics = { path = "../diagnostics" }
 # Win32_System_IO：windows 0.62 中所有带 OVERLAPPED 参数的 API（含命名管道必需的
 # ReadFile/WriteFile/ConnectNamedPipe，S8 §4.4）被该 feature 门控，白名单内的
 # Win32_System_Pipes/Win32_Storage_FileSystem 本身不够。

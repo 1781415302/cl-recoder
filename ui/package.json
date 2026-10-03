@@ -6,12 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test tests/wp-mouse-query.test.mjs tests/app-activity.test.mjs tests/presentation-contracts.test.mjs tests/device-layouts.test.mjs tests/runtime-ui-integration.test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-autostart": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-opener": "^2.0.0",
     "react": "^18.3.1",

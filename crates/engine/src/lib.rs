@@ -4,19 +4,30 @@
 //! 不碰鼠标/手柄事件；唯一依赖是 [`clrecoder_core`] 的修饰键位掩码契约
 //! （`codes::modifier_bit` / `codes::mods`）。
 //!
-//! 统计语义（§4.3 五条规则，逐字实现）：
-//! 1) down 且 held 中已存在该 sc → 自动重复，不产计数，held 不变；
+//! 统计语义（PLAN §4.3 五条规则 + correctness-v2 §4.2 来源维度，逐字实现）：
+//! 1) down 且 held 中已存在该 `(source, sc)` → 自动重复，不产计数，held 不变；
 //! 2) down：插入 held；该键计数 `Key{sc}` 恒产出（含修饰键自身，修饰键也磨损）；
 //! 3) down 且该键非修饰键且 mods_held != 0 → 产出 `Combo{mods: mods_held, code: sc}`；
-//! 4) up：从 held 移除（不存在则忽略）；修饰键按"物理 sc 集合"跟踪，
+//! 4) up：从 held 移除该 `(source, sc)`（不存在则忽略）；修饰键按"物理 sc 集合"跟踪，
 //!    L/R 合并位仅在两侧都抬起后清零（mods_held 每次由 held 中的修饰键重算）；
 //! 5) mods_held = OR(held 中所有键的 modifier_bit)。
+//!
+//! 来源维度（correctness-v2 §4.2，F3/F5 的状态机基础）：held 的逻辑键是 `(source, sc)`——
+//! 同一来源的重复 make 判为自动重复，不同来源的同码按下各自独立计数；修饰位始终取
+//! **所有** held 项的位或，[`Engine::remove_source`] / [`Engine::clear_sources`]
+//! （设备拔出/重置生命周期）后重算，且移除一个来源不影响另一个仍按住的同码修饰键。
+//! [`Engine::on_key`] 保留为 source=0 的单来源兼容包装，生产 aggregator 必须走
+//! [`Engine::on_key_from`]。
 //!
 //! "今天"不属于引擎状态——日期按调用方（aggregator）参数入桶，跨天自然开新桶。
 
 use std::collections::HashSet;
 
 use clrecoder_core::codes::modifier_bit;
+use clrecoder_core::event::InputSourceId;
+
+/// 单来源兼容入口的保留来源 ID：[`Engine::on_key`] 路由到它（真实输入用正 ID）。
+const COMPAT_SOURCE: InputSourceId = InputSourceId(0);
 
 /// 一次键盘事件的产出：0..=2 条计数（PLAN §4.3 契约类型，字段逐字对齐）。
 ///
@@ -32,15 +43,17 @@ pub struct EngineOut {
     pub combo: Option<(u8, u16)>,
 }
 
-/// 键盘统计纯状态机（PLAN §4.3）。
+/// 键盘统计纯状态机（PLAN §4.3 + correctness-v2 §4.2）。
 ///
-/// 按下状态以"物理 scancode 集合"跟踪（`held`），修饰键位掩码 `mods_held`
+/// 按下状态以 `(来源, 物理 scancode)` 集合跟踪（`held`），修饰键位掩码 `mods_held`
 /// 每次 held 变动后由 held 中的修饰键重算——左右修饰键天然等价（L/R 合并位）。
-/// 引擎不存日期、不存设备；调用方对每个 `(设备, 键盘事件)` 调一次 [`Engine::on_key`]。
+/// 引擎不存日期、不存设备；调用方对每个 `(来源, 键盘事件)` 调一次
+/// [`Engine::on_key_from`]（单键盘兼容路径用 [`Engine::on_key`]，等价于来源 0）。
 #[derive(Debug, Clone, Default)]
 pub struct Engine {
-    /// 当前按下的物理 scancode 集合（修饰键与非修饰键统一跟踪）。
-    held: HashSet<u16>,
+    /// 当前按下的 `(来源, scancode)` 集合（修饰键与非修饰键统一跟踪；
+    /// 来源维度实现同码跨键盘独立计数——F3/F5 的状态机基础）。
+    held: HashSet<(InputSourceId, u16)>,
     /// mods_held = OR(held 中所有键的 modifier_bit)（§4.3 规则 5，held 变动后重算）。
     mods_held: u8,
 }
@@ -57,12 +70,27 @@ impl Engine {
 
     /// 输入一个键盘事件（归一化 scancode + 按下/抬起边沿），输出 0..=2 条计数。
     ///
+    /// 单来源兼容入口：等价于 `on_key_from(InputSourceId(0), sc, down)`——已有单键盘
+    /// 调用方与测试无需改动；生产 aggregator 必须改走 [`Engine::on_key_from`]。
+    ///
     /// `sc` 必须是采集层经 `core::codes::normalize_scancode` 归一化后的码值
     /// （如 Pause 的 E1 双事件归一化为同一码 0xE11D，由本状态表天然去重）。
     pub fn on_key(&mut self, sc: u16, down: bool) -> EngineOut {
+        self.on_key_from(COMPAT_SOURCE, sc, down)
+    }
+
+    /// 输入一个带来源的键盘事件（归一化 scancode + 按下/抬起边沿），输出 0..=2 条计数。
+    ///
+    /// `source` 为 collector 进程内单调分配的连接 ID（0 保留给 [`Engine::on_key`]）；
+    /// 按下状态按 `(source, sc)` 去重——同一来源的重复 make 判为自动重复，
+    /// 不同来源的同码按下各自独立计数（F3/F5）。修饰位始终取**所有**来源
+    /// held 项的位或，`up` / `remove_source` / `clear_sources` 后重算。
+    ///
+    /// `sc` 必须是采集层经 `core::codes::normalize_scancode` 归一化后的码值。
+    pub fn on_key_from(&mut self, source: InputSourceId, sc: u16, down: bool) -> EngineOut {
         if down {
-            // 规则 1：自动重复——held 已含该 sc：不产计数，held/mods 均不变。
-            if self.held.contains(&sc) {
+            // 规则 1：自动重复——held 已含该 (source, sc)：不产计数，held/mods 均不变。
+            if self.held.contains(&(source, sc)) {
                 return EngineOut::default();
             }
             let is_modifier = modifier_bit(sc).is_some();
@@ -78,15 +106,30 @@ impl Engine {
                 },
             };
             // 规则 2：插入 held；规则 5：mods_held 由 held 重算。
-            self.held.insert(sc);
+            self.held.insert((source, sc));
             self.mods_held = self.recompute_mods_held();
             out
         } else {
-            // 规则 4：up——从 held 移除（不存在则忽略），不产任何计数。
-            self.held.remove(&sc);
+            // 规则 4：up——从 held 移除该 (source, sc)（不存在则忽略），不产任何计数。
+            self.held.remove(&(source, sc));
             self.mods_held = self.recompute_mods_held();
             EngineOut::default()
         }
+    }
+
+    /// 移除一个输入来源的全部按下状态（设备拔出/失联的生命周期事件）：
+    /// 该来源按住的键视为全部抬起，mods_held 由剩余 held 重算——
+    /// 不影响其他来源仍按住的同码修饰键（correctness-v2 §4.2）。
+    pub fn remove_source(&mut self, source: InputSourceId) {
+        self.held.retain(|&(s, _)| s != source);
+        self.mods_held = self.recompute_mods_held();
+    }
+
+    /// 清空全部来源的按下状态（键盘来源整体重置的生命周期事件）：
+    /// mods_held 归零，此后各来源的 down 重新独立计数。
+    pub fn clear_sources(&mut self) {
+        self.held.clear();
+        self.mods_held = self.recompute_mods_held();
     }
 
     /// 规则 4/5：mods_held 每次由 held 中的修饰键重算——
@@ -94,7 +137,7 @@ impl Engine {
     fn recompute_mods_held(&self) -> u8 {
         self.held
             .iter()
-            .filter_map(|&sc| modifier_bit(sc))
+            .filter_map(|&(_, sc)| modifier_bit(sc))
             .fold(0, |acc, bit| acc | bit)
     }
 }
@@ -103,6 +146,7 @@ impl Engine {
 mod tests {
     use super::*;
     use clrecoder_core::codes::{mods, normalize_scancode};
+    use clrecoder_core::event::InputSourceId;
 
     /// 断言"无任何计数"产出（自动重复 / up 事件的预期形状）。
     fn assert_no_counts(out: EngineOut) {
@@ -306,6 +350,138 @@ mod tests {
         assert_eq!(
             e.on_key(0x14, true),
             EngineOut { key: Some(0x14), combo: Some((mods::SHIFT, 0x14)) }
+        );
+    }
+
+    // ==================================================================
+    // correctness-v2 §4.2：来源维度（F3/F5 状态机基础）
+    // 每个测试对应行为表一行；真实输入使用正 ID，0 仅限 on_key 兼容入口。
+    // ==================================================================
+
+    /// 行为表第 1 行：`(101,A,down)`、`(102,A,down)` → 两个 key=Some(0x1E)。
+    /// 同码双键盘各自独立计数（型号相同也按连接隔离——Writer 侧再按型号合并）。
+    #[test]
+    fn correctness_v2_same_scancode_two_sources_count_independently() {
+        let mut e = Engine::new();
+        assert_eq!(
+            e.on_key_from(InputSourceId(101), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: None }
+        );
+        assert_eq!(
+            e.on_key_from(InputSourceId(102), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: None }
+        );
+        // 101 自身的重复 make 仍被去重——隔离只在来源之间，不破坏规则 1
+        assert_no_counts(e.on_key_from(InputSourceId(101), 0x1E, true));
+    }
+
+    /// 行为表第 2 行：`(101,A,down)` 重复三次 → 仅第一条有 Key。
+    #[test]
+    fn correctness_v2_repeat_dedup_is_per_source() {
+        let mut e = Engine::new();
+        assert_eq!(e.on_key_from(InputSourceId(101), 0x1E, true).key, Some(0x1E));
+        assert_no_counts(e.on_key_from(InputSourceId(101), 0x1E, true));
+        assert_no_counts(e.on_key_from(InputSourceId(101), 0x1E, true));
+        // 101 的按下状态不影响 102 的同码 down（去重键是 (source, sc)）
+        assert_eq!(e.on_key_from(InputSourceId(102), 0x1E, true).key, Some(0x1E));
+    }
+
+    /// 行为表第 3 行：101 Ctrl down，102 C down → 第二条 combo=Some((1,0x2E))。
+    /// 修饰位跨来源位或（mods::CTRL == 1）。
+    #[test]
+    fn correctness_v2_cross_keyboard_ctrl_combo() {
+        let mut e = Engine::new();
+        assert_eq!(e.on_key_from(InputSourceId(101), 0x1D, true).key, Some(0x1D));
+        let c = e.on_key_from(InputSourceId(102), 0x2E, true);
+        assert_eq!(c, EngineOut { key: Some(0x2E), combo: Some((mods::CTRL, 0x2E)) });
+        // 行为表逐字锚定：mods 值就是 1
+        assert_eq!(c.combo, Some((1, 0x2E)));
+    }
+
+    /// 行为表第 4 行：101/102 Ctrl down，101 Ctrl up，102 C down → C 仍有 Ctrl+C。
+    /// up 只摘除本来源的 (source, sc)，另一来源的同码修饰键保留。
+    #[test]
+    fn correctness_v2_ctrl_up_on_one_source_keeps_other_sources_mod() {
+        let mut e = Engine::new();
+        assert!(e.on_key_from(InputSourceId(101), 0x1D, true).key.is_some());
+        assert!(e.on_key_from(InputSourceId(102), 0x1D, true).key.is_some());
+        assert_no_counts(e.on_key_from(InputSourceId(101), 0x1D, false));
+        assert_eq!(
+            e.on_key_from(InputSourceId(102), 0x2E, true),
+            EngineOut { key: Some(0x2E), combo: Some((mods::CTRL, 0x2E)) }
+        );
+    }
+
+    /// 行为表第 5 行：101 Ctrl down，remove_source(101)，102 C down → C 无 Combo。
+    #[test]
+    fn correctness_v2_remove_source_drops_only_that_source_state() {
+        let mut e = Engine::new();
+        assert!(e.on_key_from(InputSourceId(101), 0x1D, true).key.is_some());
+        e.remove_source(InputSourceId(101));
+        assert_eq!(
+            e.on_key_from(InputSourceId(102), 0x2E, true),
+            EngineOut { key: Some(0x2E), combo: None }
+        );
+    }
+
+    /// §4.2 非显然决策：移除一个来源不能影响另一个仍按住的同码修饰键
+    /// （101/102 都按住 Ctrl，移除 101 后 102 的 C 仍产 Ctrl+C）。
+    #[test]
+    fn correctness_v2_remove_source_spares_other_source_same_modifier() {
+        let mut e = Engine::new();
+        assert!(e.on_key_from(InputSourceId(101), 0x1D, true).key.is_some());
+        assert!(e.on_key_from(InputSourceId(102), 0x1D, true).key.is_some());
+        e.remove_source(InputSourceId(101));
+        assert_eq!(
+            e.on_key_from(InputSourceId(102), 0x2E, true),
+            EngineOut { key: Some(0x2E), combo: Some((mods::CTRL, 0x2E)) }
+        );
+    }
+
+    /// 行为表第 6 行：101 Ctrl down → clear_sources → 101 A down
+    /// → A 重新计数、无旧 Ctrl。
+    #[test]
+    fn correctness_v2_clear_sources_allows_fresh_count_without_stale_mods() {
+        let mut e = Engine::new();
+        assert!(e.on_key_from(InputSourceId(101), 0x1D, true).key.is_some());
+        // clear 前确立旧状态：A 带旧 Ctrl 组合
+        assert_eq!(
+            e.on_key_from(InputSourceId(101), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: Some((mods::CTRL, 0x1E)) }
+        );
+        e.clear_sources();
+        // 同一来源的同码 down 重新计 1 次（held 已清空），且不带 clear 前按住的 Ctrl
+        assert_eq!(
+            e.on_key_from(InputSourceId(101), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: None }
+        );
+    }
+
+    /// 兼容入口：`on_key` 与 `on_key_from(InputSourceId(0), …)` 共享同一按下状态
+    /// （source=0 专用于单来源兼容路径，真实输入的正 ID 与之隔离）。
+    #[test]
+    fn correctness_v2_on_key_compat_wrapper_routes_to_source_zero() {
+        let mut e = Engine::new();
+        assert_eq!(e.on_key(0x1E, true), EngineOut { key: Some(0x1E), combo: None });
+        // source=0 的同码 down 判为自动重复（两条路径等价）
+        assert_no_counts(e.on_key_from(InputSourceId(0), 0x1E, true));
+        assert_no_counts(e.on_key(0x1E, true));
+        // 正 ID 来源与 source=0 互不干扰
+        assert_eq!(
+            e.on_key_from(InputSourceId(1), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: None }
+        );
+    }
+
+    /// 空状态上的生命周期操作是无害 no-op：不 panic、不污染后续计数。
+    #[test]
+    fn correctness_v2_remove_and_clear_on_empty_state_are_noops() {
+        let mut e = Engine::new();
+        e.remove_source(InputSourceId(101));
+        e.clear_sources();
+        assert_eq!(
+            e.on_key_from(InputSourceId(101), 0x1E, true),
+            EngineOut { key: Some(0x1E), combo: None }
         );
     }
 }

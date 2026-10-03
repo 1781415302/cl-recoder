@@ -2,20 +2,26 @@
 //!
 //! 数据流（§2.3 写路径的落点）：三个采集线程的 `AggEvent` → 本线程逐条处理：
 //!
-//! - **Input**：暂停时直接丢弃（§4.6）；键盘事件先过 [`Engine`] 纯状态机（按下边沿产出
-//!   Key/Combo，§4.3），按 `(device_id, day, code)` / `(day, mods, code)` 计数，并按当前
-//!   前台 exe 归属 app 的 key_count/click_count（§5.2，仅物理按下边沿——Engine 天然去重
-//!   自动重复）；手柄只进 `input_daily`（§5.2 仅键鼠归 app）。
+//! - **Input**：丢弃但键盘边沿仍喂 engine（§4.6：暂停期按来源维护 held/修饰键，输出不
+//!   计数）；活动期键盘事件先过 [`Engine`] 纯状态机（按下边沿产出 Key/Combo，§4.3，
+//!   `on_key_from` 携带采集层分配的连接 ID——来源维度按物理连接隔离，F3），按
+//!   `(device_id, day, code)` / `(day, mods, code)` 计数，并按当前前台 exe 归属 app 的
+//!   key_count/click_count（§5.2，仅物理按下边沿——Engine 天然去重自动重复）；
+//!   手柄只进 `input_daily`（§5.2 仅键鼠归 app）。
+//! - **SourceRemoved / KeyboardSourcesReset**：生命周期控制事件（correctness-v2 §4.3）——
+//!   无论 paused 均执行：设备拔出清该来源按下状态（其他来源修饰位保留）、loop 重建清空
+//!   全部键盘来源；不写统计、不记 events_seen、不动 paused/shutdown。
 //! - **Foreground**：暂停时也照常处理（保持 exe 归属正确，§4.6）。事件与暂停/恢复旗标
 //!   并发时，先在 [`Aggregator::handle_event`] 入口消解未观察的沿（观察延迟至多一个心跳
 //!   [`POLL_INTERVAL`]）——否则归账区间会横跨暂停间隔、把暂停秒数记为活动秒数。
 //!
 //! 聚合结构（§4.6 逐字）：`HashMap<(i64, day, u16), u64>`、`HashMap<(day, mods, code), u64>`、
-//! `HashMap<(day, exe), AppAcc>`。每 1s tick 检查 shutdown 与跨天（入桶日期按到达时刷新）；
-//! 每 0.5s 若脏 → 构造 [`FlushBatch`]（含前台增量秒数，按天切分，§5.3）→ [`Writer::flush`] →
-//! 清桶；**flush 失败保留聚合桶、下个 tick 重试、日志限频——绝不丢计数、绝不 panic**（§4.5/§9.4）。
+//! `HashMap<(day, exe), AppAcc>`。每 1s tick 检查 shutdown 与跨天（入桶日期按到达时刷新；
+//! 跨天时清 ledger 过期日尾差）；每 0.5s 若脏 → 构造 [`FlushBatch`]（含前台增量秒数，按天
+//! 切分，§5.3）→ [`Writer::flush`] → 清桶；**flush 失败保留聚合桶、下个 tick 重试、日志限频
+//! ——绝不丢计数、绝不 panic**（§4.5/§9.4）。
 //!
-//! # 前台秒数归账（FgState 增量的无损实现）
+//! # 前台秒数归账（FgState 增量的无损实现 + 亚秒余数账本，correctness-v2 §4.4）
 //!
 //! [`FgState`]（apps 线程在 exe 变化时写 `exe`/`since=now`，且"先落状态再发事件"）与本线程
 //! 通过 [`Arc<Mutex>`] 共享。若每次归账都直接读 `FgState.since`，一次前台切换会把旧 exe 的
@@ -23,12 +29,23 @@
 //! 单线程内维护与 FgState 同步的归账游标 `fg_cur: (exe, since)`：
 //!
 //! - `Foreground{exe}` 事件：先把游标尾段 `[since → now]` 归账到旧 exe，再切换游标——
-//!   事件有序、单线程处理，无丢失、无重复；
-//! - 每 0.5s flush 前：归账 `[游标.since → now]` 到游标 exe（按本地日历日切分，§5.3 跨天切分），
-//!   随后推进游标；
-//! - **暂停瞬间**（观察到 `paused` 上升沿）：先把增量秒数归账一次，再把游标与 `FgState.since`
-//!   一并**冻结在暂停时刻**；**恢复时** `since=now`——暂停区间不产生秒数，全程无减法无负值
-//!   （§4.6/§5.3 逐字语义；暂停期间的 Foreground 事件只切换归属、不归账）。
+//!   事件有序、单线程处理，无丢失、无重复（§5.3-1）；
+//! - 每 0.5s flush 前：归账 `[游标.since → now]` 到游标 exe（先按本地日历日拆分再入
+//!   ledger，§5.3-2），随后推进游标；
+//! - **暂停瞬间**（观察到 `paused` 上升沿）：先把增量秒数归账一次（已赚余数原样保留），
+//!   再把游标与 `FgState.since` 一并**冻结在暂停时刻**；**恢复时** `since=now`——暂停区间
+//!   不交给 ledger、不产生秒数，全程无减法无负值（§4.6/§5.3 逐字语义；暂停期间的
+//!   Foreground 事件只切换归属、不归账）。
+//!
+//! 归账本体（correctness-v2 §4.4）：aggregator 仍负责 OS 时间——elapsed 取自 Instant，
+//! 墙钟 end 取本次 `Local::now()`，`start = end − elapsed` 转 naive 后交
+//! [`AppTimeLedger`]：ledger 先把真实区间按本地午夜拆日，再对每个 `(day, exe)` 凑整，
+//! 产出的整数秒并入 `AppAcc.secs`（持久整数秒含义不变，§4.6），不足 1 秒余数留账、
+//! 跨归账/跨暂停接续。跨天 tick 时先把未归账区间完整归账，再
+//! [`AppTimeLedger::discard_before`] 清过期日的尾差（§5.3-3）；flush 失败只回并整数秒桶、
+//! ledger 不回滚不清空——重试不重复记秒（§5.3-5）；退出终账后 flush，余数随进程结束
+//! 丢弃（§5.3-6）。测试经 `wall_now` 注入固定墙钟——Instant 归账端点与墙钟 end 同时可控，
+//! 午夜边界确定性复现（禁止 sleep 逼近）。
 //!
 //! 输入事件的 exe 归属直接读 `FgState.exe`（apps 线程先落状态，值最新鲜，§2.3"当前前台"）。
 //! 归账游标读取入口见 [`Aggregator::account_seconds_unchecked`]——它正是"FgState 增量秒数"
@@ -45,13 +62,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, TimeDelta};
+use chrono::{DateTime, Local};
 use clrecoder_core::day;
 use clrecoder_core::event::{AggEvent, DeviceKey, RawEvent};
 use clrecoder_engine::Engine;
 use clrecoder_store::writer::{FlushBatch, Writer};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
+use crate::app_time::AppTimeLedger;
 use crate::apps::FgState;
 use crate::ipc_server::{Flags, RuntimeStatus};
 
@@ -73,7 +91,7 @@ const FLUSH_LOG_EVERY: u64 = 60;
 const DEVICE_LOG_EVERY: u64 = 60;
 
 /// `app_daily (day, exe)` 的内存聚合桶（§4.6 的 `AppAcc`）。
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct AppAcc {
     /// 前台秒数（按天切分后累加）
     secs: u64,
@@ -93,8 +111,9 @@ struct AppAcc {
 ///   [`RuntimeStatus::record_event`]）。
 ///
 /// 线程体 panic 时限频记录并重建聚合状态继续（§9.4 catch_unwind 兜底；丢失的仅是
-/// ≤0.5s 的未 flush 内存增量，`FgState`/`Flags` 不受影响）；收到 shutdown 或通道断开
-/// 时排空余事件、终账、最后一批 flush 后正常退出。
+/// ≤0.5s 的未 flush 内存增量与 ledger 不足整秒余数——余数本就不落库，§5.3-6 同类语义，
+/// `FgState`/`Flags` 不受影响）；收到 shutdown 或通道断开时排空余事件、终账、最后一批
+/// flush 后正常退出。
 #[must_use = "aggregator 线程必须被 join（main/selftest 等待终账与最后一批 flush）"]
 pub fn spawn(
     rx: Receiver<AggEvent>,
@@ -120,12 +139,13 @@ fn run(
 ) {
     loop {
         // Gilrs 式兜底：闭包捕获非 UnwindSafe 的 channel/Writer，断言后跨 catch_unwind 使用；
-        // panic 重建即全新聚合状态（≤0.5s 增量），共享的 Flags/FgState/Writer 无恙。
+        // panic 重建即全新聚合状态（≤0.5s 未 flush 增量 + ledger 各 (day,exe) <1s 余数），
+        // 共享的 Flags/FgState/Writer 无恙。
         match catch_unwind(AssertUnwindSafe(|| aggregate_loop(&rx, &writer, &flags, &fg, &status)))
         {
             Ok(()) => return,
             Err(_) => {
-                log::error!("aggregator 线程 panic（已捕获，重建聚合状态继续；≤0.5s 未 flush 增量丢失）");
+                log::error!("aggregator 线程 panic（已捕获，重建聚合状态继续；≤0.5s 未 flush 增量与 ledger 余数丢失）");
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -152,6 +172,8 @@ fn aggregate_loop(
         combos: HashMap::new(),
         apps: HashMap::new(),
         mouse_move: HashMap::new(),
+        ledger: AppTimeLedger::new(),
+        wall_now: Local::now,
         today: day::today_local(),
         fg_cur: None,
         paused_observed: flags.paused.load(Ordering::Acquire),
@@ -196,10 +218,18 @@ fn aggregate_loop(
             return;
         }
 
-        // 1s tick：刷新入桶日期（跨天检查，§4.6/§5.3——事件按到达时的本地日期入桶）
+        // 1s tick：刷新入桶日期（跨天检查，§4.6/§5.3——事件按到达时的本地日期入桶）。
+        // 跨天时先把仍指向前一日的未归账区间完整交给 ledger（整秒与余数就位），再清
+        // 过期日的不足 1 秒尾差——correctness-v2 §4.4/§5.3-3：discard_before 只能在完整
+        // 归账区间处理完后调用；此后区间只可能从新日起算，旧日余数再无接续机会。
         if now.duration_since(agg.last_tick) >= TICK_INTERVAL {
             agg.last_tick = now;
-            agg.today = day::today_local();
+            let today = day::today_local();
+            if today != agg.today {
+                agg.account_seconds(now);
+                agg.ledger.discard_before(&today);
+                agg.today = today;
+            }
         }
 
         // 0.5s flush：若脏（任一聚合桶非空）→ 构造 FlushBatch（含前台增量秒数，按天切分）
@@ -230,6 +260,13 @@ struct Aggregator {
     apps: HashMap<(String, String), AppAcc>,
     /// `mouse_move_daily` 桶：(device_id, day) → distance_inches
     mouse_move: HashMap<(i64, String), f64>,
+    /// 前台时长的亚秒余数账本（correctness-v2 §4.4）：按 `(day, exe)` 累计不足整秒零头、
+    /// 凑满整秒经 [`AppTimeLedger::account_interval`] 产出并入 `AppAcc.secs`。与统计桶
+    /// 生命周期分离——flush 成功不清账、失败回并桶时也不回滚/清账（§5.3-5）。
+    ledger: AppTimeLedger,
+    /// 墙钟读取器：归账 end 的来源（§4.4 aggregator 负责 OS 时间）。生产为 `Local::now`；
+    /// 测试注入固定端点，与 Instant 归账端点同时确定——禁止一端真实时钟造成午夜偶发。
+    wall_now: fn() -> DateTime<Local>,
     /// 入桶日期缓存（每 1s tick 刷新，跨天自动切换，§5.3）
     today: String,
     /// 前台秒数归账游标 (exe, 未归账起点)——FgState 增量的单线程无损载体（见模块文档）
@@ -259,24 +296,34 @@ impl Aggregator {
             self.on_pause_transition(paused, Instant::now());
         }
         match ev {
-            AggEvent::Foreground { exe } => self.on_foreground(exe, paused),
+            AggEvent::Foreground { exe } => self.on_foreground(exe, paused, Instant::now()),
             AggEvent::Input(raw) => {
                 // 收到即计（§4.4 StatusData.events_seen = "累计收到的事件数"，含暂停丢弃的）
                 self.status.record_event();
-                // 暂停：Input 事件丢弃（§4.6），Foreground 照常处理
                 if paused {
+                    // 键盘边沿照常喂状态机（按来源维护 held/修饰键，输出丢弃不计数），
+                    // 防止暂停期松开/按下的键在恢复后被误判（漏计首按 + 幽灵组合键）。
+                    // 其余 RawEvent 变体无内部状态可陈旧，照旧整条丢弃。
+                    if let RawEvent::Keyboard { source, sc, down, .. } = raw {
+                        let _ = self.engine.on_key_from(source, sc, down); // EngineOut 带 #[must_use]
+                    }
                     return;
                 }
                 self.on_input(raw);
             }
+            // 生命周期控制事件（correctness-v2 §4.3/§5.2）：无论 paused 均执行——暂停中
+            // 拔出设备/loop 重建同样要清 Engine 来源按下状态，否则恢复后产生幽灵组合键；
+            // 不写统计、不记 events_seen、不动 paused/shutdown（"全局清空不能替代来源移除"）。
+            AggEvent::SourceRemoved { source } => self.engine.remove_source(source),
+            AggEvent::KeyboardSourcesReset => self.engine.clear_sources(),
         }
     }
 
     /// Foreground 事件：先把旧 exe 的未归账尾段落桶，再切换归属（Foreground 照常处理，
     /// 保持 exe 归属正确，§4.6）。暂停期间只切换归属、不归账（区间冻结）。
     /// 调用前 `handle_event` 已完成沿消解——`paused` 即当前真实沿状态。
-    fn on_foreground(&mut self, exe: String, paused: bool) {
-        let now = Instant::now();
+    /// `now` 为事件消费时刻（§5.3-1 沿用既有实现；私有测试入口：与墙钟 end 同时可控）。
+    fn on_foreground(&mut self, exe: String, paused: bool, now: Instant) {
         if paused {
             self.fg_cur = Some((exe, now));
             return;
@@ -290,9 +337,9 @@ impl Aggregator {
     fn on_input(&mut self, raw: RawEvent) {
         let day = self.today.clone();
         match raw {
-            RawEvent::Keyboard { device, sc, down } => {
-                // 引擎状态先行：up 边沿/自动重复在此消化（§4.3）
-                let out = self.engine.on_key(sc, down);
+            RawEvent::Keyboard { source, device, sc, down } => {
+                // 引擎状态先行：up 边沿/自动重复在此消化（§4.3；按来源隔离，F3）
+                let out = self.engine.on_key_from(source, sc, down);
                 let Some(code) = out.key else { return }; // 无按键计数：up 边沿或自动重复
                 let Some(dev_id) = self.device_id(&device) else { return };
                 *self.inputs.entry((dev_id, day.clone(), code)).or_insert(0) += 1;
@@ -328,12 +375,14 @@ impl Aggregator {
 
     // ---------- 前台秒数归账 ----------
 
-    /// 暂停/恢复沿处理（§4.6 逐字语义）。
+    /// 暂停/恢复沿处理（§4.6 逐字语义；correctness-v2 §4.4：暂停沿先归账、冻结游标、
+    /// 保留已赚余数——余数不因暂停丢弃，恢复后同日同 exe 接续凑整）。
     fn on_pause_transition(&mut self, paused: bool, now: Instant) {
         self.paused_observed = paused;
         if paused {
             // 暂停瞬间：先把 FgState 增量秒数归账一次，再把 since 冻结在暂停时刻。
             // （旗标置位到本线程观察到的 ≤100ms 滞后按暂停前时间计入，属可忽略斜差。）
+            // 已赚的不足整秒余数原样留在 ledger（§4.4），恢复后接续凑整。
             self.account_seconds_unchecked(now);
         }
         // 恢复（与暂停冻结的写回）：游标与 FgState.since 一律重置为 now——
@@ -352,8 +401,14 @@ impl Aggregator {
         self.account_seconds_unchecked(now);
     }
 
-    /// 归账核心：游标尾段 `[since → now]` 按本地日历日切分入 `app_daily` 桶，随后推进游标。
-    /// 异常情形（时钟回拨/极小间隔）宁可丢弃零头也绝不产生负值（§4.6）。
+    /// 归账核心：游标尾段 `[since → now]` 交 [`AppTimeLedger`] 处理（correctness-v2 §4.4）
+    /// ——ledger 先把真实区间按本地午夜拆日、再对每个 `(day, exe)` 凑整，产出的整数秒
+    /// 并入 `app_daily` 桶（`AppAcc.secs` 持久整数秒含义不变），不足 1 秒余数留账、
+    /// 跨归账/跨暂停接续；随后推进游标。
+    ///
+    /// OS 时间归属（§4.4）：elapsed 取自 Instant，墙钟 end 经 [`Aggregator::wall_now`]
+    /// （生产 `Local::now()`，测试注入固定端点），`start = end − elapsed` 转 naive。
+    /// 零长区间不归账；`Instant` 反向差值饱和为 0、走同一路径——绝不产生负值（§4.6）。
     fn account_seconds_unchecked(&mut self, now: Instant) {
         let Some((exe, since)) = self.fg_cur.as_ref().map(|(e, s)| (e.clone(), *s)) else {
             return;
@@ -362,17 +417,15 @@ impl Aggregator {
         if elapsed.is_zero() {
             return;
         }
-        let end_wall = Local::now();
-        let Ok(delta) = TimeDelta::from_std(elapsed) else {
-            return;
-        };
-        let start_wall = end_wall - delta;
-        for (seg_day, secs) in split_seconds_by_day(start_wall, end_wall) {
-            if secs > 0 {
-                // i64 秒数已验证为正，try_from 失败按 0 兜底（防御，实际不可达）
-                let secs = u64::try_from(secs).unwrap_or(0);
-                self.app(&seg_day, &exe).secs += secs;
-            }
+        // 以本次墙钟为 end、减去 elapsed 得 start（§4.4 逐字）；DateTime − Duration 为
+        // instant 语义（与旧 TimeDelta 减法一致），转 naive 后交 ledger 按本地午夜拆分
+        let end_wall = (self.wall_now)();
+        let start_wall = end_wall - elapsed;
+        for delta in self
+            .ledger
+            .account_interval(&exe, start_wall.naive_local(), end_wall.naive_local())
+        {
+            self.app(&delta.day, &delta.exe).secs += delta.seconds;
         }
         if let Some((_, since)) = self.fg_cur.as_mut() {
             *since = now;
@@ -492,6 +545,8 @@ impl Aggregator {
 }
 
 /// flush 失败时把已取出的桶原样合并回去（计数累加，键合并——后续增量接着累计）。
+/// 参数多是 flush 回滚语义的直接映射（四类桶 × 当前+回滚）；私有辅助，不改聚合契约。
+#[allow(clippy::too_many_arguments)]
 fn merge_buckets_back(
     inputs: &mut HashMap<(i64, String, u16), u64>,
     combos: &mut HashMap<(String, u8, u16), u64>,
@@ -519,125 +574,312 @@ fn merge_buckets_back(
     }
 }
 
-/// 把墙钟区间 `[start, end]` 按本地日历日切分为 `(day, 秒数)` 段（§5.3"FgState 秒数在
-/// 日期边界切分到两个 (day,exe)"；系统休眠跨多天时自然切出多段）。
-///
-/// 纯函数：在 naive 本地时间上运算——DST 切换日的段长按墙钟差计（±1 小时偏差，符合
-/// §9.3"前台墙钟时长"语义）；`end <= start`（时钟回拨等异常）返回空——宁可不记，绝不负值。
-fn split_seconds_by_day(start: DateTime<Local>, end: DateTime<Local>) -> Vec<(String, i64)> {
-    split_secs_by_day_naive(start.naive_local(), end.naive_local())
-}
-
-/// [`split_seconds_by_day`] 的 naive 核心（可脱离时区单测）。
-fn split_secs_by_day_naive(start: NaiveDateTime, end: NaiveDateTime) -> Vec<(String, i64)> {
-    let mut out = Vec::new();
-    if end <= start {
-        return out;
-    }
-    let mut seg_start = start;
-    loop {
-        let seg_day = seg_start.date();
-        // 次日零点为段界；无次日（理论不可达：end > start 保证日期可推进）即止
-        let Some(next_day) = seg_day.succ_opt() else { break };
-        let seg_end = next_day.and_time(NaiveTime::MIN).min(end);
-        let secs = (seg_end - seg_start).num_seconds();
-        if secs > 0 {
-            out.push((day::format_day(seg_day), secs));
-        }
-        if seg_end >= end {
-            break;
-        }
-        seg_start = seg_end;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-    use std::path::PathBuf;
+    use chrono::TimeZone;
+    use std::path::{Path, PathBuf};
 
-    use clrecoder_core::codes::DeviceKind;
+    use clrecoder_core::codes::{mods, DeviceKind};
+    use clrecoder_core::event::InputSourceId;
 
-    /// 便捷构造 naive 时刻。
-    fn at(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, mi, s).unwrap()
+    // ---------------- correctness-v2 §4.4：前台时长 ledger 接线（S4/F4） ----------------
+    //
+    // 旧 fg_residual_ms 标量与整秒拆分 helper（split_secs_by_day_naive）退役：余数改由
+    // AppTimeLedger 按 (day, exe) 记账、先拆日再凑整。下列测试把原拆分 helper 的跨日/
+    // 反向/边界意图迁移到 aggregator 集成路径——墙钟经 `wall_now` 注入、Instant 端点经
+    // 参数注入，两侧同时确定（§4.4：禁止一端真实时钟造成午夜偶发、禁止 sleep 逼近）。
+
+    /// `wall_noon` 注入的固定"今日"（app 桶断言键；`day::format_day` 输出同形）。
+    const WALL_DAY: &str = "2026-09-28";
+
+    /// 固定本地墙钟构造（`with_ymd_and_hms` 整点秒，避开 DST 歧义时刻）。
+    fn wall_at(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(y, m, d, h, mi, s).unwrap()
     }
 
-    /// 汇总各段秒数（断言总量守恒用）。
-    fn total(segs: &[(String, i64)]) -> i64 {
-        segs.iter().map(|(_, s)| *s).sum()
+    /// 默认注入端点：2026-09-28 12:00:00（同日测试用）。
+    fn wall_noon() -> DateTime<Local> {
+        wall_at(2026, 9, 28, 12, 0, 0)
     }
 
+    /// 跨午夜 end：2026-09-29 00:00:01。
+    fn wall_just_past_midnight() -> DateTime<Local> {
+        wall_at(2026, 9, 29, 0, 0, 1)
+    }
+
+    /// 恰好午夜 end：2026-09-29 00:00:00（区间右开语义）。
+    fn wall_at_midnight() -> DateTime<Local> {
+        wall_at(2026, 9, 29, 0, 0, 0)
+    }
+
+    /// 年界 end：2027-01-01 00:00:01。
+    fn wall_year_boundary() -> DateTime<Local> {
+        wall_at(2027, 1, 1, 0, 0, 1)
+    }
+
+    /// 月界 end：2027-03-01 00:00:01。
+    fn wall_month_boundary() -> DateTime<Local> {
+        wall_at(2027, 3, 1, 0, 0, 1)
+    }
+
+    /// 休眠跨多天 end：2026-09-30 06:00:00。
+    fn wall_multiday_end() -> DateTime<Local> {
+        wall_at(2026, 9, 30, 6, 0, 0)
+    }
+
+    /// 汇总 app 桶全部整数秒（跨日守恒断言用）。
+    fn total_secs(agg: &Aggregator) -> u64 {
+        agg.apps.values().map(|a| a.secs).sum()
+    }
+
+    /// 回归（原 half_second_flush_segments_accumulate_via_residual 意图迁移）：0.5s 一段地
+    /// 归账时，余数必须经 ledger 把两个 0.5s 接成 1 秒，而不是各截断成 0；flush 成功不清
+    /// 余数——余下零头继续接续凑整（§5.3-3）。
     #[test]
-    fn same_day_interval_is_single_segment() {
-        let segs = split_secs_by_day_naive(at(2026, 9, 28, 10, 0, 0), at(2026, 9, 28, 10, 0, 30));
-        assert_eq!(segs, vec![("2026-09-28".to_string(), 30)]);
+    fn correctness_v2_half_second_flushes_accumulate_via_ledger_remainder() {
+        let (mut agg, db) = agg_with_frozen_cursor("ledger-residual", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("code.exe".to_string(), t0));
+        // 模拟 0.5s 周期 flush 的逐次归账（每段 elapsed 恰 500ms）
+        agg.account_seconds(t0 + Duration::from_millis(500));
+        assert_eq!(total_secs(&agg), 0, "首段 0.5s 不足整秒，不得产出");
+        agg.account_seconds(t0 + Duration::from_millis(1000));
+        assert_eq!(total_secs(&agg), 1, "两个 0.5s 必须接续凑出 1 秒");
+        // flush 成功保留余数：第三次归账余 500ms，不产出新整秒
+        agg.account_seconds(t0 + Duration::from_millis(1500));
+        assert_eq!(total_secs(&agg), 1, "flush 成功不清 ledger 余数");
+        agg.account_seconds(t0 + Duration::from_millis(2000));
+        assert_eq!(total_secs(&agg), 2, "余数接续凑出第 2 秒");
+        drop(agg);
+        cleanup_db(&db);
     }
 
+    /// §4.4 精确示例：A 400ms / B 600ms 前台交替 20 轮 → A 8 秒、B 12 秒。
+    /// Foreground 切换先按旧 exe 归账再移动游标（§5.3-1），余数跨切换分段接续。
     #[test]
-    fn midnight_crossing_splits_into_two_days() {
-        // §5.3：FgState 秒数在日期边界切分到两个 (day,exe)
-        let segs = split_secs_by_day_naive(at(2026, 9, 28, 23, 59, 58), at(2026, 9, 29, 0, 0, 3));
+    fn correctness_v2_foreground_switch_ab_alternating_20_rounds_settle_8_and_12_seconds() {
+        let (mut agg, db) = agg_with_frozen_cursor("fg-ab-8-12", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        for round in 0..20u32 {
+            let base = u64::from(round) * 1000;
+            // A 用满 400ms 后切到 B：先归账 A 的尾段，再切游标
+            agg.on_foreground("b.exe".to_string(), false, t0 + Duration::from_millis(base + 400));
+            // B 用满 600ms 后切回 A
+            agg.on_foreground("a.exe".to_string(), false, t0 + Duration::from_millis(base + 1000));
+        }
+        let a = &agg.apps[&(WALL_DAY.to_string(), "a.exe".to_string())];
+        let b = &agg.apps[&(WALL_DAY.to_string(), "b.exe".to_string())];
+        assert_eq!(a.secs, 8, "20×400ms 必须凑出整 8 秒");
+        assert_eq!(b.secs, 12, "20×600ms 必须凑出整 12 秒");
+        assert_eq!(agg.apps.len(), 2, "同日恰两个 (day,exe) 桶: {:?}", agg.apps);
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// §4.4 精确示例（暂停接续）：暂停沿先归账 A 400ms 并冻结游标（已赚余数保留），
+    /// 暂停 100 秒不归账，恢复重设游标后 A 600ms → 恰 1 秒（暂停区间不交给 ledger）。
+    #[test]
+    fn correctness_v2_pause_edge_accounts_then_freezes_and_remainder_carries_over() {
+        let (mut agg, db) = agg_with_frozen_cursor("pause-remainder", Duration::ZERO);
+        agg.paused_observed = false;
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // 暂停沿（pipe 已置位）在 t0+400ms：先归账 400ms（不足整秒→余数留账），再冻结
+        agg.flags.paused.store(true, Ordering::Release);
+        agg.on_pause_transition(true, t0 + Duration::from_millis(400));
+        assert!(agg.paused_observed);
+        assert_eq!(total_secs(&agg), 0, "400ms 不足整秒，整数秒桶为空");
+        // 暂停 100 秒：区间不归账；恢复沿（pipe 已复位）重设游标
+        let t_resume = t0 + Duration::from_millis(400) + Duration::from_secs(100);
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.on_pause_transition(false, t_resume);
+        // 恢复后 A 600ms：与暂停前 400ms 接续凑整 → 恰 1 秒，暂停 100s 不计入
+        agg.account_seconds(t_resume + Duration::from_millis(600));
+        let a = &agg.apps[&(WALL_DAY.to_string(), "a.exe".to_string())];
+        assert_eq!(a.secs, 1, "400ms+600ms 接续凑出 1 秒");
+        assert_eq!(agg.apps.len(), 1, "暂停区间与恢复时刻不得产生其他桶: {:?}", agg.apps);
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 原 midnight_crossing_splits_into_two_days 意图迁移：归账区间横跨本地午夜时，
+    /// 整数秒按日分桶——先拆日再凑整，两日桶各自独立成秒、不互相借零头（§5.3-2）。
+    #[test]
+    fn correctness_v2_cross_midnight_interval_splits_into_two_day_buckets() {
+        let (mut agg, db) = agg_with_frozen_cursor("cross-midnight", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.wall_now = wall_just_past_midnight; // end = 2026-09-29 00:00:01
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // elapsed 5s → naive 区间 [2026-09-28 23:59:56 → 2026-09-29 00:00:01]
+        agg.account_seconds(t0 + Duration::from_secs(5));
+        let secs_of = |day: &str| agg.apps[&(day.to_string(), "a.exe".to_string())].secs;
+        assert_eq!(secs_of("2026-09-28"), 4, "午夜前的 4 秒归前一日");
+        assert_eq!(secs_of("2026-09-29"), 1, "午夜后的 1 秒归次日");
+        assert_eq!(agg.apps.len(), 2, "恰两个日桶: {:?}", agg.apps);
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 原 end_exactly_at_midnight_belongs_to_previous_day 意图迁移：区间右开——恰好
+    /// 结束于午夜零点的时长全归前一日，次日不产生桶。
+    #[test]
+    fn correctness_v2_interval_ending_exactly_at_midnight_belongs_to_previous_day() {
+        let (mut agg, db) = agg_with_frozen_cursor("end-at-midnight", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.wall_now = wall_at_midnight; // end = 2026-09-29 00:00:00
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // elapsed 2s → [2026-09-28 23:59:58 → 2026-09-29 00:00:00]
+        agg.account_seconds(t0 + Duration::from_secs(2));
         assert_eq!(
-            segs,
-            vec![("2026-09-28".to_string(), 2), ("2026-09-29".to_string(), 3)]
+            agg.apps[&("2026-09-28".to_string(), "a.exe".to_string())].secs,
+            2,
+            "右开区间整段归前一日"
         );
+        assert!(
+            !agg.apps.contains_key(&("2026-09-29".to_string(), "a.exe".to_string())),
+            "次日零点时刻不属于次日: {:?}",
+            agg.apps
+        );
+        drop(agg);
+        cleanup_db(&db);
     }
 
+    /// 原 multi_day_span_is_split_per_calendar_day 意图迁移：休眠跨多天（Instant 连续
+    /// 计时、墙钟端点固定）按日历日逐段切分，各日独立成秒、总量守恒。
     #[test]
-    fn end_exactly_at_midnight_belongs_to_previous_day() {
-        // 区间右开：恰好到零点的秒数全归前一日
-        let segs = split_secs_by_day_naive(at(2026, 9, 28, 23, 59, 58), at(2026, 9, 29, 0, 0, 0));
-        assert_eq!(segs, vec![("2026-09-28".to_string(), 2)]);
+    fn correctness_v2_multi_day_span_splits_per_calendar_day() {
+        let (mut agg, db) = agg_with_frozen_cursor("multi-day", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.wall_now = wall_multiday_end; // end = 2026-09-30 06:00:00
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // elapsed 56h → naive 区间 [2026-09-28 22:00 → 2026-09-30 06:00]
+        let elapsed_secs: u64 = 2 * 3600 + 86_400 + 6 * 3600;
+        agg.account_seconds(t0 + Duration::from_secs(elapsed_secs));
+        assert_eq!(agg.apps[&("2026-09-28".to_string(), "a.exe".to_string())].secs, 2 * 3600);
+        assert_eq!(agg.apps[&("2026-09-29".to_string(), "a.exe".to_string())].secs, 86_400);
+        assert_eq!(agg.apps[&("2026-09-30".to_string(), "a.exe".to_string())].secs, 6 * 3600);
+        assert_eq!(total_secs(&agg), elapsed_secs, "切分不丢总量");
+        drop(agg);
+        cleanup_db(&db);
     }
 
+    /// 原 year_boundary_and_month_boundary_split_correctly 意图迁移：年界/月界
+    /// （2027-02-28 → 03-01，非闰年）同样按日历日切分。
     #[test]
-    fn multi_day_span_is_split_per_calendar_day() {
-        // 休眠跨多天（Instant 连续计时、墙钟跳跃）：按日历日逐段切分
-        let segs = split_secs_by_day_naive(at(2026, 9, 28, 22, 0, 0), at(2026, 9, 30, 6, 0, 0));
+    fn correctness_v2_year_and_month_boundary_accounting_split_correctly() {
+        // 年界：end 2027-01-01 00:00:01、elapsed 2s → 2026-12-31 1 秒 + 2027-01-01 1 秒
+        {
+            let (mut agg, db) = agg_with_frozen_cursor("year-boundary", Duration::ZERO);
+            agg.paused_observed = false;
+            agg.flags.paused.store(false, Ordering::Release);
+            agg.wall_now = wall_year_boundary;
+            let t0 = Instant::now();
+            agg.fg_cur = Some(("a.exe".to_string(), t0));
+            agg.account_seconds(t0 + Duration::from_secs(2));
+            assert_eq!(agg.apps[&("2026-12-31".to_string(), "a.exe".to_string())].secs, 1);
+            assert_eq!(agg.apps[&("2027-01-01".to_string(), "a.exe".to_string())].secs, 1);
+            drop(agg);
+            cleanup_db(&db);
+        }
+        // 月界：end 2027-03-01 00:00:01、elapsed 2s → 2027-02-28 1 秒 + 2027-03-01 1 秒
+        {
+            let (mut agg, db) = agg_with_frozen_cursor("month-boundary", Duration::ZERO);
+            agg.paused_observed = false;
+            agg.flags.paused.store(false, Ordering::Release);
+            agg.wall_now = wall_month_boundary;
+            let t0 = Instant::now();
+            agg.fg_cur = Some(("a.exe".to_string(), t0));
+            agg.account_seconds(t0 + Duration::from_secs(2));
+            assert_eq!(agg.apps[&("2027-02-28".to_string(), "a.exe".to_string())].secs, 1);
+            assert_eq!(agg.apps[&("2027-03-01".to_string(), "a.exe".to_string())].secs, 1);
+            drop(agg);
+            cleanup_db(&db);
+        }
+    }
+
+    /// 原 inverted_or_zero_interval_yields_nothing_and_never_negative 意图迁移：零长区间
+    /// 不归账、不扰动余数（Instant 端点经 duration_since 对反向差值饱和为 0、走同一路径，
+    /// 绝不负值；ledger 侧的反向区间语义由 app_time::tests 覆盖）。
+    #[test]
+    fn correctness_v2_zero_elapsed_accounts_nothing_and_keeps_remainder() {
+        let (mut agg, db) = agg_with_frozen_cursor("zero-elapsed", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // 先赚 400ms 余数
+        agg.account_seconds(t0 + Duration::from_millis(400));
+        assert_eq!(total_secs(&agg), 0);
+        // 零长区间（now == since）：不产出、游标与余数原样
+        agg.account_seconds(t0 + Duration::from_millis(400));
+        assert_eq!(total_secs(&agg), 0, "零长区间不得产出");
+        // 余数未受扰动：补 600ms 恰好凑整 1 秒
+        agg.account_seconds(t0 + Duration::from_millis(1000));
+        assert_eq!(total_secs(&agg), 1, "零长区间不得扰动余数（400ms 应原样接续）");
+        assert_eq!(agg.apps.len(), 1, "零长区间不得产生其他桶");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// §5.3-5/§8.3：flush 失败（输入桶放入不存在的 device_id → 现有外键事务失败）回并
+    /// app 整数秒桶、ledger 不回滚不清空；清除标记重试后成功清桶、整数秒不重复
+    /// （重试批次内容在其发送前逐点断言；库级事务原子性由 store 侧既有测试覆盖）。
+    #[test]
+    fn correctness_v2_failed_flush_merges_app_secs_back_and_retry_does_not_double_count() {
+        let (mut agg, db) = agg_with_frozen_cursor("failed-flush", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let day = WALL_DAY.to_string();
+        let t0 = Instant::now();
+        agg.fg_cur = Some(("a.exe".to_string(), t0));
+        // 归账 1.5s：1 整秒入桶、500ms 余数留 ledger
+        agg.account_seconds(t0 + Duration::from_millis(1500));
+        assert_eq!(agg.apps[&(day.clone(), "a.exe".to_string())].secs, 1);
+        // 测试标记：输入桶放入不存在的 device_id，令现有外键事务失败（§8.3 允许手法）
+        let ghost_device = 7_654_321i64;
+        agg.inputs.insert((ghost_device, day.clone(), 0x1E), 1);
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 1, "外键事务必须失败");
+        // app 整数秒桶回并不丢；ledger 不回滚不清空——再归账 500ms 与留账余数接续，
+        // 恰好新产出 1 整秒（若失败时清空/重复提取 ledger，这里不会恰为 2）
+        assert_eq!(agg.apps[&(day.clone(), "a.exe".to_string())].secs, 1, "失败必须回并 app 桶");
+        agg.account_seconds(t0 + Duration::from_secs(2));
+        assert_eq!(agg.apps[&(day.clone(), "a.exe".to_string())].secs, 2);
+        // 清除测试标记重试：成功（streak 清零）；成功路径清桶——已写库的整数秒不残留
+        // 桶内，下一轮 flush 不会重复发送（§5.3-5"重试不会重复记秒"的聚合侧语义；
+        // §8.3：校验全部走聚合桶内存态，不为读库引入 rusqlite）
+        agg.inputs.remove(&(ghost_device, day.clone(), 0x1E));
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 0, "重试应成功");
+        assert!(agg.apps.is_empty(), "成功 flush 必须清桶，不残留已写库的整秒: {:?}", agg.apps);
+        assert!(agg.inputs.is_empty(), "ghost 标记清除后不得残留输入行: {:?}", agg.inputs);
+        // 失败-重试周期后管道照常：余数精确耗尽（1.5s+0.5s=2s），两段 500ms 接续凑出
+        // 第 3 秒并成功落库清桶——后续归账与 flush 不受失败周期影响
+        agg.account_seconds(t0 + Duration::from_millis(2500));
+        assert!(agg.apps.is_empty(), "余数精确耗尽后 500ms 不得提前产出: {:?}", agg.apps);
+        agg.account_seconds(t0 + Duration::from_millis(3000));
         assert_eq!(
-            segs,
-            vec![
-                ("2026-09-28".to_string(), 2 * 3600),
-                ("2026-09-29".to_string(), 86_400),
-                ("2026-09-30".to_string(), 6 * 3600),
-            ]
+            agg.apps.get(&(day, "a.exe".to_string())).map(|a| a.secs),
+            Some(1),
+            "余数接续凑出第 3 秒: {:?}",
+            agg.apps
         );
-        assert_eq!(total(&segs), 2 * 3600 + 86_400 + 6 * 3600);
-    }
-
-    #[test]
-    fn year_boundary_and_month_boundary_split_correctly() {
-        let segs = split_secs_by_day_naive(at(2026, 12, 31, 23, 59, 59), at(2027, 1, 1, 0, 0, 1));
-        assert_eq!(
-            segs,
-            vec![("2026-12-31".to_string(), 1), ("2027-01-01".to_string(), 1)]
-        );
-        let segs = split_secs_by_day_naive(at(2027, 2, 28, 23, 59, 59), at(2027, 3, 1, 0, 0, 1));
-        assert_eq!(
-            segs,
-            vec![("2027-02-28".to_string(), 1), ("2027-03-01".to_string(), 1)]
-        );
-    }
-
-    #[test]
-    fn inverted_or_zero_interval_yields_nothing_and_never_negative() {
-        // 时钟回拨（start > end）与零长区间：空结果，绝不产生负秒数（§4.6）
-        assert!(split_secs_by_day_naive(at(2026, 9, 28, 1, 0, 0), at(2026, 9, 28, 0, 0, 0)).is_empty());
-        assert!(split_secs_by_day_naive(at(2026, 9, 28, 8, 0, 0), at(2026, 9, 28, 8, 0, 0)).is_empty());
-    }
-
-    #[test]
-    fn sub_second_truncation_keeps_total_consistent() {
-        // 毫秒级区间：秒数截断为 0，不产生空段
-        let start = at(2026, 9, 28, 0, 0, 0);
-        let end = start + TimeDelta::try_milliseconds(999).unwrap();
-        assert!(split_secs_by_day_naive(start, end).is_empty());
-        // 恰好 1 秒 → 1 段 1 秒
-        let end = start + TimeDelta::try_seconds(1).unwrap();
-        assert_eq!(split_secs_by_day_naive(start, end), vec![("2026-09-28".to_string(), 1)]);
+        agg.flush_buckets();
+        assert!(agg.apps.is_empty(), "第 3 秒应成功落库并清桶");
+        drop(agg);
+        cleanup_db(&db);
     }
 
     #[test]
@@ -703,6 +945,8 @@ mod tests {
     // 秒数"）。以下用例确定性复现该竞态（无 sleep、无线程），守住修复。
 
     /// 带冻结游标的 aggregator（临时库；tag+pid 保证路径唯一，结束清理）。
+    /// 墙钟固定在 wall_noon（2026-09-28 12:00:00）——归账端点两侧同时确定；
+    /// 需要跨天/年月界端点的测试再覆写 `wall_now`。
     fn agg_with_frozen_cursor(tag: &str, frozen_for: Duration) -> (Aggregator, PathBuf) {
         let db =
             std::env::temp_dir().join(format!("clrecoder-agg-{tag}-{}.db", std::process::id()));
@@ -723,6 +967,8 @@ mod tests {
             combos: HashMap::new(),
             apps: HashMap::new(),
             mouse_move: HashMap::new(),
+            ledger: AppTimeLedger::new(),
+            wall_now: wall_noon,
             today: day::today_local(),
             // 游标停在 alpha.exe，且"暂停已冻结"2 秒（旗标翻转发生在冻结之后）
             fg_cur: Some(("alpha.exe".to_string(), Instant::now() - frozen_for)),
@@ -735,7 +981,7 @@ mod tests {
         (agg, db)
     }
 
-    fn cleanup_db(db: &PathBuf) {
+    fn cleanup_db(db: &Path) {
         for suffix in ["", "-wal", "-shm"] {
             let mut name = db.as_os_str().to_owned();
             name.push(suffix);
@@ -774,10 +1020,11 @@ mod tests {
     fn foreground_while_active_accounts_old_exe_tail() {
         let (mut agg, db) = agg_with_frozen_cursor("active-fg", Duration::from_secs(2));
         // 活动期（沿已对齐为未暂停）：旧 exe 的 2s 尾段正常归账后切换游标
+        // （归账桶的日期取注入墙钟 wall_noon 的固定日）
         agg.paused_observed = false;
         agg.flags.paused.store(false, Ordering::Release);
         agg.handle_event(AggEvent::Foreground { exe: "beta.exe".to_string() });
-        let alpha = &agg.apps[&(day::today_local(), "alpha.exe".to_string())];
+        let alpha = &agg.apps[&(WALL_DAY.to_string(), "alpha.exe".to_string())];
         assert_eq!(alpha.secs, 2, "旧 exe 尾段应无损归账");
         assert_eq!(agg.fg_cur.as_ref().unwrap().0, "beta.exe");
         drop(agg);
@@ -795,12 +1042,307 @@ mod tests {
             pid: 8,
             name: "测试键盘".to_string(),
         };
-        agg.handle_event(AggEvent::Input(RawEvent::Keyboard { device: dev.clone(), sc: 0x1E, down: true }));
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
         let dev_id = agg.devices.get(&dev).copied().unwrap();
         let day = day::today_local();
         assert_eq!(agg.inputs.get(&(dev_id, day.clone(), 0x1E)), Some(&1), "恢复后的按键应计数");
-        // 暂停冻结区间不得入账
-        assert!(!agg.apps.contains_key(&(day, "alpha.exe".to_string())));
+        // 暂停冻结区间不得入账（app 桶断言键取注入墙钟的固定日）
+        assert!(
+            !agg.apps.contains_key(&(WALL_DAY.to_string(), "alpha.exe".to_string())),
+            "暂停区间不得入账: {:?}",
+            agg.apps
+        );
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 暂停期键盘边沿仍喂 Engine（held/修饰键维护），输出丢弃不计数；
+    /// 恢复后首按不被当自动重复吞掉，且不产生幽灵组合键。
+    #[test]
+    fn paused_keyboard_edges_keep_engine_state_fresh() {
+        let (mut agg, db) = agg_with_frozen_cursor("paused-kb", Duration::from_secs(2));
+        // helper 只设 paused_observed:true、flag 默认 false——必须显式置位，
+        // 否则首条事件会走恢复沿消解，测试假绿。
+        agg.flags.paused.store(true, Ordering::Release);
+
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 1,
+            pid: 2,
+            name: "测试键盘".to_string(),
+        };
+        let day = day::today_local();
+
+        // 暂停中键盘按下：边沿仍喂 engine，但 inputs/combos/apps 全空
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        assert!(agg.inputs.is_empty(), "暂停中按下不得入 input_daily: {:?}", agg.inputs);
+        assert!(agg.combos.is_empty(), "暂停中不得入 combo_daily: {:?}", agg.combos);
+        assert!(agg.apps.is_empty(), "暂停中不得入 app_daily: {:?}", agg.apps);
+
+        // 恢复：先 up 再 down——首按恰计 1（paused 期间的 down 边沿已喂 engine，
+        // 恢复后的 down 不会被当自动重复吞掉，也不重复计）
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: false,
+        }));
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        assert_eq!(agg.inputs.get(&(dev_id, day.clone(), 0x1E)), Some(&1), "恢复后首按应恰计 1");
+        assert!(agg.combos.is_empty(), "单键不得产生组合: {:?}", agg.combos);
+
+        // 推荐附加：暂停前 Ctrl down → 暂停期 Ctrl up → 恢复后 C down → combos 仍空
+        // （暂停期 up 边沿必须喂 engine 维护 held，否则 held 残留 Ctrl 会幽灵 Ctrl+C）
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1D,
+            down: true,
+        }));
+        agg.flags.paused.store(true, Ordering::Release);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1D,
+            down: false,
+        }));
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x2E,
+            down: true,
+        }));
+        assert!(agg.combos.is_empty(), "暂停期松开的 Ctrl 不得产生幽灵 Ctrl+C: {:?}", agg.combos);
+
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    // ---------------- correctness-v2 §4.3/§5.2：物理来源与生命周期接线（F3/F5） ----------------
+
+    /// §5.2 边界：同型号两键盘（不同来源、相同 DeviceKey）各产 1 个 Key，
+    /// 并入同一个型号桶（Writer 侧再按型号归并）。
+    #[test]
+    fn correctness_v2_same_model_two_sources_merge_into_one_device_bucket() {
+        let (mut agg, db) = agg_with_frozen_cursor("same-model", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 7,
+            pid: 8,
+            name: "测试键盘".to_string(),
+        };
+        // 两个物理连接（来源 101/102）按同一个码：各自独立计数（Engine 来源维度），
+        // 聚合桶仍按 DeviceKey 归并
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(101),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(102),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        assert_eq!(
+            agg.inputs.get(&(dev_id, day::today_local(), 0x1E)),
+            Some(&2),
+            "同型号两键盘的按键并入同一个型号桶"
+        );
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// §5.2-5：移除一个来源只清该来源 held，另一个仍按住的同码修饰键保留——
+    /// SourceRemoved 后其余来源的 C 仍产 Ctrl+C。
+    #[test]
+    fn correctness_v2_source_removed_keeps_other_source_modifier() {
+        let (mut agg, db) = agg_with_frozen_cursor("remove-keeps-mod", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 7,
+            pid: 8,
+            name: "测试键盘".to_string(),
+        };
+        // 两个键盘都按住 Ctrl
+        for source in [InputSourceId(101), InputSourceId(102)] {
+            agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+                source,
+                device: dev.clone(),
+                sc: 0x1D,
+                down: true,
+            }));
+        }
+        // 101 拔出：只清 101 的 held
+        agg.handle_event(AggEvent::SourceRemoved { source: InputSourceId(101) });
+        // 102 的 C：仍有 Ctrl+C（其他来源修饰位保留）
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(102),
+            device: dev.clone(),
+            sc: 0x2E,
+            down: true,
+        }));
+        let day = day::today_local();
+        assert_eq!(
+            agg.combos.get(&(day, mods::CTRL, 0x2E)),
+            Some(&1),
+            "SourceRemoved 不得清掉其他来源的修饰位: {:?}",
+            agg.combos
+        );
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// §5.2 边界"暂停中移除同样处理生命周期"：SourceRemoved 无论 paused 均执行——
+    /// 暂停中 101 Ctrl down（held 维护）→ 暂停中拔出 101 → 恢复后 102 C down 无幽灵 Ctrl。
+    #[test]
+    fn correctness_v2_source_removed_during_pause_clears_held_state() {
+        let (mut agg, db) = agg_with_frozen_cursor("paused-removal", Duration::from_secs(2));
+        // helper 只设 paused_observed:true、flag 默认 false——必须显式置位保持暂停沿一致
+        agg.flags.paused.store(true, Ordering::Release);
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 7,
+            pid: 8,
+            name: "测试键盘".to_string(),
+        };
+        // 暂停中 101 Ctrl down：边沿喂 engine（不计数）
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(101),
+            device: dev.clone(),
+            sc: 0x1D,
+            down: true,
+        }));
+        // 暂停中拔出来源 101：生命周期分支必须执行（否则恢复后 102 的 C 带幽灵 Ctrl）
+        agg.handle_event(AggEvent::SourceRemoved { source: InputSourceId(101) });
+        // 恢复后 102 C down：正常计数、无组合
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(102),
+            device: dev.clone(),
+            sc: 0x2E,
+            down: true,
+        }));
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        assert!(agg.combos.is_empty(), "移除来源的 Ctrl 不得产生幽灵组合: {:?}", agg.combos);
+        assert_eq!(
+            agg.inputs.get(&(dev_id, day::today_local(), 0x2E)),
+            Some(&1),
+            "恢复后 102 的 C 应正常计数"
+        );
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// §5.2-6：loop 重建的 KeyboardSourcesReset 清空全部来源 held（含修饰位与同源
+    /// 去重表）——reset 后同码 down 重新计数且无旧修饰键，随后同源 repeat 正常去重。
+    #[test]
+    fn correctness_v2_keyboard_sources_reset_clears_all_held() {
+        let (mut agg, db) = agg_with_frozen_cursor("reset-all", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 7,
+            pid: 8,
+            name: "测试键盘".to_string(),
+        };
+        // 101 Ctrl、102 Shift 按住
+        for (source, sc) in [(InputSourceId(101), 0x1Du16), (InputSourceId(102), 0x2A)] {
+            agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+                source,
+                device: dev.clone(),
+                sc,
+                down: true,
+            }));
+        }
+        agg.handle_event(AggEvent::KeyboardSourcesReset);
+        // reset 后 101 A down：重新计数，且不继承任何来源的旧修饰键
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(101),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        let day = day::today_local();
+        assert_eq!(agg.inputs.get(&(dev_id, day.clone(), 0x1E)), Some(&1), "reset 后同码 down 重新计数");
+        assert!(agg.combos.is_empty(), "reset 必须清掉全部来源修饰位: {:?}", agg.combos);
+        // reset 重建的同源去重表生效：101 A 的自动重复不计数
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(101),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        assert_eq!(agg.inputs.get(&(dev_id, day, 0x1E)), Some(&1), "同源 repeat 仍去重");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 生命周期事件不写统计、不记 events_seen（§4.3）：SourceRemoved/Reset 前后
+    /// 全部统计桶逐键相等（只动 Engine 按下状态，不动任何计数）。
+    #[test]
+    fn correctness_v2_lifecycle_events_do_not_count_or_record_status() {
+        let (mut agg, db) = agg_with_frozen_cursor("lifecycle-clean", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey {
+            kind: DeviceKind::Keyboard,
+            vid: 7,
+            pid: 8,
+            name: "测试键盘".to_string(),
+        };
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard {
+            source: InputSourceId(1),
+            device: dev.clone(),
+            sc: 0x1E,
+            down: true,
+        }));
+        assert_eq!(agg.status.events_seen.load(Ordering::Relaxed), 1, "正常输入记 events_seen");
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        let inputs_before = agg.inputs.clone();
+        let combos_before = agg.combos.clone();
+        let apps_before = agg.apps.clone();
+        let mouse_move_before = agg.mouse_move.clone();
+
+        agg.handle_event(AggEvent::SourceRemoved { source: InputSourceId(1) });
+        agg.handle_event(AggEvent::KeyboardSourcesReset);
+        assert_eq!(
+            agg.status.events_seen.load(Ordering::Relaxed),
+            1,
+            "生命周期事件不得增加 events_seen"
+        );
+        assert_eq!(agg.inputs, inputs_before, "生命周期事件不得写 input_daily 桶");
+        assert_eq!(agg.combos, combos_before, "生命周期事件不得写 combo_daily 桶");
+        assert_eq!(agg.apps, apps_before, "生命周期事件不得写 app_daily 桶");
+        assert_eq!(agg.mouse_move, mouse_move_before, "生命周期事件不得写 mouse_move 桶");
+        // 已入桶计数保持不变（幂等引用：dev_id 桶仍存在）
+        assert_eq!(agg.inputs.get(&(dev_id, day::today_local(), 0x1E)), Some(&1));
         drop(agg);
         cleanup_db(&db);
     }

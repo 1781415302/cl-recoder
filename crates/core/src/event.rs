@@ -1,8 +1,14 @@
-//! 采集层 → aggregator 的事件语言（PLAN §4.2 逐字对齐）。
+//! 采集层 → aggregator 的事件语言（PLAN §4.2 + correctness-v2 §4.1）。
 //!
 //! 三个采集线程（raw_input / gamepad / apps）各自翻译为 [`RawEvent`] / [`AggEvent::Foreground`]，
 //! 经 crossbeam channel 送入 aggregator（engine_loop）。按键边沿提取、滚轮 delta→刻度折算
 //! 都在采集层完成——本层事件已经是"一次物理按下"语义。
+//!
+//! [`InputSourceId`] 表达"一次物理连接"：collector 进程内单调分配且不重用，不编码
+//! vid/pid/kind（设备身份由 [`DeviceKey`] 承载）；`0` 保留给 Engine 的单来源兼容入口，
+//! 真实 Raw Input 与 selftest 显式注入使用正 ID。[`AggEvent::SourceRemoved`] /
+//! [`AggEvent::KeyboardSourcesReset`] 是生命周期控制事件——不写统计、不增加 events_seen、
+//! 不改变 paused/shutdown。
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +32,18 @@ pub struct DeviceKey {
     pub name: String,
 }
 
+/// 输入来源 ID（correctness-v2 §4.1）：一次物理连接在 collector 进程内的身份。
+///
+/// - 真实 ID 由 collector 单调分配且**不重用**；原生句柄（hDevice 等）的 bit pattern
+///   不能直接充当 ID；ID 仅表达连接，不编码 vid/pid/kind。
+/// - `0` 专用于 Engine 的单来源兼容入口（[`clrecoder_engine::Engine::on_key`]）；
+///   真实 Raw Input 以及 selftest 显式注入使用正 ID。
+/// - `#[serde(transparent)]`：线上形状是裸 u64。`Keyboard.source` 不设 serde 缺省——
+///   内部构造者必须显式携带来源（项目无原始事件持久化，不建立回放兼容合同）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InputSourceId(pub u64);
+
 /// 采集层产出的原始输入事件。**只投递按下边沿**（up 不计数）；
 /// 键盘的 up 事件仍需投递（Engine 维护按下状态表去重自动重复/判定组合键）。
 /// （无 `Eq`：MouseMove 携带 f64 距离。）
@@ -33,6 +51,8 @@ pub struct DeviceKey {
 pub enum RawEvent {
     /// 键盘事件：`sc` 为 normalize_scancode 归一化后的 scancode，`down` 为按下/抬起边沿
     Keyboard {
+        /// 输入来源（连接 ID；0 为 Engine 单来源兼容入口，真实输入用正 ID）
+        source: InputSourceId,
         /// 设备
         device: DeviceKey,
         /// 归一化 scancode（0xE000/0xE100 前缀位含在内）
@@ -63,7 +83,9 @@ pub enum RawEvent {
     },
 }
 
-/// 送入 aggregator 的聚合事件：`Input` 走统计，`Foreground` 更新当前归属 exe。
+/// 送入 aggregator 的聚合事件：`Input` 走统计，`Foreground` 更新当前归属 exe，
+/// `SourceRemoved` / `KeyboardSourcesReset` 为生命周期控制事件（不写统计、不增加
+/// events_seen、不改变 paused/shutdown）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AggEvent {
     /// 原始输入事件（键盘/鼠标/手柄）
@@ -73,6 +95,13 @@ pub enum AggEvent {
         /// 前台进程 exe 的小写 basename
         exe: String,
     },
+    /// 输入来源移除（设备拔出/失联）：aggregator 据此清 Engine 中该来源的按下状态
+    SourceRemoved {
+        /// 被移除的连接 ID
+        source: InputSourceId,
+    },
+    /// 全部键盘来源重置（待机/系统级重置）：aggregator 据此清空 Engine 按下状态
+    KeyboardSourcesReset,
 }
 
 #[cfg(test)]
@@ -130,8 +159,8 @@ mod tests {
             name: "XInput 手柄".to_string(),
         };
         let events = [
-            RawEvent::Keyboard { device: kb.clone(), sc: 0xE01D, down: true },
-            RawEvent::Keyboard { device: kb, sc: 0x2A, down: false },
+            RawEvent::Keyboard { source: InputSourceId(101), device: kb.clone(), sc: 0xE01D, down: true },
+            RawEvent::Keyboard { source: InputSourceId(102), device: kb, sc: 0x2A, down: false },
             RawEvent::MouseClick { device: mouse, button: MouseButton::WheelUp },
             RawEvent::GamepadPress { device: pad, button: GamepadButton::DPadLeft },
         ];
@@ -151,14 +180,65 @@ mod tests {
             name: "Keyboard".to_string(),
         };
         let events = [
-            AggEvent::Input(RawEvent::Keyboard { device: d, sc: 0x1E, down: true }),
+            AggEvent::Input(RawEvent::Keyboard {
+                source: InputSourceId(101),
+                device: d,
+                sc: 0x1E,
+                down: true,
+            }),
             AggEvent::Foreground { exe: "explorer.exe".to_string() },
+            AggEvent::SourceRemoved { source: InputSourceId(102) },
+            AggEvent::KeyboardSourcesReset,
         ];
         for e in events {
             let s = serde_json::to_string(&e).unwrap();
             let back: AggEvent = serde_json::from_str(&s).unwrap();
             assert_eq!(back, e);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // correctness-v2 §4.1：InputSourceId 线上形状
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn correctness_v2_input_source_id_serde_transparent() {
+        // #[serde(transparent)]：线上形状就是裸 u64（内部事件 serde 契约）
+        assert_eq!(serde_json::to_string(&InputSourceId(101)).unwrap(), "101");
+        assert_eq!(serde_json::from_str::<InputSourceId>("101").unwrap(), InputSourceId(101));
+        // Default = 0（Engine 单来源兼容入口专用值）
+        assert_eq!(InputSourceId::default(), InputSourceId(0));
+        // Copy/Hash/Eq：可直接做 HashSet<(InputSourceId, u16)> 的键（Engine held 维度）
+        use std::collections::HashSet;
+        let mut set: HashSet<(InputSourceId, u16)> = HashSet::new();
+        set.insert((InputSourceId(101), 0x1E));
+        assert!(set.contains(&(InputSourceId(101), 0x1E)));
+        assert!(!set.contains(&(InputSourceId(102), 0x1E)));
+    }
+
+    #[test]
+    fn correctness_v2_keyboard_source_field_is_required() {
+        // Keyboard.source 不设 serde 缺省：内部构造者必须显式携带来源——
+        // 缺 source 的旧形状 JSON 反序列化必须失败（不建立虚假回放兼容合同）。
+        let missing = r#"{"Keyboard":{"device":{"kind":"keyboard","vid":0,"pid":0,"name":"x"},"sc":30,"down":true}}"#;
+        assert!(serde_json::from_str::<RawEvent>(missing).is_err());
+        // 完整形状：source 是裸 u64 字段（transparent 穿透枚举内部）
+        let full = r#"{"Keyboard":{"source":101,"device":{"kind":"keyboard","vid":0,"pid":0,"name":"x"},"sc":30,"down":true}}"#;
+        let back: RawEvent = serde_json::from_str(full).unwrap();
+        assert_eq!(
+            back,
+            RawEvent::Keyboard {
+                source: InputSourceId(101),
+                device: DeviceKey {
+                    kind: DeviceKind::Keyboard,
+                    vid: 0,
+                    pid: 0,
+                    name: "x".to_string(),
+                },
+                sc: 0x1E,
+                down: true,
+            }
+        );
     }
 
     #[test]

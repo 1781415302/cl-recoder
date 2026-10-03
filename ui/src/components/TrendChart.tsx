@@ -1,5 +1,7 @@
-// 趋势折线图（§4.9：折线 ≤6 序列且带直接标签；图例可见可切换；tooltip 键盘可达；
-// prefers-reduced-motion 时关闭动画）。时间序列趋势不适用"Top N ≤15"规则（该规则针对类别柱图）。
+// 趋势折线图（§4.9：折线 ≤6 序列且带直接标签；图例可见可切换；tooltip 键盘可达）。
+// §4.8：数值更新无动画（isAnimationActive=false 恒定，与偏好无关）；数据仅一个点时折线
+// 不可见，以 dot 呈现保证读数可见（"只有一个有数据点也显示 dot"）。
+// 时间序列趋势不适用"Top N ≤15"规则（该规则针对类别柱图）。
 import { useState } from "react";
 import {
   CartesianGrid,
@@ -12,7 +14,6 @@ import {
   YAxis,
 } from "recharts";
 import { fmtCompact, fmtDay, fmtDayShort, fmtNum } from "../lib/format";
-import { useReducedMotion } from "../lib/useReducedMotion";
 import { ChartTooltip } from "./ChartTooltip";
 
 export interface TrendPoint {
@@ -37,12 +38,13 @@ export function TrendChart({
   unit = "次",
   height = 240,
 }: TrendChartProps) {
-  const reduceMotion = useReducedMotion();
   const [visible, setVisible] = useState(true);
   const [idx, setIdx] = useState<number | null>(null);
 
   const last = data.length > 0 ? data[data.length - 1] : undefined;
   const selected = idx !== null ? data[idx] : undefined;
+  // §4.8：仅一个数据点时折线不可见——显示常驻 dot（多点多边形由折线本身呈现，dot 关闭）
+  const singlePoint = data.length === 1;
 
   function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (data.length === 0) return;
@@ -111,9 +113,9 @@ export function TrendChart({
                 name={seriesName}
                 style={{ stroke: `var(${colorVar})` }}
                 strokeWidth={2}
-                dot={false}
+                dot={singlePoint ? { r: 3, style: { fill: `var(${colorVar})` } } : false}
                 activeDot={{ r: 4, style: { fill: `var(${colorVar})` } }}
-                isAnimationActive={!reduceMotion}
+                isAnimationActive={false}
               />
               {/* 键盘选中点（tooltip 的键盘可达替代 + 视觉定位）；系列直接标签由图例芯片承载（系列名 + 最新值） */}
               {selected ? (

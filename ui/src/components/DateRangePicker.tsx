@@ -1,15 +1,18 @@
-// 日期范围选择（§4.7 Range 契约："YYYY-MM-DD"；§4.9 日期本地化）。
+// 日期范围选择（§4.7 Range 契约："YYYY-MM-DD"；§4.9 日期本地化；§4.5 统计范围）。
 // 原生 <input type="date">（键盘可达 + 本地化）+ 常用区间快捷键。
+// onChange 第二参数 mode 可选（§4.5）：今天 preset 传 "today"（恢复跟随），手动输入
+// 与其它 preset 传 "fixed"（午夜不改）；旧调用方（WP/导出的 setState）忽略它，行为不变。
 import { defaultRange, todayDay } from "../lib/format";
 import type { Range } from "../api/types";
+import type { RangeChangeMode } from "../lib/statisticsRange";
 
 interface DateRangePickerProps {
   value: Range;
-  onChange: (r: Range) => void;
+  onChange: (range: Range, mode?: RangeChangeMode) => void;
 }
 
-const PRESETS: { label: string; days: number | "all" }[] = [
-  { label: "今天", days: 1 },
+const PRESETS: { label: string; days: number | "all"; today?: boolean }[] = [
+  { label: "今天", days: 1, today: true },
   { label: "近 7 天", days: 7 },
   { label: "近 30 天", days: 30 },
   { label: "近 90 天", days: 90 },
@@ -24,17 +27,17 @@ function presetRange(days: number | "all"): Range {
   return days === "all" ? { from: ALL_FROM, to: todayDay() } : defaultRange(days);
 }
 
-export function DateRangePicker({ value, onChange }: DateRangePickerProps) {
+export function DateRangePicker({ value, onChange }: DateRangePickerProps): React.ReactElement {
   const today = todayDay();
 
   function setFrom(from: string) {
     if (!from) return;
-    // 保持 from ≤ to：from 越界时把 to 提上来
-    onChange({ from, to: from > value.to ? from : value.to });
+    // 保持 from ≤ to：from 越界时把 to 提上来（手动输入 → fixed）
+    onChange({ from, to: from > value.to ? from : value.to }, "fixed");
   }
   function setTo(to: string) {
     if (!to) return;
-    onChange({ from: to < value.from ? to : value.from, to });
+    onChange({ from: to < value.from ? to : value.from, to }, "fixed");
   }
 
   return (
@@ -60,7 +63,7 @@ export function DateRangePicker({ value, onChange }: DateRangePickerProps) {
             type="button"
             className={`btn btn-sm${active ? " btn-primary" : ""}`}
             aria-pressed={active}
-            onClick={() => onChange(r)}
+            onClick={() => onChange(r, p.today ? "today" : "fixed")}
           >
             {p.label}
           </button>

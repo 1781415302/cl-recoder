@@ -1,13 +1,18 @@
 // 组合键页：仅修饰键组合（Ctrl/Shift/Alt/Win + 非修饰键），× 每天（R7）。
-import { useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+// §4.5/§4.8：默认今日；active 且范围含今日时 1s 轮询（历史固定范围不轮询）；
+// 排行用 RankedList（稳定 id=mods:code）；完整表分页，全部返回行可访问；
+// 跨范围不显示旧数据（不用 keepPreviousData）。
+import { useQuery } from "@tanstack/react-query";
 import * as client from "../api/client";
+import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
 import { EmptyState } from "../components/EmptyState";
+import { RankedList } from "../components/RankedList";
 import { SkeletonCard } from "../components/Skeleton";
-import { TopBarChart } from "../components/TopBarChart";
-import { defaultRange, fmtNum } from "../lib/format";
+import { fmtNum } from "../lib/format";
+import { useAppActivity } from "../lib/AppActivityProvider";
+import { useStatisticsRange } from "../lib/useStatisticsRange";
 import type { ComboRowLabeled } from "../api/types";
 
 const columns: Column<ComboRowLabeled>[] = [
@@ -17,12 +22,18 @@ const columns: Column<ComboRowLabeled>[] = [
 ];
 
 export function Combos() {
-  const [range, setRange] = useState(() => defaultRange(30));
+  const { range, onChange } = useStatisticsRange();
+  const activity = useAppActivity();
+  // §4.5：interval 仅范围包含当前 today 时传入（历史固定范围不轮询）
+  const includesToday = range.from <= activity.today && activity.today <= range.to;
+  const policy = uiQueryPolicy(activity.active, includesToday ? 1_000 : undefined);
   const { data, isLoading } = useQuery({
     queryKey: ["combos", range.from, range.to],
     queryFn: () => client.getCombos(range.from, range.to, 200),
-    placeholderData: keepPreviousData,
+    ...policy,
   });
+  // 活动初始化完成前查询被 gating（无凭据不臆断"无数据"），按加载态呈现
+  const loading = isLoading || !activity.ready;
 
   return (
     <>
@@ -31,26 +42,28 @@ export function Combos() {
           <h1 className="page-title">组合键</h1>
           <p className="page-desc">修饰键组合（Ctrl/Shift/Alt/Win + 非修饰键）；纯修饰键按下不计入组合</p>
         </div>
-        <DateRangePicker value={range} onChange={setRange} />
+        <DateRangePicker value={range} onChange={onChange} />
       </div>
 
-      {isLoading ? (
+      {loading ? (
         <SkeletonCard rows={6} />
       ) : (
-        <TopBarChart
+        <RankedList
           title="组合键排行"
-          rows={(data ?? []).map((r) => ({ label: r.label, value: r.total }))}
-          colorVar="--chart-5"
+          rows={(data ?? []).map((r) => ({ id: `${r.mods}:${r.code}`, label: r.label, value: r.total }))}
           unit="次"
           labelHeader="组合键"
           valueHeader="累计次数"
+          queryLimit={200}
           fullTable={
             <DataTable
               columns={columns}
               rows={data ?? []}
-              rowKey={(r) => `${r.mods}-${r.code}`}
+              rowKey={(r) => `${r.mods}:${r.code}`}
               initialSort={{ key: "total", dir: "desc" }}
               caption="组合键排行（所选范围）"
+              pageSize={50}
+              resetKey={`${range.from}|${range.to}`}
               empty={
                 <EmptyState
                   title="还没有组合键记录"

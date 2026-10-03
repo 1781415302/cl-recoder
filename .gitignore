@@ -22,3 +22,12 @@ Thumbs.db
 
 # 本地工作流草稿
 .zcode/
+
+# 本地暂存构建工程（v3 候选产物）
+.staging-v3/
+
+# 第三方工具本地数据
+.mimocode/
+
+# Playwright CLI 会话快照
+.playwright-cli/

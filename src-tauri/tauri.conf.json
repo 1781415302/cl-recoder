@@ -33,6 +33,7 @@
     "resources": {
       "../target/release/cl-recoder-collector.exe": "cl-recoder-collector.exe",
       "../scripts/install-collector-task.ps1": "scripts/install-collector-task.ps1",
+      "../scripts/collector-task-policy.ps1": "scripts/collector-task-policy.ps1",
       "../scripts/uninstall-collector-task.ps1": "scripts/uninstall-collector-task.ps1",
       "../scripts/check-task.ps1": "scripts/check-task.ps1"
     }

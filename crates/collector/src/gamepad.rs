@@ -2,7 +2,7 @@
 //!
 //! - `spawn(tx)`：独立线程轮询 [`Gilrs::next_event`]（**非阻塞**）+ `sleep(8ms)`（≈125Hz）。
 //! - `ButtonPressed` → [`RawEvent::GamepadPress`]（只投递按下边沿）；
-//!   **LeftTrigger2/RightTrigger2 例外**——它们由 [`EventType::ButtonChanged`] 的模拟量
+//!   **LeftTrigger2/RightTrigger2（物理 LT/RT 模拟扳机）例外**——它们由 [`EventType::ButtonChanged`] 的模拟量
 //!   以上穿 0.33 计 1 次、下穿复位（见 [`TriggerGate`]）。gilrs 0.11 的轴→按键合成逻辑
 //!   会在自己的 0.75/0.65 阈值处额外发出这两个键的 `ButtonPressed/ButtonReleased`
 //!   （gilrs-0.11.2/src/gamepad.rs:297-330，`axis_to_btn_pressed=0.75`），若并入 `ButtonPressed`
@@ -72,14 +72,27 @@ fn run(tx: Sender<AggEvent>) {
 /// 返回即表示通道关闭（接收端消失），线程应退出；其余错误一律降级继续。
 fn poll_loop(tx: Sender<AggEvent>) {
     let mut gilrs = init_gilrs();
+    // 启动时枚举一次已连接手柄（gilrs 对启动即插入的 pads 不补发 Connected）。
+    {
+        let mut n = 0;
+        for (id, gamepad) in gilrs.gamepads() {
+            log::info!("gamepad 已连接：id={id:?} name={:?}", gamepad.name());
+            n += 1;
+        }
+        if n == 0 {
+            log::info!("gamepad：当前无已连接的 XInput 手柄（本软件仅支持 XInput/Xbox 系）");
+        }
+    }
     // DeviceKey 按连接（GamepadId）缓存（PLAN §4.6"同一连接内缓存"）。
     let mut devices: HashMap<GamepadId, DeviceKey> = HashMap::new();
     // LT2/RT2 迟滞门限按连接缓存；断开即丢弃，重连时触发器处于静止态、重新武装。
     let mut gates: HashMap<GamepadId, [TriggerGate; 2]> = HashMap::new();
+    // 数字键按下状态（ButtonPressed/ButtonChanged 去重）。
+    let mut digital: HashMap<(GamepadId, GilrsButton), bool> = HashMap::new();
 
     loop {
         while let Some(event) = gilrs.next_event() {
-            if !handle_event(&mut gilrs, event, &mut devices, &mut gates, &tx) {
+            if !handle_event(&mut gilrs, event, &mut devices, &mut gates, &mut digital, &tx) {
                 return; // 通道关闭：aggregator 已停止，线程正常收尾
             }
         }
@@ -106,6 +119,7 @@ fn handle_event(
     event: Event,
     devices: &mut HashMap<GamepadId, DeviceKey>,
     gates: &mut HashMap<GamepadId, [TriggerGate; 2]>,
+    digital: &mut HashMap<(GamepadId, GilrsButton), bool>,
     tx: &Sender<AggEvent>,
 ) -> bool {
     let Event { id, event, .. } = event;
@@ -113,26 +127,35 @@ fn handle_event(
         // 连接建立：按当前连接解析设备身份并缓存。
         EventType::Connected => {
             let device = device_key(gilrs.gamepad(id).name());
+            log::info!("gamepad Connected：{device:?}");
             devices.insert(id, device);
             gates.insert(id, [TriggerGate::armed(), TriggerGate::armed()]);
+            digital.retain(|(gid, _), _| *gid != id);
             true
         }
         // 断开：缓存失效（gilrs 重连可能复用同一 id，届时按新连接重建）。
         EventType::Disconnected => {
             devices.remove(&id);
             gates.remove(&id);
+            digital.retain(|(gid, _), _| *gid != id);
             true
         }
         // 数字按键按下边沿 → 计数。LT2/RT2 例外：由下方 ButtonChanged 迟滞路径独占计数
         // （gilrs 会在自己的 0.75 阈值处为这两个键合成 ButtonPressed，并入会双重计数，见模块文档）。
         EventType::ButtonPressed(button, _) => match map_button(button) {
             Some(b) if !is_threshold_button(b) => {
+                digital.insert((id, button), true);
                 let device = cached_device(gilrs, devices, id);
                 send_press(tx, device, b)
             }
             _ => true,
         },
-        // 模拟触发器：以事件值上穿 0.33 计 1 次，下穿（<0.33）复位后方可再计（PLAN §5.3）。
+        EventType::ButtonReleased(button, _) => {
+            digital.insert((id, button), false);
+            true
+        }
+        // 模拟触发器：上穿 0.33 计 1 次（PLAN §5.3）。
+        // 数字键：部分驱动只发 ButtonChanged——用 0.5 迟滞补按下边沿（与 ButtonPressed 去重）。
         EventType::ButtonChanged(button, value, _) => match map_button(button) {
             Some(b) if is_threshold_button(b) => {
                 let idx = trigger_index(b);
@@ -146,10 +169,23 @@ fn handle_event(
                     true
                 }
             }
-            // 数字按键的 ButtonChanged（gilrs 在数字键按下时会补发 v=1.0 的该事件）不计数。
-            _ => true,
+            Some(b) => {
+                let was = digital.get(&(id, button)).copied().unwrap_or(false);
+                let now_down = value >= 0.5;
+                if now_down && !was {
+                    digital.insert((id, button), true);
+                    let device = cached_device(gilrs, devices, id);
+                    send_press(tx, device, b)
+                } else {
+                    if !now_down {
+                        digital.insert((id, button), false);
+                    }
+                    true
+                }
+            }
+            None => true,
         },
-        // ButtonReleased/ButtonRepeated/AxisChanged/Dropped/ForceFeedbackEffectCompleted：
+        // ButtonRepeated/AxisChanged/Dropped/ForceFeedbackEffectCompleted：
         // 均非"一次物理按下"边沿，不计数（抬键不计数是全系统语义，PLAN §4.2）。
         _ => true,
     }
@@ -189,6 +225,10 @@ fn device_key(name: &str) -> DeviceKey {
 }
 
 /// gilrs 按键 → 本系统 code 空间（[`GamepadButton`]，PLAN §4.1）。
+/// 物理键位 ↔ gilrs 枚举对照（主证据：本机 gilrs-core 0.6.8
+/// `windows_xinput/gamepad.rs:310-380`——物理 X→West、物理 Y→North、肩键→LeftTrigger/RightTrigger、
+/// 模拟扳机轴→LeftTrigger2/RightTrigger2）：code 1/2/3/4 = 物理 A/B/Y/X（南/东/北/西），
+/// 5/6/7/8 = 物理 LB/LT/RB/RT。枚举名沿用 gilrs 原名不改，物理键名只体现在 GUI 显示标签。
 /// gilrs 的 `C`/`Z`/`Unknown` 在 XInput 后端不会出现，防御性丢弃。
 fn map_button(button: GilrsButton) -> Option<GamepadButton> {
     Some(match button {
@@ -326,25 +366,26 @@ mod tests {
 
     #[test]
     fn map_button_covers_all_17_code_space_buttons() {
-        // 17 个 code 空间按键逐一映射且 code 值与 §4.1 一致（写入 input_daily 的锚点）
+        // 17 个 code 空间按键逐一映射且 code 值与 §4.1 一致（写入 input_daily 的锚点）；
+        // 行尾注释为物理键位（usability-runtime-v3 §4.6 U2，证据见 map_button 文档）
         let pairs = [
-            (GilrsButton::South, GamepadButton::South, 1),
-            (GilrsButton::East, GamepadButton::East, 2),
-            (GilrsButton::North, GamepadButton::North, 3),
-            (GilrsButton::West, GamepadButton::West, 4),
-            (GilrsButton::LeftTrigger, GamepadButton::LeftTrigger, 5),
-            (GilrsButton::LeftTrigger2, GamepadButton::LeftTrigger2, 6),
-            (GilrsButton::RightTrigger, GamepadButton::RightTrigger, 7),
-            (GilrsButton::RightTrigger2, GamepadButton::RightTrigger2, 8),
-            (GilrsButton::Select, GamepadButton::Select, 9),
-            (GilrsButton::Start, GamepadButton::Start, 10),
-            (GilrsButton::Mode, GamepadButton::Mode, 11),
-            (GilrsButton::LeftThumb, GamepadButton::LeftThumb, 12),
-            (GilrsButton::RightThumb, GamepadButton::RightThumb, 13),
-            (GilrsButton::DPadUp, GamepadButton::DPadUp, 14),
-            (GilrsButton::DPadDown, GamepadButton::DPadDown, 15),
-            (GilrsButton::DPadLeft, GamepadButton::DPadLeft, 16),
-            (GilrsButton::DPadRight, GamepadButton::DPadRight, 17),
+            (GilrsButton::South, GamepadButton::South, 1),               // 物理 A（南）
+            (GilrsButton::East, GamepadButton::East, 2),                 // 物理 B（东）
+            (GilrsButton::North, GamepadButton::North, 3),               // 物理 Y（北）
+            (GilrsButton::West, GamepadButton::West, 4),                 // 物理 X（西）
+            (GilrsButton::LeftTrigger, GamepadButton::LeftTrigger, 5),   // 物理 LB（左肩）
+            (GilrsButton::LeftTrigger2, GamepadButton::LeftTrigger2, 6), // 物理 LT（左扳机）
+            (GilrsButton::RightTrigger, GamepadButton::RightTrigger, 7),  // 物理 RB（右肩）
+            (GilrsButton::RightTrigger2, GamepadButton::RightTrigger2, 8), // 物理 RT（右扳机）
+            (GilrsButton::Select, GamepadButton::Select, 9),             // 物理 View（选择）
+            (GilrsButton::Start, GamepadButton::Start, 10),              // 物理 Menu（开始）
+            (GilrsButton::Mode, GamepadButton::Mode, 11),                // 物理 Guide
+            (GilrsButton::LeftThumb, GamepadButton::LeftThumb, 12),      // 物理 LS 按下
+            (GilrsButton::RightThumb, GamepadButton::RightThumb, 13),    // 物理 RS 按下
+            (GilrsButton::DPadUp, GamepadButton::DPadUp, 14),            // 十字上
+            (GilrsButton::DPadDown, GamepadButton::DPadDown, 15),        // 十字下
+            (GilrsButton::DPadLeft, GamepadButton::DPadLeft, 16),        // 十字左
+            (GilrsButton::DPadRight, GamepadButton::DPadRight, 17),      // 十字右
         ];
         for (g, ours, code) in pairs {
             assert_eq!(map_button(g), Some(ours));
@@ -358,7 +399,8 @@ mod tests {
 
     #[test]
     fn only_deep_triggers_are_threshold_buttons() {
-        // 仅 LT2/RT2 走 ButtonChanged 迟滞；LT/RT（肩键）等数字键走 ButtonPressed 边沿
+        // 仅 LT2/RT2（物理 LT/RT 模拟扳机）走 ButtonChanged 迟滞；
+        // LeftTrigger/RightTrigger（物理 LB/RB 肩键，见 map_button 注释）等数字键走 ButtonPressed 边沿
         assert!(is_threshold_button(GamepadButton::LeftTrigger2));
         assert!(is_threshold_button(GamepadButton::RightTrigger2));
         assert!(!is_threshold_button(GamepadButton::LeftTrigger));
@@ -366,5 +408,27 @@ mod tests {
         assert!(!is_threshold_button(GamepadButton::South));
         assert_eq!(trigger_index(GamepadButton::LeftTrigger2), 0);
         assert_eq!(trigger_index(GamepadButton::RightTrigger2), 1);
+    }
+
+    /// U2（usability-runtime-v3 §4.6）：物理 Xbox 键位 ↔ code 锚定——17 码显示标签统一后，
+    /// 采集侧必须保证"哪个物理键落在哪个 code"不变（枚举名/数值均不改，仅锚定映射）：
+    /// 3=物理 Y（北）、4=物理 X（西）、5=LB（左肩）、6=LT（左扳机）、7=RB（右肩）、8=RT（右扳机）。
+    /// 主证据：本机 gilrs-core 0.6.8 windows_xinput/gamepad.rs:310-380（肩/面键）与 628-641（模拟扳机轴）。
+    #[test]
+    fn usability_v3_physical_xbox_layout_lands_on_u2_codes() {
+        let physical: [(GilrsButton, GamepadButton, u16, &str); 8] = [
+            (GilrsButton::South, GamepadButton::South, 1, "A（南）"),
+            (GilrsButton::East, GamepadButton::East, 2, "B（东）"),
+            (GilrsButton::North, GamepadButton::North, 3, "Y（北）"),
+            (GilrsButton::West, GamepadButton::West, 4, "X（西）"),
+            (GilrsButton::LeftTrigger, GamepadButton::LeftTrigger, 5, "LB（左肩）"),
+            (GilrsButton::LeftTrigger2, GamepadButton::LeftTrigger2, 6, "LT（左扳机）"),
+            (GilrsButton::RightTrigger, GamepadButton::RightTrigger, 7, "RB（右肩）"),
+            (GilrsButton::RightTrigger2, GamepadButton::RightTrigger2, 8, "RT（右扳机）"),
+        ];
+        for (g, ours, code, label) in physical {
+            assert_eq!(map_button(g), Some(ours));
+            assert_eq!(ours as u16, code, "物理标签 {label} 的 code 漂移");
+        }
     }
 }

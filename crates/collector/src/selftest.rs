@@ -5,16 +5,17 @@
 //!
 //! - [`run_inject`]（`--selftest-inject --db <临时库>`）：**不启动任何采集线程**，把一组
 //!   合成 [`AggEvent`] 直接灌入 aggregator→store 全链路（先删除已存在的库文件，含 WAL
-//!   旁路），事件脚本覆盖：键盘 a/b/c/Enter 各 1 次、Ctrl+C 1 次、Shift+A 1 次、鼠标左键
-//!   2 次、≥2 次 Foreground 切换、暂停 2s 再恢复——供外部脚本对 `input_daily`/
-//!   `combo_daily`/`app_daily` 做 sqlite 断言（行正确、暂停区间秒数为 0、工作集 <100MB）。
+//!   旁路），事件脚本覆盖：键盘 a/b/c/Enter 各 1 次（来源 1）、Ctrl+C 1 次、Shift+A 1 次、
+//!   鼠标左键 2 次、双来源测试（来源 2 按同型号 B 1 次，并入同型号桶，§4.3）、≥2 次
+//!   Foreground 切换、暂停 2s 再恢复——供外部脚本对 `input_daily`/`combo_daily`/
+//!   `app_daily` 做 sqlite 断言（行正确、暂停区间秒数为 0、工作集 <100MB）。
 //!   注入端同时以与 apps 线程相同的语义（先落状态再发事件）维护 [`FgState`]，使 exe 归属
 //!   与真实链路一致。结束时把"期望的库内容"打印到 stdout，供关卡脚本/人工对照。
 //! - [`run_live`]（`--selftest N [--db path]`）：**真实采集模式**——完整起 raw_input/
 //!   gamepad/apps 三采集线程与 aggregator，main 线程作泵：把收到的事件以
-//!   `kind|device|code|down` 行打印到 stdout（`# ` 开头为注释/前台切换行）并转发给
-//!   aggregator 写库；N 秒后置 shutdown 优雅收尾（终账 + 最后一批 flush）退出。
-//!   `--db` 缺省 `./stats.db`。
+//!   `kind|device|code|down` 行打印到 stdout（`# ` 开头为注释/前台切换/生命周期行）并
+//!   **原样转发**给 aggregator 写库（生命周期事件只打印不丢弃，§4.3）；N 秒后置 shutdown
+//!   优雅收尾（终账 + 最后一批 flush）退出。`--db` 缺省 `./stats.db`。
 //!
 //! 时间编排（注入脚本）：alpha.exe 驻留 2.6s → 暂停 2.0s → beta.exe 驻留 1.6s。aggregator
 //! 的暂停观察心跳为 100ms（见 engine_loop），归账秒数取整后 alpha≈2、beta≈1，且暂停的
@@ -28,12 +29,17 @@ use std::time::{Duration, Instant};
 
 use clrecoder_core::codes::{DeviceKind, MouseButton};
 use clrecoder_core::day;
-use clrecoder_core::event::{AggEvent, DeviceKey, RawEvent};
+use clrecoder_core::event::{AggEvent, DeviceKey, InputSourceId, RawEvent};
 use clrecoder_store::writer::Writer;
 
 use crate::apps::{EXE_UNKNOWN, FgState};
 use crate::engine_loop;
 use crate::ipc_server::{Flags, RuntimeStatus};
+
+/// 注入键盘默认来源（§4.3：固定 `InputSourceId(1)`；0 保留给 Engine 单来源兼容入口）。
+const INJECT_SOURCE: InputSourceId = InputSourceId(1);
+/// 双来源测试的第二来源（§4.3：不同正 ID；与来源 1 同 DeviceKey 并入同型号桶）。
+const INJECT_SOURCE_ALT: InputSourceId = InputSourceId(2);
 
 /// 注入用合成键盘设备（devices 表 UNIQUE 四元组，与未知桶/真实设备均不冲突）。
 fn inject_keyboard() -> DeviceKey {
@@ -92,8 +98,9 @@ pub fn run_inject(db: &Path) -> i32 {
             let _ = tx.send(AggEvent::Foreground { exe: exe.to_string() });
             *sent += 1;
         };
-        let send_kb = |sc: u16, down: bool, sent: &mut u64| {
+        let send_kb = |source: InputSourceId, sc: u16, down: bool, sent: &mut u64| {
             let _ = tx.send(AggEvent::Input(RawEvent::Keyboard {
+                source,
                 device: kb_dev.clone(),
                 sc,
                 down,
@@ -108,26 +115,27 @@ pub fn run_inject(db: &Path) -> i32 {
             *sent += 1;
         };
 
-        println!("[inject] 脚本：Foreground alpha.exe → 键盘 a/b/c/Enter 各1次 → Ctrl+C → Shift+A → \
-                  鼠标左键×2 → 驻留 2.6s → 暂停 2.0s → 恢复 → Foreground beta.exe → 驻留 1.6s → shutdown");
+        println!("[inject] 脚本：Foreground alpha.exe → 键盘 a/b/c/Enter 各1次(来源1) → Ctrl+C → Shift+A → \
+                  鼠标左键×2 → 驻留 2.6s → 暂停 2.0s → 恢复 → Foreground beta.exe → 双来源B(来源2)×1 → \
+                  驻留 1.6s → shutdown");
 
         // 切换 #1：unknown → alpha.exe
         send_fg("alpha.exe", &mut sent);
-        // 键盘 a / b / c / Enter 各 1 次（按下+抬起）
+        // 键盘 a / b / c / Enter 各 1 次（按下+抬起；默认来源 1）
         for sc in [0x1Eu16, 0x30, 0x2E, 0x1C] {
-            send_kb(sc, true, &mut sent);
-            send_kb(sc, false, &mut sent);
+            send_kb(INJECT_SOURCE, sc, true, &mut sent);
+            send_kb(INJECT_SOURCE, sc, false, &mut sent);
         }
         // Ctrl+C 1 次 → Key(Ctrl) + Key(C) + Combo(CTRL, C)
-        send_kb(0x1D, true, &mut sent);
-        send_kb(0x2E, true, &mut sent);
-        send_kb(0x2E, false, &mut sent);
-        send_kb(0x1D, false, &mut sent);
+        send_kb(INJECT_SOURCE, 0x1D, true, &mut sent);
+        send_kb(INJECT_SOURCE, 0x2E, true, &mut sent);
+        send_kb(INJECT_SOURCE, 0x2E, false, &mut sent);
+        send_kb(INJECT_SOURCE, 0x1D, false, &mut sent);
         // Shift+A 1 次 → Key(Shift) + Key(A) + Combo(SHIFT, A)
-        send_kb(0x2A, true, &mut sent);
-        send_kb(0x1E, true, &mut sent);
-        send_kb(0x1E, false, &mut sent);
-        send_kb(0x2A, false, &mut sent);
+        send_kb(INJECT_SOURCE, 0x2A, true, &mut sent);
+        send_kb(INJECT_SOURCE, 0x1E, true, &mut sent);
+        send_kb(INJECT_SOURCE, 0x1E, false, &mut sent);
+        send_kb(INJECT_SOURCE, 0x2A, false, &mut sent);
         // 鼠标左键 2 次
         send_click(MouseButton::Left, &mut sent);
         send_click(MouseButton::Left, &mut sent);
@@ -141,6 +149,10 @@ pub fn run_inject(db: &Path) -> i32 {
         flags.paused.store(false, Ordering::Release);
         // 切换 #2：alpha.exe → beta.exe
         send_fg("beta.exe", &mut sent);
+        // 双来源测试（§4.3）：第二个来源（不同正 ID、同 DeviceKey）按 B——同码跨来源独立
+        // 计数并入同一个型号桶（input_daily (keyboard,48) 因而为 2）；无修饰键按住 → 无组合
+        send_kb(INJECT_SOURCE_ALT, 0x30, true, &mut sent);
+        send_kb(INJECT_SOURCE_ALT, 0x30, false, &mut sent);
         // beta 驻留（1.6s → ≈1s）
         std::thread::sleep(DWELL_BETA);
     }
@@ -160,11 +172,11 @@ pub fn run_inject(db: &Path) -> i32 {
         "EXPECT devices: (kind=keyboard,name=Selftest 键盘,vid=4369,pid=1) (kind=mouse,name=Selftest 鼠标,vid=4369,pid=2)"
     );
     println!(
-        "EXPECT input_daily(code=十进制): (keyboard,30)=2 (keyboard,48)=1 (keyboard,46)=2 (keyboard,28)=1 (keyboard,29)=1 (keyboard,42)=1 (mouse,1)=2"
+        "EXPECT input_daily(code=十进制): (keyboard,30)=2 (keyboard,48)=2 (keyboard,46)=2 (keyboard,28)=1 (keyboard,29)=1 (keyboard,42)=1 (mouse,1)=2"
     );
     println!("EXPECT combo_daily: (mods=1,code=46)=1 (mods=2,code=30)=1");
     println!(
-        "EXPECT app_daily: (exe=alpha.exe,keys=8,clicks=2,secs≈2) (exe=beta.exe,keys=0,clicks=0,secs≈1)"
+        "EXPECT app_daily: (exe=alpha.exe,keys=8,clicks=2,secs≈2) (exe=beta.exe,keys=1,clicks=0,secs≈1)"
     );
     println!(
         "EXPECT 暂停区间({PAUSE_FOR:?})秒数贡献为 0：app_daily.foreground_secs 合计应 ≤ 5（活动驻留 2.6+1.6s、按秒取整 ≈3；暂停的 2s 恒不入账）"
@@ -232,11 +244,12 @@ pub fn run_live(seconds: u64, db: &Path) -> i32 {
 }
 
 /// 事件 → stdout 行（纯函数，单测锚点）。
-/// Input 事件 = `kind|device|code|down`（down: 1=按下 0=抬起；鼠标/手柄恒为按下边沿 1）；
-/// Foreground 事件 = `# fg|exe`（注释行，不属于四段格式）。
+/// Input 事件 = `kind|device|code|down`（down: 1=按下 0=抬起；鼠标/手柄恒为按下边沿 1；
+/// 来源 ID 不进入四段线格式，§4.3"正常 stdout 四段完全不改"）；
+/// Foreground 与生命周期事件 = `# ` 开头注释行（不属于四段格式，不追加第五段）。
 fn event_line(ev: &AggEvent) -> String {
     match ev {
-        AggEvent::Input(RawEvent::Keyboard { device, sc, down }) => {
+        AggEvent::Input(RawEvent::Keyboard { device, sc, down, .. }) => {
             format!("keyboard|{}|{}|{}", device.name, sc, u8::from(*down))
         }
         AggEvent::Input(RawEvent::MouseClick { device, button }) => {
@@ -249,6 +262,9 @@ fn event_line(ev: &AggEvent) -> String {
             format!("mousemove|{}|{:.4}|1", device.name, distance_inches)
         }
         AggEvent::Foreground { exe } => format!("# fg|{exe}"),
+        // 生命周期控制事件（§4.3）：只打注释行；live 泵仍原样转发给 aggregator
+        AggEvent::SourceRemoved { source } => format!("# source_removed|{}", source.0),
+        AggEvent::KeyboardSourcesReset => "# kb_sources_reset".to_string(),
     }
 }
 
@@ -290,11 +306,21 @@ mod tests {
             name: "Xbox Controller".to_string(),
         };
         assert_eq!(
-            event_line(&AggEvent::Input(RawEvent::Keyboard { device: kb.clone(), sc: 0x1E, down: true })),
+            event_line(&AggEvent::Input(RawEvent::Keyboard {
+                source: INJECT_SOURCE,
+                device: kb.clone(),
+                sc: 0x1E,
+                down: true,
+            })),
             format!("keyboard|{}|30|1", kb.name)
         );
         assert_eq!(
-            event_line(&AggEvent::Input(RawEvent::Keyboard { device: kb, sc: 0xE11D, down: false })),
+            event_line(&AggEvent::Input(RawEvent::Keyboard {
+                source: INJECT_SOURCE,
+                device: kb,
+                sc: 0xE11D,
+                down: false,
+            })),
             "keyboard|Selftest 键盘|57629|0"
         );
         assert_eq!(
@@ -338,5 +364,42 @@ mod tests {
         remove_db_files(&base).expect("存在的文件应被删除");
         assert!(!base.exists());
         // 只读目录场景不做断言（Windows 语义差异大），错误传播路径由调用方处理
+    }
+
+    /// §4.3：生命周期事件输出为 `# ` 开头注释行（不追加第五段）；
+    /// live 泵对它们照常原样转发（转发逻辑在 run_live 主循环，见模块文档）。
+    #[test]
+    fn correctness_v2_lifecycle_events_print_as_comment_lines() {
+        let removed = event_line(&AggEvent::SourceRemoved { source: InputSourceId(7) });
+        assert_eq!(removed, "# source_removed|7");
+        assert!(removed.starts_with("# "), "生命周期行必须以注释前缀开头");
+        let reset = event_line(&AggEvent::KeyboardSourcesReset);
+        assert_eq!(reset, "# kb_sources_reset");
+        assert!(reset.starts_with("# "), "生命周期行必须以注释前缀开头");
+    }
+
+    /// §4.3：双来源（不同正 ID）键盘事件的四段输出完全一致——来源 ID 不进入线格式，
+    /// 注入键盘默认固定 InputSourceId(1)，双来源测试用不同正 ID。
+    #[test]
+    fn correctness_v2_dual_source_keyboard_lines_keep_four_field_format() {
+        let kb = inject_keyboard();
+        let s1 = event_line(&AggEvent::Input(RawEvent::Keyboard {
+            source: INJECT_SOURCE,
+            device: kb.clone(),
+            sc: 0x30,
+            down: true,
+        }));
+        let s2 = event_line(&AggEvent::Input(RawEvent::Keyboard {
+            source: INJECT_SOURCE_ALT,
+            device: kb,
+            sc: 0x30,
+            down: true,
+        }));
+        assert_eq!(s1, s2, "来源 ID 不得改变四段线格式");
+        assert_eq!(s1, "keyboard|Selftest 键盘|48|1");
+        // 注入来源常量契约：默认 1，双来源用不同正 ID（0 保留给 Engine 兼容入口）
+        assert_eq!(INJECT_SOURCE, InputSourceId(1));
+        assert_eq!(INJECT_SOURCE_ALT, InputSourceId(2));
+        assert_ne!(INJECT_SOURCE, INJECT_SOURCE_ALT);
     }
 }

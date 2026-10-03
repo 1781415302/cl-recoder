@@ -155,4 +155,23 @@ mod tests {
         assert!(js.contains(r#""kind":"keyboard""#), "{js}");
         assert!(!js.contains("first_seen"), "DTO 必须是 camelCase: {js}");
     }
+
+    /// MouseDistanceDto 序列化逐字钉死（DEVPLAN §3.7/§4.6/§4.7）：
+    /// `"totalInches"`/`"distanceInches"` 在场，`total_inches`/`distance_inches` 缺席。
+    /// 禁止反向拆 Rust 的 `rename_all="camelCase"`；前端已按 camelCase 对齐。
+    #[test]
+    fn mouse_distance_dto_serializes_camel_case() {
+        let dto = MouseDistanceDto {
+            total_inches: 12.5,
+            days: vec![MouseDistanceDayDto {
+                day: "2026-09-28".into(),
+                distance_inches: 3.25,
+            }],
+        };
+        let js = serde_json::to_string(&dto).unwrap();
+        assert!(js.contains(r#""totalInches":"#), "{js}");
+        assert!(js.contains(r#""distanceInches":"#), "{js}");
+        assert!(!js.contains("total_inches"), "不得序列化 snake_case: {js}");
+        assert!(!js.contains("distance_inches"), "不得序列化 snake_case: {js}");
+    }
 }

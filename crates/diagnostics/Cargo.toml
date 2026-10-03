@@ -1,0 +1,13 @@
+[package]
+name = "clrecoder-diagnostics"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder 共享有界诊断日志：collector/gui 双角色 JSONL sink、256KiB 轮转、受控 log facade 适配（usability-runtime-v3 §4.1）"
+
+[dependencies]
+# 白名单内复用（§4.1：仅 chrono/serde/serde_json/log，无其他依赖）。
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# log 显式启用已有 std feature：保证独立 crate 的 adapter（log::Log 实现）接口可编译。
+log = { workspace = true, features = ["std"] }

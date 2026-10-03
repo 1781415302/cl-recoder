@@ -7,6 +7,8 @@ members = [
     "crates/engine",
     "crates/store",
     "crates/collector",
+    # S1（usability-runtime-v3 §4.1）：共享有界诊断日志（collector/GUI 双角色 sink）。
+    "crates/diagnostics",
     "src-tauri",
 ]
 

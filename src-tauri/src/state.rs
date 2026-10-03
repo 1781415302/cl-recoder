@@ -2,14 +2,15 @@
 //!
 //! - `ro_conn`：统计库只读连接（§2.4）；stats.db 不存在（采集器从未运行）时用内存兜底连接，
 //!   查询得到空结果即 §5.1 的"引导态"；`with_ro` 在兜底模式下每次尝试重新连接真实库，
-//!   collector 建库后 GUI 无需重启即可看到数据。
+//!   collector 建库后 GUI 无需重启即可看到数据。重连目标是注入的 `stats_path`
+//!   （§4.5：仅服务 with_ro 兜底；写路径命令继续用 `db::stats_db_path()`）。
 //! - `settings`：settings.json 的内存镜像（§6），结构体字段即文件 JSON 字段
 //!   （`gui_autostart`/`wp_db_path`/`first_run_done`，snake_case）。
 //!
-//! 两字段包 `Arc` 仅为了把状态廉价克隆进 `spawn_blocking`（§4.7 全部 async command），
-//! 字段名与 PLAN §3 逐字一致。
+//! 公开字段包 `Arc` 仅为了把状态廉价克隆进 `spawn_blocking`（§4.7 全部 async command），
+//! 字段名与 PLAN §3 逐字一致；`stats_path` 私有，不公开。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use rusqlite::Connection;
@@ -60,22 +61,47 @@ pub struct AppState {
     pub ro_conn: Arc<Mutex<Connection>>,
     /// settings.json 内存镜像（§6）
     pub settings: Arc<RwLock<Settings>>,
+    /// 统计库路径：仅 `with_ro` 兜底重连使用；写路径命令继续用 `db::stats_db_path()`（§4.5）。
+    stats_path: PathBuf,
 }
 
 impl AppState {
-    /// 构造：打开 ro 连接（失败→内存兜底）+ 加载设置（损坏/缺失→默认值）。
+    /// 构造（生产路径）：默认 stats 路径 + 加载 settings（损坏/缺失→默认值）。
     ///
     /// 本函数**不失败**：§5.1 要求"DB 不存在/短暂 BUSY → 命令返回空数据 + 引导态"，
     /// 而不是 GUI 启动失败。
     #[must_use]
     pub fn new() -> Self {
-        let stats = db::stats_db_path();
-        let conn = db::open_ro(&stats).unwrap_or_else(|e| {
+        Self::build(
+            db::stats_db_path(),
+            Settings::load_from(&db::settings_path()),
+        )
+    }
+
+    /// 构造（测试/hermetic）：注入统计库路径 + 默认 settings（§4.5）。
+    ///
+    /// 注入不存在路径时：`open_ro` 失败 → 内存兜底 → 每次 `with_ro` 重连必失败 →
+    /// 永远兜底，与本机是否有真实 stats.db 无关。
+    ///
+    /// 可见性按 DEVPLAN §4.5 锁定为 `pub(crate)`；生产入口 `new()` 走默认路径，
+    /// 非 test 目标下对 bin 是 unused——`cfg_attr` 压制 dead_code 以满足 S8 clippy。
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_db_path(stats_path: PathBuf) -> Self {
+        Self::build(stats_path, Settings::default())
+    }
+
+    /// 打开 ro 连接（失败→内存兜底）+ 套用 settings；`new`/`with_db_path` 的共同实现。
+    fn build(stats_path: PathBuf, settings: Settings) -> Self {
+        let conn = db::open_ro(&stats_path).unwrap_or_else(|e| {
             crate::gui_log!("WARN: stats.db 不可用（{e}），使用内存兜底连接（引导态空数据）");
             Connection::open_in_memory().expect("内存连接不可能打开失败")
         });
-        let settings = Settings::load_from(&db::settings_path());
-        Self { ro_conn: Arc::new(Mutex::new(conn)), settings: Arc::new(RwLock::new(settings)) }
+        Self {
+            ro_conn: Arc::new(Mutex::new(conn)),
+            settings: Arc::new(RwLock::new(settings)),
+            stats_path,
+        }
     }
 
     /// 取 ro 连接。毒化互斥量恢复为可用——GUI 查询线程 panic 不应让后续查询永久失败。
@@ -102,7 +128,7 @@ impl AppState {
         let mut guard = self.lock_ro();
         if Self::is_fallback_conn(&guard) {
             // 仍不可用：继续用兜底连接跑 f（空表 → 空结果/错误，均由上层映射为空数据）
-            if let Ok(real) = db::open_ro(&db::stats_db_path()) {
+            if let Ok(real) = db::open_ro(&self.stats_path) {
                 crate::gui_log!("INFO: stats.db 已出现，从内存兜底连接切换到真实只读连接");
                 *guard = real;
             }
@@ -198,10 +224,13 @@ mod tests {
 
     #[test]
     fn app_state_fallback_conn_returns_empty_semantics() {
-        // stats.db 不在场：AppState 构造不失败，with_ro 在内存兜底连接上跑出
-        // "no such table" 类错误——上层据此映射空数据（§5.1 引导态）。
-        let st = AppState::new();
-        assert!(AppState::is_fallback_conn(&st.lock_ro()), "测试环境无 stats.db，应为兜底连接");
+        // 注入不存在路径：open_ro 失败 → 内存兜底；with_ro 重连目标也是该路径，
+        // 永远兜底——与本机是否有真实 stats.db 无关（§4.5）。
+        // 查询跑出 "no such table" 类错误——上层据此映射空数据（§5.1 引导态）。
+        let missing = testutil::temp_path("state-fallback", "db");
+        testutil::remove_all(&missing);
+        let st = AppState::with_db_path(missing);
+        assert!(AppState::is_fallback_conn(&st.lock_ro()), "注入不存在路径应为兜底连接");
         let r: store::Result<usize> =
             st.with_ro(|c| Ok(c.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get::<_, i64>(0))? as usize));
         assert!(r.is_err(), "兜底连接未迁移 schema，查询应失败并由上层映射为空");
@@ -209,7 +238,8 @@ mod tests {
 
     #[test]
     fn app_state_with_ro_on_real_db() {
-        // 真实库在场：with_ro 直连文件并跑通 reader（覆盖"reader 查询"验收点的一部分）
+        // 真实库在场：with_db_path 注入该库路径，with_ro 直连文件并跑通 reader
+        // （覆盖"reader 查询"验收点的一部分）
         let f = TempFile::new("state-real", "db");
         let w = store::writer::Writer::open(f.as_ref()).unwrap();
         let dev = w
@@ -227,12 +257,12 @@ mod tests {
         .unwrap();
         drop(w);
 
-        // 直接以该库为 ro 连接构造 AppState（绕过全局路径，便于测试）
-        let conn = db::open_ro(f.as_ref()).unwrap();
-        let st = AppState {
-            ro_conn: Arc::new(Mutex::new(conn)),
-            settings: Arc::new(RwLock::new(Settings::default())),
-        };
+        // §4.5：测试 hermetic 构造走 with_db_path（不再字面构造 AppState{..}）
+        let st = AppState::with_db_path(f.to_path_buf());
+        assert!(
+            !AppState::is_fallback_conn(&st.lock_ro()),
+            "注入真实库路径应直连文件，而非内存兜底"
+        );
         let rows = st
             .with_ro(|c| store::reader::daily_totals(c, "2026-09-01", "2026-09-30", None))
             .unwrap();

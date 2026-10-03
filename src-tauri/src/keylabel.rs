@@ -165,20 +165,26 @@ pub fn mouse_button_label(code: u16) -> String {
 }
 
 /// 手柄按键 code → 显示名（`input_daily` 的手柄 code 空间 1..=17，§4.1 GamepadButton）。
+/// 17 码物理标签表（usability-runtime-v3 §4.6 U2）：code 取 gilrs 枚举位次，显示名用物理键位——
+/// XInput 后端物理 X→West、Y→North、肩键→LeftTrigger/RightTrigger、模拟扳机→LeftTrigger2/RightTrigger2
+/// （主证据：本机 gilrs-core 0.6.8 windows_xinput/gamepad.rs:310-380），故 3 显示 Y（北）、
+/// 4 显示 X（西）、5/6/7/8 显示 LB/LT/RB/RT，枚举名（LT2/RT2/Select 等）不再泄漏成显示文本。
+/// Guide（code 11）保留：当前 XInput 后端可能不产出该事件，计数为 0 属预期、不是故障。
+/// 未知 code 保留 `按钮 N` 兜底；鼠标同码不在此处（`code_label` 按 kind 分派）。
 #[must_use]
 pub fn gamepad_button_label(code: u16) -> String {
     match code {
         1 => "A（南）".into(),
         2 => "B（东）".into(),
-        3 => "X（北）".into(),
-        4 => "Y（西）".into(),
-        5 => "LT".into(),
-        6 => "LT2".into(),
-        7 => "RT".into(),
-        8 => "RT2".into(),
-        9 => "Select".into(),
-        10 => "Start".into(),
-        11 => "Mode（Guide）".into(),
+        3 => "Y（北）".into(),
+        4 => "X（西）".into(),
+        5 => "LB（左肩）".into(),
+        6 => "LT（左扳机）".into(),
+        7 => "RB（右肩）".into(),
+        8 => "RT（右扳机）".into(),
+        9 => "View（选择）".into(),
+        10 => "Menu（开始）".into(),
+        11 => "Guide".into(),
         12 => "左摇杆按下".into(),
         13 => "右摇杆按下".into(),
         14 => "十字上".into(),
@@ -288,8 +294,42 @@ mod tests {
         assert_eq!(gamepad_button_label(17), "十字右");
         assert_eq!(gamepad_button_label(99), "按钮 99");
         assert_eq!(code_label(DeviceKind::Mouse, 6), "滚轮上");
-        assert_eq!(code_label(DeviceKind::Gamepad, 11), "Mode（Guide）");
+        assert_eq!(code_label(DeviceKind::Gamepad, 11), "Guide");
         assert_eq!(code_label(DeviceKind::Keyboard, 0x1E), "A");
+    }
+
+    /// U2（usability-runtime-v3 §4.6）：17 码物理标签表逐码锚定（正式查询与 mock 同一字符串）。
+    /// 修正点：3/4 的 X/Y 泄漏（旧版 3→"X（北）"、4→"Y（西）"）与 5-8 的枚举名泄漏
+    /// （LT/LT2/RT/RT2 → LB（左肩）/LT（左扳机）/RB（右肩）/RT（右扳机））；
+    /// 存储码与历史 count 不动，旧数据查询时按此表自然纠正。
+    #[test]
+    fn usability_v3_gamepad_17_code_u2_label_table() {
+        let expect: [(u16, &str); 17] = [
+            (1, "A（南）"),
+            (2, "B（东）"),
+            (3, "Y（北）"),
+            (4, "X（西）"),
+            (5, "LB（左肩）"),
+            (6, "LT（左扳机）"),
+            (7, "RB（右肩）"),
+            (8, "RT（右扳机）"),
+            (9, "View（选择）"),
+            (10, "Menu（开始）"),
+            (11, "Guide"),
+            (12, "左摇杆按下"),
+            (13, "右摇杆按下"),
+            (14, "十字上"),
+            (15, "十字下"),
+            (16, "十字左"),
+            (17, "十字右"),
+        ];
+        for (code, label) in expect {
+            assert_eq!(gamepad_button_label(code), label, "code {code} 标签错误");
+            assert_eq!(code_label(DeviceKind::Gamepad, code), label);
+        }
+        // 未知 code 兜底保留（"按钮 N"）
+        assert_eq!(gamepad_button_label(0), "按钮 0");
+        assert_eq!(gamepad_button_label(18), "按钮 18");
     }
 
     /// 组合键标签：固定顺序 Ctrl+Shift+Alt+Win + 键名（§4.7 "Ctrl+Shift+T" 形状）。

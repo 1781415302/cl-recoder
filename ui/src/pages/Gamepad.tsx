@@ -6,7 +6,7 @@ export function Gamepad() {
     <DeviceStatsPage
       kind="gamepad"
       title="手柄"
-      description="手柄按键计数（触发器以上穿 0.33 计 1 次，回落后才可再计）；XInput 手柄按固定名单行合并"
+      description="XInput/Xbox 系手柄按键计数（扳机上穿 0.33 计 1 次）；非 XInput 手柄（如部分 PS/Switch）暂不统计"
       colorVar="--chart-3"
     />
   );

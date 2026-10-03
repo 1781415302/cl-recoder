@@ -553,6 +553,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clrecoder-core",
+ "clrecoder-diagnostics",
  "clrecoder-store",
  "dirs 6.0.0",
  "rusqlite",
@@ -573,6 +574,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clrecoder-core",
+ "clrecoder-diagnostics",
  "clrecoder-engine",
  "clrecoder-store",
  "crossbeam-channel",
@@ -590,6 +592,16 @@ name = "clrecoder-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "clrecoder-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
  "serde",
  "serde_json",
 ]

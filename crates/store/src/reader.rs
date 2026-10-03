@@ -131,7 +131,7 @@ pub struct OverviewData {
     pub days: Vec<DayCount>,
     /// `to` 日按设备种类拆分（GUI 仪表盘把它当"今日"展示）
     pub today: TodaySplit,
-    /// 设备列表（lifetime total，与 [`devices`] 同口径）
+    /// 设备列表（`[from, to]` 区间总量，usability-runtime-v3 §4.6；lifetime 口径见 [`devices`]）
     pub devices: Vec<OverviewDeviceRow>,
 }
 
@@ -155,7 +155,8 @@ pub struct OverviewDeviceRow {
     pub kind: DeviceKind,
     /// 显示名
     pub name: String,
-    /// lifetime 总计数
+    /// 所选闭区间 `[from, to]` 总计数（usability-runtime-v3 §4.6：非 lifetime；
+    /// 区间内从未输入的设备为 0 且仍列出）
     pub total: u64,
 }
 
@@ -383,6 +384,15 @@ fn day_count_row(r: &Row<'_>) -> std::result::Result<DayCount, rusqlite::Error> 
     Ok(DayCount { day: r.get(0)?, total: i64_to_count(r.get(1)?) })
 }
 
+/// 设备主键直查种类（usability-runtime-v3 §4.6：只按 `devices.id` 读 kind，
+/// 不做 input_daily 全历史 SUM；id 不存在返回 `None`，由调用方折算成既有错误）。
+pub fn device_kind_by_id(conn: &Connection, id: i64) -> Result<Option<DeviceKind>> {
+    let kind: Option<String> = conn
+        .query_row("SELECT kind FROM devices WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    kind.map(|t| kind_from_text(&t)).transpose()
+}
+
 /// 逐日总量（可选按设备种类过滤；kind 消歧靠 devices.kind 连表，§4.1）。
 pub fn daily_totals(
     conn: &Connection,
@@ -449,7 +459,8 @@ pub fn mouse_distance_daily(conn: &Connection, from: &str, to: &str) -> Result<V
 /// 仪表盘一次组合查询（§4.7 Overview）：
 /// - `days`：范围内逐日总量（全部种类）；
 /// - `today`：**`to` 日**按 devices.kind 拆分为 keys/clicks/gamepad（GUI 传 `to=今日` 即今日拆分）；
-/// - `devices`：设备列表（lifetime total）。
+/// - `devices`：设备列表（`[from, to]` **区间总量**，usability-runtime-v3 §4.6；
+///   日期条件放 LEFT JOIN 的 ON 上，区间内零输入的设备仍列出且 total=0）。
 pub fn overview(conn: &Connection, from: &str, to: &str) -> Result<OverviewData> {
     let days = daily_totals(conn, from, to, None)?;
     let mut today = TodaySplit::default();
@@ -472,11 +483,14 @@ pub fn overview(conn: &Connection, from: &str, to: &str) -> Result<OverviewData>
     }
     let mut devices_out = Vec::new();
     {
+        // §4.6：devices[].total 为所选闭区间 SUM；日期条件必须在 ON 上——放 WHERE 会把
+        // 区间内零输入的设备整个过滤掉（LEFT JOIN 退化为 INNER JOIN）。
         let mut stmt = conn.prepare(
             "SELECT v.id, v.kind, COALESCE(v.nickname, v.name), COALESCE(SUM(i.count), 0) FROM devices v \
-             LEFT JOIN input_daily i ON i.device_id = v.id GROUP BY v.id ORDER BY v.id",
+             LEFT JOIN input_daily i ON i.device_id = v.id AND i.day BETWEEN ?1 AND ?2 \
+             GROUP BY v.id ORDER BY v.id",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![from, to], |r| {
             Ok(OverviewDeviceRow {
                 id: r.get(0)?,
                 kind: kind_col(r, 1)?,
@@ -1048,7 +1062,8 @@ mod tests {
         );
     }
 
-    /// overview：days 全种类合计；today = `to` 日按 kind 拆分；devices lifetime total。
+    /// overview：days 全种类合计；today = `to` 日按 kind 拆分；devices 为区间总量
+    ///（本测试范围 [DAY1, DAY2] 恰覆盖全部数据，区间值与 lifetime 值一致）。
     #[test]
     fn overview_returns_plan_shape() {
         let (_db, w) = seed("reader-overview");
@@ -1071,6 +1086,85 @@ mod tests {
         // to=DAY1：拆分随 to 变化
         let ov1 = overview(&conn, DAY1, DAY1).unwrap();
         assert_eq!((ov1.today.keys, ov1.today.clicks, ov1.today.gamepad), (15, 4, 0));
+    }
+
+    /// §4.6（usability-runtime-v3）：device_kind_by_id 主键直查 kind（不做全历史 SUM）；
+    /// 不存在的 id 返回 `None`。
+    #[test]
+    fn usability_v3_device_kind_by_id_primary_key_lookup() {
+        let (_db, w) = seed("reader-kind-by-id");
+        let conn = w.lock_conn();
+        assert_eq!(device_kind_by_id(&conn, 1).unwrap(), Some(DeviceKind::Keyboard));
+        assert_eq!(device_kind_by_id(&conn, 2).unwrap(), Some(DeviceKind::Mouse));
+        assert_eq!(device_kind_by_id(&conn, 3).unwrap(), Some(DeviceKind::Gamepad));
+        assert_eq!(device_kind_by_id(&conn, 999).unwrap(), None);
+    }
+
+    /// §4.6（usability-runtime-v3）：overview.devices.total 为所选闭区间 SUM——
+    /// 昨天 100 / 今天 2 / 多日 102；区间内零输入设备仍在场且 total=0（日期条件在 ON）；
+    /// devices() 的 DeviceRow.total 保持 lifetime 不受影响。
+    #[test]
+    fn usability_v3_overview_devices_total_is_selected_range_sum() {
+        let db = TempDb::new("reader-ov-range");
+        let w = Writer::open(db.as_ref()).unwrap();
+        let kb = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0x04D9,
+                pid: 0x0169,
+                name: "测试键盘".into(),
+            })
+            .unwrap();
+        let ms = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 0x1532,
+                pid: 0x0045,
+                name: "测试鼠标".into(),
+            })
+            .unwrap();
+        let gp = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Gamepad,
+                vid: 0,
+                pid: 0,
+                name: "零输入手柄".into(),
+            })
+            .unwrap();
+        assert_eq!((kb, ms, gp), (1, 2, 3), "依赖自增 id 顺序");
+        // 昨天（DAY1）100，今天（DAY2）2；鼠标只有昨天 50；手柄从未输入
+        w.flush(&FlushBatch {
+            input: vec![
+                (kb, DAY1.into(), 0x1E, 100),
+                (kb, DAY2.into(), 0x1E, 2),
+                (ms, DAY1.into(), 1, 50),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let conn = w.lock_conn();
+        // 多日闭区间 [昨天, 今天]：键盘 100+2=102，鼠标 50，零输入手柄 0 但仍在场
+        let ov = overview(&conn, DAY1, DAY2).unwrap();
+        assert_eq!(
+            ov.days.iter().map(|d| (d.day.as_str(), d.total)).collect::<Vec<_>>(),
+            vec![(DAY1, 150), (DAY2, 2)]
+        );
+        assert_eq!(ov.devices.len(), 3, "零输入设备不得被日期条件过滤掉");
+        assert_eq!((ov.devices[0].id, ov.devices[0].total), (1, 102));
+        assert_eq!((ov.devices[1].id, ov.devices[1].total), (2, 50));
+        assert_eq!((ov.devices[2].id, ov.devices[2].total), (3, 0));
+        // today 仍为 to 日拆分：今天只有键盘 2
+        assert_eq!((ov.today.keys, ov.today.clicks, ov.today.gamepad), (2, 0, 0));
+
+        // 单日区间 [今天, 今天]：区间内零输入的鼠标仍列出且 total=0
+        let ov_today = overview(&conn, DAY2, DAY2).unwrap();
+        assert_eq!(ov_today.devices.len(), 3);
+        assert_eq!((ov_today.devices[0].total, ov_today.devices[1].total), (2, 0));
+
+        // lifetime 口径不受影响：DeviceRow.total 仍为全历史 SUM
+        let devs = devices(&conn).unwrap();
+        assert_eq!((devs[0].total, devs[1].total, devs[2].total), (102, 50, 0));
     }
 
     /// §8-S4：wp_* 全家桶往返——meta/overview/top/daily/apps/mouse/buttons/scrolls 形状。

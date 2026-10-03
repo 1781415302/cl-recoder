@@ -259,6 +259,97 @@ body {
   font-weight: 600;
 }
 
+/* ========== 设备参考物理布局（usability-runtime-v3 §4.8 U4） ========== */
+/* 填充保持中性（不按频率染色）；仅选择/焦点强调用主色；控件 44px 起、圆角 6px、1px 边框（合同定值）。 */
+.dev-zones { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-3); }
+.dev-zone { min-width: 0; }
+.dev-zone-label { font-size: var(--text-caption); color: var(--color-text-muted); margin-bottom: var(--space-1); }
+.dev-zone-scroll { overflow-x: auto; padding-bottom: var(--space-1); } /* 卡内宽不足：局部横向查看，不缩放字号 */
+.dev-zone-grid { position: relative; }
+.dev-outline { position: absolute; top: 0; left: 0; pointer-events: none; }
+.dev-key {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: 1px solid var(--color-divider);
+  border-radius: 6px; /* §4.8 合同定值 */
+  background: var(--color-card);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-caption);
+  line-height: 1.15;
+  text-align: center;
+  cursor: pointer;
+  overflow: hidden;
+}
+.dev-key:hover { background: var(--color-muted); }
+.dev-key[aria-pressed="true"] { border-color: var(--color-primary); background: var(--color-muted); }
+.dev-key[aria-pressed="true"] .dev-key-num { color: var(--color-primary); font-weight: 700; }
+.dev-key-name { font-size: var(--text-caption); color: var(--color-text-muted); overflow-wrap: break-word; }
+.dev-key-num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--text-body); color: var(--color-text); }
+.dev-detail {
+  display: flex;
+  align-items: baseline;
+  align-content: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-height: 44px;
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-muted);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-body);
+}
+.dev-other-title { margin: var(--space-3) 0 var(--space-1); font-size: var(--text-caption); color: var(--color-text-muted); }
+.dev-other-list { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.dev-other-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-sm);
+  background: var(--color-card);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-caption);
+  cursor: pointer;
+}
+.dev-other-chip:hover { background: var(--color-muted); }
+.dev-other-chip[aria-pressed="true"] { border-color: var(--color-primary); color: var(--color-primary); font-weight: 600; }
+.dev-other-label { overflow-wrap: anywhere; text-align: left; }
+
+/* ========== 简洁排行列表（usability-runtime-v3 §4.8 U4） ========== */
+/* 名称 16px、值 tabular nums、轨道 4px、每行至少 44px；值变化无过渡/入场动画（.rank-fill 不设 transition）。 */
+.rank-list { list-style: none; margin: 0; padding: 0; }
+.rank-row {
+  display: grid;
+  grid-template-columns: 2em minmax(0, 1fr) auto;
+  grid-template-areas:
+    "no name value"
+    "no track track";
+  column-gap: var(--space-2);
+  row-gap: var(--space-1);
+  align-content: center;
+  min-height: 44px;
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--color-divider);
+}
+.rank-row:last-child { border-bottom: 0; }
+.rank-no { grid-area: no; color: var(--color-text-muted); font-variant-numeric: tabular-nums; }
+.rank-name { grid-area: name; font-size: var(--text-body-lg); font-weight: 600; overflow-wrap: anywhere; }
+.rank-value { grid-area: value; text-align: right; white-space: nowrap; }
+.rank-track { grid-area: track; height: 4px; border-radius: 2px; background: var(--color-muted); overflow: hidden; }
+.rank-fill { display: block; height: 100%; background: var(--color-primary); }
+
+/* ========== 表格分页（usability-runtime-v3 §4.8） ========== */
+.pager { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); flex-wrap: wrap; margin-top: var(--space-2); }
+.pager .chart-hint { margin: 0; }
+
 /* ========== 动画尊重 prefers-reduced-motion（§4.9 硬规则） ========== */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

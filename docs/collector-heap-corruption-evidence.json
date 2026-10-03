@@ -1,0 +1,39 @@
+{
+  "observed_date": "2026-09-30",
+  "timezone": "Asia/Shanghai",
+  "production_executable": "C:/Users/17814/Documents/cl recoder/target/release/cl-recoder-collector.exe",
+  "production_executable_sha256": "DECC74AE8DAE9B46A2A9B19DD5B2555DD282626D60157517F3318685046D1D96",
+  "source_file": "crates/collector/src/device.rs",
+  "source_sha256": "D140BE46005C579C0DD35446F1B59F93D6546C9FDF55A28EE9E61F6B29D55F9F",
+  "source_function": "raw_input_device_name",
+  "source_lines_at_diagnosis": [309, 329],
+  "crashes": [
+    {"local_time": "2026-09-30 19:35:50", "event_id": 1000, "exception_code": "0xC0000374", "module": "ntdll.dll"},
+    {"local_time": "2026-09-30 21:18:55", "event_id": 1000, "exception_code": "0xC0000374", "module": "ntdll.dll"}
+  ],
+  "scheduled_task": {"name": "ClRecoderCollector", "last_run_local_time": "2026-09-30 21:18:09", "last_result_decimal": 3221226356, "last_result_hex": "0xC0000374"},
+  "read_only_proof": {
+    "method": "GetRawInputDeviceList followed by GetRawInputDeviceInfoW/RIDI_DEVICENAME with oversized physical buffer; compare writes past old logical capacity; no actual out-of-allocation write",
+    "queried_device_count": 10,
+    "all_outer_canaries_intact": true,
+    "mouse_samples": [
+      {"required_utf16_chars": 79, "old_allocated_u16": 40, "written_chars_past_old_boundary": 39},
+      {"required_utf16_chars": 89, "old_allocated_u16": 45, "written_chars_past_old_boundary": 44},
+      {"required_utf16_chars": 95, "old_allocated_u16": 48, "written_chars_past_old_boundary": 47}
+    ],
+    "keyboard_samples": [
+      {"required_utf16_chars": 89, "old_allocated_u16": 45, "written_chars_past_old_boundary": 44},
+      {"required_utf16_chars": 95, "old_allocated_u16": 48, "written_chars_past_old_boundary": 47},
+      {"required_utf16_chars": 87, "old_allocated_u16": 44, "written_chars_past_old_boundary": 43},
+      {"required_utf16_chars": 79, "old_allocated_u16": 40, "written_chars_past_old_boundary": 39},
+      {"required_utf16_chars": 70, "old_allocated_u16": 36, "written_chars_past_old_boundary": 34}
+    ]
+  },
+  "limitations": "Existing WER event records show heap corruption but are not an exact corrupting-instruction stack trace. The source capacity violation is independently confirmed by API contract and safe real-device write-boundary measurements.",
+  "source_changes_made_by_diagnosis": false,
+  "production_processes_or_tasks_modified": false,
+  "references": [
+    "https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getrawinputdeviceinfow",
+    "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55"
+  ]
+}

@@ -1,5 +1,6 @@
-// 仪表盘：今日 KPI（0.5s 近实时轮询）+ 每日趋势 + 设备总计。
-import { useState } from "react";
+// 仪表盘：今日 KPI（近实时轮询）+ 每日趋势 + 设备总计。
+// §4.5：默认今日（useStatisticsRange，跨午夜跟随）；单日隐藏无意义的每日趋势卡；
+// 设备总计为所选闭区间总量（overview.devices[].total，usability-runtime-v3 §4.6）。
 import { useOverview } from "../api/queries";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
@@ -8,7 +9,9 @@ import { SkeletonCard, SkeletonCards } from "../components/Skeleton";
 import { StatCard } from "../components/StatCard";
 import { TrendChart } from "../components/TrendChart";
 import { IconGamepad, IconKeyboard, IconMouse } from "../components/icons";
-import { defaultRange, fmtNum, kindLabel } from "../lib/format";
+import { fmtDayShort, fmtNum, kindLabel } from "../lib/format";
+import { useAppActivity } from "../lib/AppActivityProvider";
+import { useStatisticsRange } from "../lib/useStatisticsRange";
 
 interface DeviceSummary {
   id: number;
@@ -24,8 +27,13 @@ const deviceColumns: Column<DeviceSummary>[] = [
 ];
 
 export function Dashboard() {
-  const [range, setRange] = useState(() => defaultRange(30));
+  const { range, onChange } = useStatisticsRange();
+  const activity = useAppActivity();
   const { data, isLoading, isError, refetch } = useOverview(range);
+  // §4.8：仅单日时每日趋势卡无意义——隐藏（多日时保留，单数据点由 TrendChart 显示 dot）
+  const singleDay = range.from === range.to;
+  // 活动初始化完成前查询被 gating（无凭据不臆断"无数据"），按加载态呈现
+  const loading = isLoading || !activity.ready;
 
   if (isError) {
     return (
@@ -44,36 +52,36 @@ export function Dashboard() {
           <h1 className="page-title">仪表盘</h1>
           <p className="page-desc">外设输入总览 —— 今日数据近实时自动刷新</p>
         </div>
-        <DateRangePicker value={range} onChange={setRange} />
+        <DateRangePicker value={range} onChange={onChange} />
       </div>
 
-      {isLoading ? (
+      {loading ? (
         <SkeletonCards count={3} />
       ) : (
         <div className="grid-cards">
-          <StatCard label="今日按键" value={fmtNum(data?.today.keys ?? 0)} tone="primary" icon={<IconKeyboard />} />
-          <StatCard label="今日点击" value={fmtNum(data?.today.clicks ?? 0)} tone="default" icon={<IconMouse />} />
-          <StatCard label="今日手柄" value={fmtNum(data?.today.gamepad ?? 0)} tone="accent" icon={<IconGamepad />} />
+          {/* Overview.today 仍为 to 日拆分（§4.6）：卡片文案按 to 日如实标注 */}
+          <StatCard label={range.to === activity.today ? "今日按键" : `${fmtDayShort(range.to)} 按键`} value={fmtNum(data?.today.keys ?? 0)} tone="primary" icon={<IconKeyboard />} />
+          <StatCard label={range.to === activity.today ? "今日点击" : `${fmtDayShort(range.to)} 点击`} value={fmtNum(data?.today.clicks ?? 0)} tone="default" icon={<IconMouse />} />
+          <StatCard label={range.to === activity.today ? "今日手柄" : `${fmtDayShort(range.to)} 手柄`} value={fmtNum(data?.today.gamepad ?? 0)} tone="accent" icon={<IconGamepad />} />
         </div>
       )}
 
-      {isLoading ? (
-        <SkeletonCard rows={5} height="120px" />
-      ) : (
+      {!singleDay && loading ? <SkeletonCard rows={5} height="120px" /> : null}
+      {!singleDay && !loading ? (
         <TrendChart
           data={data?.days ?? []}
           title="每日总事件（所选范围）"
           colorVar="--chart-1"
           seriesName="全部设备"
         />
-      )}
+      ) : null}
 
-      {isLoading ? (
+      {loading ? (
         <SkeletonCard rows={4} />
       ) : (
         <div className="card">
           <h2 className="card-title">设备统计</h2>
-          <p className="card-sub">按设备型号分开统计（同型号合并；XInput 手柄为单行合并）</p>
+          <p className="card-sub">按设备型号分开统计（同型号合并；XInput 手柄为单行合并）；数值为所选范围累计</p>
           <div style={{ marginTop: "var(--space-3)" }}>
             <DataTable
               columns={deviceColumns}

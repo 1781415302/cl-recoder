@@ -1,21 +1,32 @@
 //! import —— WhatPulse 导入（PLAN §4.8/§5.4；**wp_* 的唯一写入处**，§2.5）。
 //!
-//! 流程（§5.4 逐字）：选文件 → **复制到 `%TEMP%\clrecoder-wp-{ts}.db`** → 只读打开副本 →
-//! 按 §4.8 逐表校验 + Rust 侧聚合（缺表→warning，继续）→ 调
-//! `store::writer::rebuild_wp_tables_with` 单事务整体重建（GUI 临时 rw 连接 busy_timeout=10s，
-//! wp_* 的 SQL 唯一归属 store）→ 删临时文件 → 返回 `ImportReport`。
-//! **整体替换语义**：重复导入即刷新为最新快照。
+//! 流程（§5.4 逐字 + correctness-v2 §5.1）：选文件 → 三级路径解析（§4.3）→
+//! **复制到 `%TEMP%\clrecoder-wp-{pid}-{ts}-{序号}.db`**（主库 fatal + `{src}-wal`
+//! best-effort，**不复制 `-shm`**）→ **RW 打开副本**（`Connection::open`，WAL 恢复写副本
+//! 自身；`-shm` 由 SQLite 自动重建）→ **preflight（correctness-v2 §4.5）：`PRAGMA
+//! quick_check` 唯一 ok + 来源识别（八张统计表至少一张且列验证通过；applications 仅是
+//! 可选展示元数据，不构成来源身份）**，不相关/损坏/畸形来源立即硬失败 → 缺表 warning
+//! （缺失统计表允许空类别）→ 全部现存统计数据读取成功后组织批次 → **此时才**依次
+//! `db::open_rw`、migrate、`store::writer::rebuild_wp_tables_with` 单事务整体重建
+//! （GUI 临时 rw 连接 busy_timeout=10s，wp_* 的 SQL 唯一归属 store）→
+//! 删 `{tmp}`/`{tmp}-wal`/`{tmp}-shm` 三件套 → 返回 `ImportReport`。
 //!
-//! 铁律（§1 原则 6 / §7-1）：WhatPulse 库只读、先复制后打开、绝不写 WhatPulse 的任何文件。
+//! **整体替换语义**：重复导入即刷新为最新快照；合法已识别的空统计表同样成功（导入
+//! 零行整体替换），与非法/不相关/损坏来源不同。来源复制/识别/校验/读取/批次准备失败
+//! 都先于目标库打开——已有目标不变、不存在目标不被创建。
+//!
+//! 铁律（§1 原则 6 / §7-1）：WhatPulse 库只读、先复制后打开、**绝不写 WhatPulse 的任何文件**。
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::db;
+use crate::state::AppState;
 use clrecoder_core::{day, qtkeys};
 use clrecoder_store::reader::{
     WpAppDailyRow, WpComboDailyRow, WpKeyDailyRow, WpMetaRow, WpMouseButtonDailyRow,
@@ -59,6 +70,24 @@ const SOURCE_TABLES: [&str; 9] = [
     "mouseclicks_frequency",
     "mousescrolls",
 ];
+
+/// 八张统计表及其必需列（correctness-v2 §4.5 表格逐字；与现有聚合 SQL 一致）。
+/// 允许额外列，不要求 profile_id/hour，不要求九表齐全；applications 是单独的可选
+/// 展示元数据，不在此列（其失败只 warning + basename 回退）。
+const STAT_TABLES: &[(&str, &[&str])] = &[
+    ("keypress_frequency", &["day", "key", "count"]),
+    ("keycombo_frequency", &["day", "combo", "count"]),
+    ("input_per_application", &["day", "path", "keys", "clicks"]),
+    ("application_active_hour", &["day", "path", "msec_active"]),
+    ("mouseclicks", &["day", "count"]),
+    ("mousedistance", &["day", "distance_inches"]),
+    ("mouseclicks_frequency", &["day", "button", "count"]),
+    ("mousescrolls", &["day", "direction", "count"]),
+];
+
+/// 临时副本名的进程内原子序号（correctness-v2 §4.5：pid+毫秒戳可能同毫秒碰撞，
+/// 追加序号保证并行回归的内部副本互不冲突；不新增依赖）。
+static TMP_COPY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// WhatPulse 按钮码 → 显示名（§4.8 静态表；其余原码直显，§9.3）。
 fn mouse_button_label(code: i64) -> String {
@@ -132,6 +161,90 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool, rusqlite::Error> 
 /// 缺表警告文案（测试断言用）。
 fn missing_table_warning(name: &str) -> String {
     format!("源库缺少表 {name}，已跳过该类数据")
+}
+
+/// preflight 结果（correctness-v2 §4.5）：来源库中已确认存在的 WhatPulse 表集合。
+/// 八张统计表只在存在**且必需列验证通过**时入集；applications 仅记录存在性
+/// （可选展示元数据，其列/读取失败由聚合路径 warning + basename 回退）。
+/// 仅本文件私有使用，内部形状不构成跨模块合同。
+#[derive(Debug, Default)]
+struct SourceSchema(HashSet<String>);
+
+impl SourceSchema {
+    /// 表是否已确认存在（统计表另需已过列验证才会出现在集合中）。
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+}
+
+/// 表的列名集合（`PRAGMA table_info` 的 name 列）。Err 由调用方按合同处理：
+/// 统计表 → 硬失败；applications 元数据在聚合路径只 warning。
+fn table_columns(conn: &Connection, table: &str) -> Result<HashSet<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    let mut cols = HashSet::new();
+    for c in rows {
+        cols.insert(c?);
+    }
+    Ok(cols)
+}
+
+/// preflight（correctness-v2 §4.5）：副本完整性检查 + 来源识别 + 现存统计表列验证。
+///
+/// 固定规则：`PRAGMA quick_check` 必须成功且结果唯一 `ok`；全局 sqlite_master 读取与
+/// 八张统计表的存在性/列检查出错均视为硬失败；八张统计表至少一张存在且列验证通过
+/// （单独 applications 不构成来源身份）。Err = 硬失败文案，调用方整次导入失败，
+/// 绝不触碰目标库。
+fn validate_source(conn: &Connection) -> Result<SourceSchema, String> {
+    // 1. 完整性：quick_check 唯一 ok（损坏库的多行错误结果 / 查询报错都算失败）
+    let mut stmt = conn
+        .prepare("PRAGMA quick_check")
+        .map_err(|e| format!("副本完整性检查失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("副本完整性检查失败: {e}"))?;
+    let mut check: Vec<String> = Vec::new();
+    for r in rows {
+        check.push(r.map_err(|e| format!("副本完整性检查失败: {e}"))?);
+    }
+    if check.len() != 1 || check[0] != "ok" {
+        return Err(format!("副本完整性检查未通过: {}", check.join("；")));
+    }
+
+    // 2. 全局读一次 sqlite_master 拿全部表名，后续存在性判断不再有 SQL 出错面
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(|e| format!("读取来源表清单失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("读取来源表清单失败: {e}"))?;
+    let mut schema = SourceSchema::default();
+    for r in rows {
+        schema.0.insert(r.map_err(|e| format!("读取来源表清单失败: {e}"))?);
+    }
+
+    // 3. 现存统计表逐一验证必需列（存在但缺列必须整次失败，不能跳过后覆写目标）
+    for &(name, required) in STAT_TABLES {
+        if !schema.0.contains(name) {
+            continue; // 缺失统计表：调用方 warning + 空类别（部分合法 schema 仍可导入）
+        }
+        let actual =
+            table_columns(conn, name).map_err(|e| format!("检查表 {name} 列失败: {e}"))?;
+        for col in required {
+            if !actual.contains(*col) {
+                return Err(format!("统计表 {name} 缺少必需列 {col}"));
+            }
+        }
+    }
+
+    // 4. 来源身份：至少一张列验证通过的统计表（单独 applications 不构成身份）
+    if !STAT_TABLES
+        .iter()
+        .any(|&(name, _)| schema.0.contains(name))
+    {
+        return Err("来源数据库不包含可识别的 WhatPulse 统计表".to_string());
+    }
+    Ok(schema)
 }
 
 /// 聚合 keypress_frequency → wp_key_daily（§4.8：GROUP BY day,key；跨 profile_id 直接求和；
@@ -245,15 +358,28 @@ fn agg_apps(
 }
 
 /// applications 表 → (path → name) 映射（§4.8 "按 path 匹配 applications.name"）。
-fn load_applications(conn: &Connection) -> Result<HashMap<String, String>, rusqlite::Error> {
-    if !table_exists(conn, "applications")? {
+/// 属可选展示元数据：先按 PRAGMA 实际列验证 path/name 再 SELECT——缺失列经
+/// SELECT 的双引号 DQS 兜底会静默变成字符串字面量，不能只靠 SELECT 报错发现；
+/// 任何失败由调用方 warning + basename 回退，不阻断统计导入（correctness-v2 §4.5）。
+fn load_applications(conn: &Connection) -> Result<HashMap<String, String>, String> {
+    if !table_exists(conn, "applications").map_err(|e| e.to_string())? {
         return Ok(HashMap::new());
     }
-    let mut stmt = conn.prepare("SELECT \"path\", \"name\" FROM applications")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let cols = table_columns(conn, "applications").map_err(|e| e.to_string())?;
+    for col in ["path", "name"] {
+        if !cols.contains(col) {
+            return Err(format!("缺少列 {col}"));
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT \"path\", \"name\" FROM applications")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
     let mut m = HashMap::new();
     for row in rows {
-        let (path, name) = row?;
+        let (path, name) = row.map_err(|e| e.to_string())?;
         if !name.is_empty() {
             m.insert(path, name);
         }
@@ -367,6 +493,38 @@ fn failed_report(started: Instant, mut warnings: Vec<String>, msg: String) -> Im
     }
 }
 
+/// 源路径三级解析（§4.3：参数 > settings 覆盖 > 默认探测）。
+/// - `path_arg.trim()` 非空 → 用它；
+/// - `settings_wp_db_path.trim()` 非空 → 用它（settings 允许写入空串，须同样 trim 判定）；
+/// - 否则 `dirs::data_local_dir()?.join("WhatPulse").join("whatpulse.db")`；
+/// - `data_local_dir` 失败 → Err（**绝不**兜底成 `./WhatPulse/whatpulse.db`）。
+pub(crate) fn resolve_wp_source(
+    path_arg: &str,
+    settings_wp_db_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    let arg = path_arg.trim();
+    if !arg.is_empty() {
+        return Ok(PathBuf::from(arg));
+    }
+    if let Some(s) = settings_wp_db_path {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(PathBuf::from(s));
+        }
+    }
+    let base = dirs::data_local_dir().ok_or_else(|| {
+        "无法解析本地数据目录（%LOCALAPPDATA%），请在设置中指定 WhatPulse 库路径".to_string()
+    })?;
+    Ok(base.join("WhatPulse").join("whatpulse.db"))
+}
+
+/// 旁路文件名：`{db}{suffix}`（`OsString::push`，非 UTF-8 路径安全）。
+fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// 导入主入口（command 与单测共用）：`source` = WhatPulse 库，`stats_db` = 本软件统计库。
 pub fn run_import(source: &Path, stats_db: &Path) -> ImportReport {
     let started = Instant::now();
@@ -379,18 +537,37 @@ pub fn run_import(source: &Path, stats_db: &Path) -> ImportReport {
     let source_size = std::fs::metadata(source).map(|m| m.len() as i64).ok();
 
     // 1. 复制到临时（§5.4：先复制后打开，绝不写 WhatPulse 目录）
+    //    临时名含 pid + 毫秒戳 + 进程内原子序号：并行测试/UI 连点同毫秒也不互相覆盖
     let tmp = std::env::temp_dir().join(format!(
-        "clrecoder-wp-{}.db",
-        chrono::Local::now().timestamp_millis()
+        "clrecoder-wp-{}-{}-{}.db",
+        std::process::id(),
+        chrono::Local::now().timestamp_millis(),
+        TMP_COPY_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_file(&tmp); // 清理可能残留的同名旧文件
+    let tmp_wal = sidecar_path(&tmp, "-wal");
+    let tmp_shm = sidecar_path(&tmp, "-shm");
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp_wal);
+    let _ = std::fs::remove_file(&tmp_shm);
     if let Err(e) = std::fs::copy(source, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
         return failed_report(started, warnings, format!("复制源库失败: {e}"));
     }
 
-    // 2. 只读打开副本 + 逐表校验/聚合（单表失败降级为 warning，§1 原则 3 绝不 crash）
+    // {src}-wal 存在则 best-effort 复制（失败静默——WhatPulse 写入期间锁竞争/checkpoint 竞态属预期，
+    // 缺 wal 只是得到更旧快照）。**不复制 -shm**：RW 打开副本时 SQLite 自动重建。
+    let src_wal = sidecar_path(source, "-wal");
+    if src_wal.is_file() {
+        let _ = std::fs::copy(&src_wal, &tmp_wal);
+    }
+
+    // 2. RW 打开副本 + preflight 校验/聚合（损坏/不相关/畸形来源硬失败，
+    //    失败路径绝不打开目标——已有目标不变、不存在目标不被创建，correctness-v2 §5.1）
     let result = import_from_copy(&tmp, source, source_size, stats_db, &mut warnings);
-    let _ = std::fs::remove_file(&tmp); // 无论成败都删临时文件（§5.4）
+    // 清理三件套（无论成败，§5.4）
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp_wal);
+    let _ = std::fs::remove_file(&tmp_shm);
 
     match result {
         Ok((batch, keys, combos, apps, mouse_days, dmin, dmax)) => {
@@ -419,7 +596,12 @@ pub fn run_import(source: &Path, stats_db: &Path) -> ImportReport {
     }
 }
 
-/// 副本聚合 + 单事务重建（返回批次与报告数字；Err = 硬失败文案）。
+/// 副本校验 + 聚合 + 单事务重建（返回批次与报告数字；Err = 硬失败文案）。
+///
+/// 失败语义（correctness-v2 §4.5/§5.1）：preflight、聚合读取与批次准备任一失败都
+/// **先于** `open_rw(stats_db)` 返回——已有目标不变、不存在目标不被创建；进入目标阶段
+/// 后沿用建库/迁移行为，替换失败由 store 的单事务回滚兜底。只有已确认缺失的表才得到
+/// 空结果，现存表读取错误绝不降级为空快照覆写目标。
 #[allow(clippy::type_complexity)]
 fn import_from_copy(
     tmp: &Path,
@@ -431,38 +613,30 @@ fn import_from_copy(
     (WpImportBatch, usize, usize, usize, usize, Option<String>, Option<String>),
     String,
 > {
-    let conn = Connection::open_with_flags(
-        tmp,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| format!("打开副本失败: {e}"))?;
+    // RW 打开副本：WAL 恢复需要写副本自身（含自动重建 -shm）；源文件绝不写（§7-1）
+    let conn = Connection::open(tmp).map_err(|e| format!("打开副本失败: {e}"))?;
 
-    // 逐表存在性校验（§4.8：缺表跳过并写入 warnings）
-    let missing: Vec<&str> = SOURCE_TABLES
-        .into_iter()
-        .filter(|t| match table_exists(&conn, t) {
-            Ok(true) => false,
-            Ok(false) => true,
-            Err(e) => {
-                warnings.push(format!("检查表 {t} 失败: {e}"));
-                true // 保守处理：检查失败按缺表跳过（防御性，§1 原则 3）
-            }
-        })
-        .collect();
-    for t in &missing {
-        warnings.push(missing_table_warning(t));
+    // preflight（correctness-v2 §4.5）：quick_check + 来源识别 + 现存统计表列验证，
+    // 任一步失败即硬失败（不相关/损坏/畸形来源立即退出，绝不触碰目标）
+    let schema = validate_source(&conn)?;
+
+    // 缺表 warning（§4.8：缺失统计表允许 warning + 空类别；含 applications 元数据）
+    for t in SOURCE_TABLES {
+        if !schema.contains(t) {
+            warnings.push(missing_table_warning(t));
+        }
     }
 
-    // Rust 侧聚合（§4.8 六张目标表）；单表 SQL 失败 → warning + 跳过（防御性）。
-    // warnings 只从 run_step 的闭包参数流入，避免同一语句对 warnings 的双重借用。
-    let keys = run_step(warnings, "keypress_frequency", |_w| agg_keys(&conn));
-    let combos = run_step(warnings, "keycombo_frequency", |_w| agg_combos(&conn));
-    let apps = run_step(warnings, "input_per_application/application_active_hour", |w| {
-        agg_apps(&conn, w)
-    });
-    let mouse = run_step(warnings, "mouseclicks/mousedistance", |_w| agg_mouse(&conn));
-    let buttons = run_step(warnings, "mouseclicks_frequency", |_w| agg_mouse_buttons(&conn));
-    let scrolls = run_step(warnings, "mousescrolls", |_w| agg_mouse_scrolls(&conn));
+    // Rust 侧聚合（§4.8 六张目标表）：只有已确认缺失的表得到空结果；
+    // 现存表的读取/聚合错误一律硬失败传播，绝不以空快照覆写目标（correctness-v2 §4.5）。
+    let keys = agg_keys(&conn).map_err(|e| format!("读取按键统计失败: {e}"))?;
+    let combos = agg_combos(&conn).map_err(|e| format!("读取组合键统计失败: {e}"))?;
+    // agg_apps/agg_mouse 任一来源统计表失败都必须整次失败，不接受"另一张成功所以覆写"
+    let apps = agg_apps(&conn, warnings).map_err(|e| format!("读取应用统计失败: {e}"))?;
+    let mouse = agg_mouse(&conn).map_err(|e| format!("读取鼠标统计失败: {e}"))?;
+    let buttons =
+        agg_mouse_buttons(&conn).map_err(|e| format!("读取鼠标按键统计失败: {e}"))?;
+    let scrolls = agg_mouse_scrolls(&conn).map_err(|e| format!("读取滚轮统计失败: {e}"))?;
     if !scrolls.is_empty() {
         // §4.8/§9.3：滚轮方向码语义为推断值，必须在 warnings 声明
         warnings.push("滚轮方向码 1..4 的语义为推断值（WhatPulse 内部编码无公开文档）".into());
@@ -479,10 +653,7 @@ fn import_from_copy(
         .chain(scrolls.iter().map(|r| r.day.as_str()));
     let (date_min, date_max) = date_range(all_days);
 
-    // 单事务整体重建（wp_* 的 SQL 唯一归属 store；GUI 临时 rw 连接 busy_timeout=10s，§5.4）
-    let stats = db::open_rw(stats_db).map_err(|e| format!("打开统计库失败: {e}"))?;
-    clrecoder_store::schema::migrate(&stats)
-        .map_err(|e| format!("统计库迁移失败: {e}"))?;
+    // 批次准备完成（correctness-v2 §4.5：批次全部准备完成前不得 open_rw/migrate/rebuild）
     let batch = WpImportBatch {
         meta: WpMetaRow {
             imported_at: day::now_local_rfc3339(),
@@ -499,6 +670,12 @@ fn import_from_copy(
         mouse_buttons: buttons,
         mouse_scrolls: scrolls,
     };
+
+    // 此时才打开/迁移目标并单事务整体重建
+    // （wp_* 的 SQL 唯一归属 store；GUI 临时 rw 连接 busy_timeout=10s，§5.4）
+    let stats = db::open_rw(stats_db).map_err(|e| format!("打开统计库失败: {e}"))?;
+    clrecoder_store::schema::migrate(&stats)
+        .map_err(|e| format!("统计库迁移失败: {e}"))?;
     clrecoder_store::writer::rebuild_wp_tables_with(&stats, &batch)
         .map_err(|e| format!("重建 wp_* 表失败: {e}"))?;
 
@@ -511,31 +688,28 @@ fn import_from_copy(
     Ok((batch, n.0, n.1, n.2, n.3, date_min, date_max))
 }
 
-/// 单表聚合的防御包装：SQL 失败 → warning + 空结果（绝不 crash、绝不丢其他表，§1 原则 3）。
-/// 闭包需要写 warnings 时（如 agg_apps 的 applications 回退警告）经参数 `w` 拿到。
-fn run_step<T>(
-    warnings: &mut Vec<String>,
-    what: &str,
-    f: impl FnOnce(&mut Vec<String>) -> Result<T, rusqlite::Error>,
-) -> T
-where
-    T: Default,
-{
-    match f(warnings) {
-        Ok(v) => v,
-        Err(e) => {
-            warnings.push(format!("表 {what} 聚合失败，已跳过: {e}"));
-            T::default()
-        }
-    }
-}
-
-/// WhatPulse 导入（§4.7 `import_whatpulse(path: String) -> ImportReport`）。
-/// 失败不返回 Err——统一以 `ok=false` + warnings 表达（TS 契约有 ok 字段）。
+/// WhatPulse 导入（§4.7/§4.3 `import_whatpulse(path) -> ImportReport`）。
+/// TS 侧 invoke 键不变：仍只有 `{path}`（`State` 由 Tauri 注入，不进 invoke 参数）。
+/// 三级解析：path 参数 > settings.wp_db_path > 默认探测；解析/导入失败一律
+/// `ok=false` 报告，不返回 Err。
 #[tauri::command]
-pub async fn import_whatpulse(path: String) -> Result<ImportReport, String> {
+pub async fn import_whatpulse(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ImportReport, String> {
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let report = run_import(Path::new(&path), &db::stats_db_path());
+        let started = Instant::now();
+        let wp_db_path = st
+            .settings
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wp_db_path
+            .clone();
+        let report = match resolve_wp_source(&path, wp_db_path.as_deref()) {
+            Ok(source) => run_import(&source, &db::stats_db_path()),
+            Err(msg) => failed_report(started, Vec::new(), msg),
+        };
         crate::gui_log!(
             "INFO: WhatPulse 导入完成: ok={} keys={} 耗时 {}ms",
             report.ok,
@@ -553,14 +727,14 @@ mod tests {
     use super::*;
     use crate::state::testutil::TempFile;
     use clrecoder_core::qtkeys::qt_key_label;
+    use rusqlite::OpenFlags;
 
     const D1: &str = "2026-05-01";
     const D2: &str = "2025-12-31"; // 故意比 D1 早：验证 dateMin 取并集最小值
 
-    /// 按 §4.8 源表 schema 造合成 fixture 库（列名与 §4.8"对真实库已验证的列"一致）。
-    /// 含两个 profile_id 的行——验证"跨 profile_id 直接求和"。
-    fn make_fixture(path: &Path) {
-        let conn = Connection::open(path).unwrap();
+    /// 按 §4.8 源表 schema 建九张空表（列名与 §4.8"对真实库已验证的列"一致）。
+    /// fixture 复用：合法空库 / 元数据反例只建表不插行。
+    fn create_wp_tables(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE keypress_frequency(profile_id INTEGER, day TEXT, hour INTEGER, key INTEGER, count INTEGER);
              CREATE TABLE keycombo_frequency(profile_id INTEGER, day TEXT, hour INTEGER, combo TEXT, count INTEGER);
@@ -573,6 +747,13 @@ mod tests {
              CREATE TABLE mousescrolls(profile_id INTEGER, day TEXT, hour INTEGER, direction INTEGER, count INTEGER);",
         )
         .unwrap();
+    }
+
+    /// 按 §4.8 源表 schema 造合成 fixture 库（列名与 §4.8"对真实库已验证的列"一致）。
+    /// 含两个 profile_id 的行——验证"跨 profile_id 直接求和"。
+    fn make_fixture(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        create_wp_tables(&conn);
         // 键：跨 profile、跨 hour 直接求和
         // profile 1：A(D1,0h,10)+A(D1,1h,5)；profile 2：A(D2,1h,2)、B(D1,2h,7)、Escape(D2,0h,3)
         // SUM = 10+5+2+7+3 = 27（§5.4 校验锚点）
@@ -927,5 +1108,360 @@ mod tests {
         assert_eq!(mouse_scroll_label(3), "向左");
         assert_eq!(mouse_scroll_label(4), "向右");
         assert_eq!(mouse_scroll_label(7), "方向 7");
+    }
+
+    /// §4.3 三级路径解析纯函数。
+    #[test]
+    fn resolve_wp_source_levels() {
+        assert_eq!(
+            resolve_wp_source(r"C:\x.db", None).unwrap(),
+            PathBuf::from(r"C:\x.db"),
+            "非空 path_arg 优先"
+        );
+        assert_eq!(
+            resolve_wp_source("  ", Some(r"D:\wp.db")).unwrap(),
+            PathBuf::from(r"D:\wp.db"),
+            "path_arg 空白 → settings"
+        );
+        assert_eq!(
+            resolve_wp_source("", Some("  ")).unwrap(),
+            resolve_wp_source("", None).unwrap(),
+            "settings 空白 → 默认探测（须 trim 判定）"
+        );
+        if let Some(base) = dirs::data_local_dir() {
+            let expected = base.join("WhatPulse").join("whatpulse.db");
+            assert_eq!(resolve_wp_source("", None).unwrap(), expected);
+            assert!(
+                resolve_wp_source("", None)
+                    .unwrap()
+                    .ends_with(std::path::Path::new("WhatPulse").join("whatpulse.db")),
+                "默认路径须以 WhatPulse/whatpulse.db 结尾"
+            );
+        } else {
+            assert!(
+                resolve_wp_source("", None).is_err(),
+                "data_local_dir 不可用时必须 Err，绝不兜底 ./WhatPulse/whatpulse.db"
+            );
+        }
+    }
+
+    /// §4.3：WAL-only 行经 `-wal` 复制被读到（未 checkpoint 的提交数据）。
+    #[test]
+    fn import_reads_wal_only_rows() {
+        // TempFile 先于 conn 声明：Drop 逆序，防 Windows 残留临时文件
+        let src = TempFile::new("imp-wal-src", "db");
+        let stats = TempFile::new("imp-wal-stats", "db");
+        let wal_path = sidecar_path(src.as_ref(), "-wal");
+
+        // fixture：WAL 模式；execute_batch autocommit 提交插入（未提交帧恢复时会被跳过）
+        let conn = Connection::open(&src).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE keypress_frequency(profile_id INTEGER, day TEXT, hour INTEGER, key INTEGER, count INTEGER);
+             INSERT INTO keypress_frequency VALUES (1,'2026-05-01',0,65,10);",
+        )
+        .unwrap();
+        // 先 checkpoint，使 schema + 基线行落入主库文件
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        // 再插入 wal-only 行（不 checkpoint → 提交数据只存在于 -wal）
+        conn.execute_batch("INSERT INTO keypress_frequency VALUES (1,'2026-05-01',1,65,5);")
+            .unwrap();
+
+        // 前置条件：src-wal 存在且非空
+        assert!(wal_path.is_file(), "fixture 必须生成 -wal: {}", wal_path.display());
+        let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_len > 0, "-wal 必须非空（含未 checkpoint 的提交）");
+
+        // conn 存活跨过 run_import（复制 -wal 后副本侧 WAL 恢复；源侧不受影响）
+        let report = run_import(src.as_ref(), stats.as_ref());
+        assert!(report.ok, "导入必须成功: {:?}", report.warnings);
+
+        let stats_conn = Connection::open(stats.as_ref()).unwrap();
+        let wp_sum: i64 = stats_conn
+            .query_row("SELECT COALESCE(SUM(count),0) FROM wp_key_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            wp_sum, 15,
+            "wp_key_daily SUM 必须含 wal-only 行（主库 10 + WAL 5）"
+        );
+
+        // conn 仍存活时源侧 -wal 应仍在（run_import 绝不写 WhatPulse 源文件；
+        // conn drop 后 SQLite 会自行 checkpoint，故断言须在 drop 前）
+        assert!(
+            wal_path.is_file() && std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "源侧 -wal 在 run_import 后、conn 存活时应仍在"
+        );
+        drop(conn);
+    }
+
+    // ===== correctness_v2（S5 导入保护）回归 =====
+
+    /// 目标库六张 wp 数据表 + meta 的内容快照（§4.5：坏来源导入前后必须逐项相等，
+    /// 保护断言覆盖全部数据表而非只看按键总数）。
+    #[derive(Debug, PartialEq)]
+    struct WpTargetSnapshot {
+        key_rows: i64,
+        key_sum: i64,
+        combo_rows: i64,
+        app_rows: i64,
+        mouse_rows: i64,
+        buttons_rows: i64,
+        scrolls_rows: i64,
+        meta_rows: i64,
+        meta_note: String,
+    }
+
+    fn wp_target_snapshot(path: &Path) -> WpTargetSnapshot {
+        let conn = Connection::open(path).unwrap();
+        let count = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        WpTargetSnapshot {
+            key_rows: count("wp_key_daily"),
+            key_sum: conn
+                .query_row("SELECT COALESCE(SUM(count),0) FROM wp_key_daily", [], |r| r.get(0))
+                .unwrap(),
+            combo_rows: count("wp_combo_daily"),
+            app_rows: count("wp_app_daily"),
+            mouse_rows: count("wp_mouse_daily"),
+            buttons_rows: count("wp_mouse_buttons_daily"),
+            scrolls_rows: count("wp_mouse_scroll_daily"),
+            meta_rows: count("wp_import_meta"),
+            meta_note: conn
+                .query_row("SELECT note FROM wp_import_meta WHERE id=1", [], |r| r.get(0))
+                .unwrap(),
+        }
+    }
+
+    /// 来源阶段失败且目标不存在：库文件与 -wal/-shm 旁路都不得被创建（§5.1-6）。
+    fn assert_target_absent(stats: &Path) {
+        assert!(!stats.exists(), "目标库不得被创建: {}", stats.display());
+        for suffix in ["-wal", "-shm"] {
+            let side = sidecar_path(stats, suffix);
+            assert!(!side.exists(), "目标旁路文件不得被创建: {}", side.display());
+        }
+    }
+
+    /// F1 反例 1（§1.1 事故）：不相关 SQLite 来源必须 ok=false，已有目标六张数据表
+    /// + meta 逐项不变（27→0 事故不再发生），且不存在目标不被创建。
+    #[test]
+    fn correctness_v2_irrelevant_source_fails_and_preserves_target() {
+        let good = TempFile::new("cv2-irrel-good", "db");
+        make_fixture(&good);
+        let stats = TempFile::new("cv2-irrel-stats", "db");
+        assert!(run_import(good.as_ref(), stats.as_ref()).ok, "前置合法导入须成功");
+        let before = wp_target_snapshot(stats.as_ref());
+        assert_eq!(before.key_sum, 27, "前置：目标已持有 fixture 的 27 个按键");
+
+        let bad = TempFile::new("cv2-irrel-bad", "db");
+        {
+            let conn = Connection::open(&bad).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE some_other_tool(data TEXT);
+                 INSERT INTO some_other_tool VALUES ('hello');",
+            )
+            .unwrap();
+        }
+        let report = run_import(bad.as_ref(), stats.as_ref());
+        assert!(!report.ok, "不相关来源必须失败: {:?}", report.warnings);
+        assert_eq!(
+            (report.keys, report.combos, report.apps, report.mouse_days),
+            (0, 0, 0, 0),
+            "失败报告数字必须全零"
+        );
+        assert!(
+            report.warnings[0].contains("WhatPulse"),
+            "失败原因须指明来源不含 WhatPulse 统计表: {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            wp_target_snapshot(stats.as_ref()),
+            before,
+            "失败导入不得触碰目标（六张数据表+meta 逐项不变）"
+        );
+
+        // 来源阶段失败且目标不存在 → 不建库
+        let fresh = TempFile::new("cv2-irrel-fresh", "db");
+        let report = run_import(bad.as_ref(), fresh.as_ref());
+        assert!(!report.ok);
+        assert_target_absent(fresh.as_ref());
+    }
+
+    /// F1 反例 2：损坏（非 SQLite）来源必须 ok=false，目标不变/不建。
+    #[test]
+    fn correctness_v2_corrupted_source_fails_and_preserves_target() {
+        let good = TempFile::new("cv2-corrupt-good", "db");
+        make_fixture(&good);
+        let stats = TempFile::new("cv2-corrupt-stats", "db");
+        assert!(run_import(good.as_ref(), stats.as_ref()).ok);
+        let before = wp_target_snapshot(stats.as_ref());
+
+        let bad = TempFile::new("cv2-corrupt-bad", "db");
+        std::fs::write(&bad, vec![0xFFu8; 4096]).unwrap();
+
+        let report = run_import(bad.as_ref(), stats.as_ref());
+        assert!(!report.ok, "损坏来源必须失败: {:?}", report.warnings);
+        assert_eq!(wp_target_snapshot(stats.as_ref()), before, "损坏来源不得触碰目标");
+
+        let fresh = TempFile::new("cv2-corrupt-fresh", "db");
+        assert!(!run_import(bad.as_ref(), fresh.as_ref()).ok);
+        assert_target_absent(fresh.as_ref());
+    }
+
+    /// F1 反例 3：同名统计表缺必需列 → 整次失败（不得跳过后覆写目标）；
+    /// 另一张完整统计表成功不构成豁免。
+    #[test]
+    fn correctness_v2_existing_stat_table_missing_column_fails() {
+        let good = TempFile::new("cv2-misscol-good", "db");
+        make_fixture(&good);
+        let stats = TempFile::new("cv2-misscol-stats", "db");
+        assert!(run_import(good.as_ref(), stats.as_ref()).ok);
+        let before = wp_target_snapshot(stats.as_ref());
+
+        let bad = TempFile::new("cv2-misscol-bad", "db");
+        {
+            let conn = Connection::open(&bad).unwrap();
+            // keypress_frequency 同名但缺 count 列；mouseclicks 列完整（不得因它覆写）
+            conn.execute_batch(
+                "CREATE TABLE keypress_frequency(profile_id INTEGER, day TEXT, hour INTEGER, key INTEGER);
+                 INSERT INTO keypress_frequency VALUES (1,'2026-05-01',0,65);
+                 CREATE TABLE mouseclicks(profile_id INTEGER, day TEXT, hour INTEGER, count INTEGER);
+                 INSERT INTO mouseclicks VALUES (1,'2026-05-01',0,9);",
+            )
+            .unwrap();
+        }
+        let report = run_import(bad.as_ref(), stats.as_ref());
+        assert!(!report.ok, "现存统计表缺列必须整次失败: {:?}", report.warnings);
+        assert_eq!(wp_target_snapshot(stats.as_ref()), before, "缺列来源不得触碰目标");
+
+        let fresh = TempFile::new("cv2-misscol-fresh", "db");
+        assert!(!run_import(bad.as_ref(), fresh.as_ref()).ok);
+        assert_target_absent(fresh.as_ref());
+    }
+
+    /// F1 反例 4：现存统计表列名齐全但行数据无法读取（day 存整数 → Rust 侧 String
+    /// 读取失败）→ 整次失败，不降级为空快照覆写目标。
+    #[test]
+    fn correctness_v2_existing_stat_table_read_error_fails() {
+        let good = TempFile::new("cv2-readerr-good", "db");
+        make_fixture(&good);
+        let stats = TempFile::new("cv2-readerr-stats", "db");
+        assert!(run_import(good.as_ref(), stats.as_ref()).ok);
+        let before = wp_target_snapshot(stats.as_ref());
+
+        let bad = TempFile::new("cv2-readerr-bad", "db");
+        {
+            let conn = Connection::open(&bad).unwrap();
+            // 列名与 §4.8 一致（preflight 列验证通过），但 day 存整数 → 聚合读取必然出错
+            conn.execute_batch(
+                "CREATE TABLE keypress_frequency(profile_id INTEGER, day INTEGER, hour INTEGER, key INTEGER, count INTEGER);
+                 INSERT INTO keypress_frequency VALUES (1,20260501,0,65,10);",
+            )
+            .unwrap();
+        }
+        let report = run_import(bad.as_ref(), stats.as_ref());
+        assert!(!report.ok, "现存统计表读取错误必须整次失败: {:?}", report.warnings);
+        assert_eq!(wp_target_snapshot(stats.as_ref()), before, "读取错误不得以空快照覆写目标");
+
+        let fresh = TempFile::new("cv2-readerr-fresh", "db");
+        assert!(!run_import(bad.as_ref(), fresh.as_ref()).ok);
+        assert_target_absent(fresh.as_ref());
+    }
+
+    /// §4.5：单独 applications 表不构成来源身份——只有展示元数据、无统计表 → 失败不建库。
+    #[test]
+    fn correctness_v2_applications_alone_is_not_source_identity() {
+        let bad = TempFile::new("cv2-apponly-src", "db");
+        {
+            let conn = Connection::open(&bad).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE applications(path TEXT, name TEXT);
+                 INSERT INTO applications VALUES ('c:/app/editor.exe','Editor');",
+            )
+            .unwrap();
+        }
+        let stats = TempFile::new("cv2-apponly-stats", "db");
+        let report = run_import(bad.as_ref(), stats.as_ref());
+        assert!(!report.ok, "仅 applications 不构成 WhatPulse 来源: {:?}", report.warnings);
+        assert_target_absent(stats.as_ref());
+    }
+
+    /// §4.5：合法已识别的空统计表 → 成功导入零行并整体替换（区别于不相关/损坏来源，
+    /// 不得以"行数为零"隐式判失败）。
+    #[test]
+    fn correctness_v2_legal_empty_source_succeeds_and_replaces() {
+        let good = TempFile::new("cv2-empty-good", "db");
+        make_fixture(&good);
+        let stats = TempFile::new("cv2-empty-stats", "db");
+        assert!(run_import(good.as_ref(), stats.as_ref()).ok);
+        assert_eq!(wp_target_snapshot(stats.as_ref()).key_sum, 27, "前置：目标已有数据");
+
+        let empty = TempFile::new("cv2-empty-src", "db");
+        {
+            let conn = Connection::open(&empty).unwrap();
+            create_wp_tables(&conn); // 九表齐全、零行
+        }
+        let report = run_import(empty.as_ref(), stats.as_ref());
+        assert!(report.ok, "合法空库必须成功: {:?}", report.warnings);
+        assert_eq!(
+            (report.keys, report.combos, report.apps, report.mouse_days),
+            (0, 0, 0, 0),
+            "空库报告数字为零"
+        );
+        assert_eq!(report.date_min, None, "空库无日期范围");
+        assert_eq!(report.date_max, None);
+        let snap = wp_target_snapshot(stats.as_ref());
+        assert_eq!(
+            (
+                snap.key_rows, snap.combo_rows, snap.app_rows, snap.mouse_rows,
+                snap.buttons_rows, snap.scrolls_rows
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "整体替换：旧数据必须被清空"
+        );
+        assert_eq!(snap.meta_rows, 1, "空库导入仍写 meta（整体替换语义）");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("未发现任何数据行")),
+            "空数据提示照常: {:?}",
+            report.warnings
+        );
+    }
+
+    /// §4.5：applications 是可选展示元数据——存在但缺 name 列只 warning + basename
+    /// 回退，不得等同统计损坏阻断导入。
+    #[test]
+    fn correctness_v2_broken_applications_metadata_warns_and_falls_back() {
+        let src = TempFile::new("cv2-appmeta-src", "db");
+        {
+            let conn = Connection::open(&src).unwrap();
+            create_wp_tables(&conn);
+            conn.execute_batch("DROP TABLE applications; CREATE TABLE applications(path TEXT);")
+                .unwrap();
+            conn.execute_batch(
+                "INSERT INTO keypress_frequency VALUES (1,'2026-05-01',0,65,10);
+                 INSERT INTO input_per_application VALUES (1,'2026-05-01',0,'c:/app/editor.exe',7,1);
+                 INSERT INTO application_active_hour VALUES (1,'2026-05-01',0,'c:/app/editor.exe',1000);",
+            )
+            .unwrap();
+        }
+        let stats = TempFile::new("cv2-appmeta-stats", "db");
+        let report = run_import(src.as_ref(), stats.as_ref());
+        assert!(report.ok, "applications 元数据错误不得阻断导入: {:?}", report.warnings);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("applications")),
+            "元数据失败须有警告: {:?}",
+            report.warnings
+        );
+        let conn = Connection::open(stats.as_ref()).unwrap();
+        let (name, keys): (String, i64) = conn
+            .query_row(
+                "SELECT name, keys FROM wp_app_daily LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "editor.exe", "应用名必须回退 basename");
+        assert_eq!(keys, 7, "统计数据本身照常导入");
     }
 }

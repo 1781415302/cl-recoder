@@ -1,12 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "CL Recoder 主窗口默认权限（S1 最小接线；S10/S12 按 commands 需要扩充）",
+  "description": "CL Recoder 主窗口默认权限（S1 最小接线；S10/S12 按 commands 需要扩充）。opener:default 故意保留：PLAN §5.5 预留「导出完成后打开所在文件夹」，前端暂未 import 该插件。autostart:default 已删：前端无 @tauri-apps/plugin-autostart 调用，GUI 自启走 Rust ManagerExt/tauri-plugin-autostart，不受 capability 约束。",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:default",
-    "opener:default",
-    "autostart:default"
+    "opener:default"
   ]
 }

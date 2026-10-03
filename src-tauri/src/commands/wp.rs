@@ -6,6 +6,9 @@
 //!   Top-N、count/秒 降序、limit 截断"——落地为：取**逐日明细行**（导入时已按 day+维度聚合），
 //!   按主指标降序排序后截断 limit。day 语义保全、Top-N 语义保全、JSON 导出复用同一行形状。
 //! - `WpMouseButtonRow/WpMouseScrollRow` 无 day 字段 → 用 reader 的按码聚合函数。
+//! - usability-runtime-v3 §4.6：`WpKeyRow` 带 `qtKey`、`WpAppRow` 带 `path`（均来自既有
+//!   reader 行，camelCase 输出）——`day:qtKey`/`day:path` 即来源主键身份（schema 上
+//!   wp_key_daily PK=(day,qt_key)、wp_app_daily PK=(day,path)），同名不同码/路径不冲突。
 
 use serde::Serialize;
 
@@ -76,13 +79,16 @@ impl From<WpOverviewData> for WpOverviewDto {
     }
 }
 
-/// WhatPulse 按键行 DTO（§4.7 `WpKeyRow`）。
+/// WhatPulse 按键行 DTO（§4.7 `WpKeyRow`；usability-runtime-v3 §4.6 增加 qtKey 稳定身份）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WpKeyRow {
     /// 日期
     pub day: String,
-    /// 显示名（导入时由 qt_key_label 固化）
+    /// Qt 键码（usability-runtime-v3 §4.6：与 day 组成稳定身份 `day:qtKey`，
+    /// 同名不同 Qt 码不冲突；来自既有 reader 行）
+    pub qt_key: i64,
+    /// 显示名（导入时由 qt_key_label 固化，不从码猜测）
     pub label: String,
     /// 当日次数
     pub count: u64,
@@ -102,12 +108,15 @@ pub struct WpComboRow {
     pub count: u64,
 }
 
-/// WhatPulse 应用行 DTO（§4.7 `WpAppRow`）。
+/// WhatPulse 应用行 DTO（§4.7 `WpAppRow`；usability-runtime-v3 §4.6 增加 path 稳定身份）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WpAppRow {
     /// 日期
     pub day: String,
+    /// 源 path 原样（usability-runtime-v3 §4.6：与 day 组成稳定身份 `day:path`，
+    /// 同名不同路径不冲突；来自既有 reader 行）
+    pub path: String,
     /// 应用显示名
     pub name: String,
     /// 前台秒数
@@ -179,7 +188,7 @@ pub(crate) fn query_wp_keys(
 ) -> store::Result<Vec<WpKeyRow>> {
     let mut rows: Vec<WpKeyRow> = reader::wp_key_daily_rows(conn, from, to)?
         .into_iter()
-        .map(|r| WpKeyRow { day: r.day, label: r.label, count: r.count })
+        .map(|r| WpKeyRow { day: r.day, qt_key: r.qt_key, label: r.label, count: r.count })
         .collect();
     rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
     rows.truncate(limit as usize);
@@ -211,7 +220,16 @@ pub(crate) fn query_wp_apps(
 ) -> store::Result<Vec<WpAppRow>> {
     let mut rows: Vec<WpAppRow> = reader::wp_app_daily_rows(conn, from, to)?
         .into_iter()
-        .map(|r| WpAppRow { day: r.day, name: r.name, seconds: r.seconds, keys: r.keys, clicks: r.clicks })
+        .map(|r| {
+            WpAppRow {
+                day: r.day,
+                path: r.path,
+                name: r.name,
+                seconds: r.seconds,
+                keys: r.keys,
+                clicks: r.clicks,
+            }
+        })
         .collect();
     rows.sort_by(|a, b| b.seconds.cmp(&a.seconds).then_with(|| a.name.cmp(&b.name)));
     rows.truncate(limit as usize);
@@ -442,18 +460,22 @@ mod tests {
         let js = serde_json::to_string(&ov).unwrap();
         assert!(js.contains(r#""keysTotal":90"#) && js.contains(r#""mouseClicksTotal":100"#), "{js}");
 
-        // keys Top-N：count 降序 + limit
+        // keys Top-N：count 降序 + limit（qt_key 身份随行携带，§4.6）
         let keys = query_wp_keys(&conn, f0, t0, 2).unwrap();
-        assert_eq!(keys.iter().map(|r| (r.label.as_str(), r.count)).collect::<Vec<_>>(), vec![("B", 50), ("A", 30)]);
+        assert_eq!(
+            keys.iter().map(|r| (r.label.as_str(), r.qt_key, r.count)).collect::<Vec<_>>(),
+            vec![("B", 0x42, 50), ("A", 0x41, 30)]
+        );
 
         // combos Top-N
         let combos = query_wp_combos(&conn, f0, t0, 1).unwrap();
         assert_eq!(combos[0].label, "Ctrl+C");
         assert_eq!(combos[0].count, 9);
 
-        // apps Top-N：秒降序
+        // apps Top-N：秒降序（path 身份随行携带，§4.6）
         let apps = query_wp_apps(&conn, f0, t0, 1).unwrap();
         assert_eq!(apps[0].name, "Browser");
+        assert_eq!(apps[0].path, "c:/web/browser.exe");
         assert_eq!(apps[0].seconds, 2000);
 
         // mouse：英寸 → 米（×0.0254）
@@ -467,6 +489,86 @@ mod tests {
         assert_eq!(buttons[0].total, 70);
         let scrolls = query_wp_mouse_scrolls(&conn, f0, t0, 5).unwrap();
         assert_eq!(scrolls[0].label, "向上");
+    }
+
+    /// §4.6（usability-runtime-v3）：WpKeyRow 携带 qt_key、WpAppRow 携带 path
+    /// （均来自既有 reader 行，camelCase 输出，不从 label/name 猜测）；
+    /// 同名不同 Qt 码 / 不同 path 不冲突——`day:qtKey`/`day:path` 唯一定位一行。
+    #[test]
+    fn usability_v3_wp_rows_carry_stable_identity() {
+        let f = TempFile::new("wp-identity", "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        w.rebuild_wp_tables(&WpImportBatch {
+            meta: WpMetaRow {
+                imported_at: "2026-09-28T12:00:00+08:00".into(),
+                source_path: r"C:\wp\whatpulse.db".into(),
+                source_size: Some(1024),
+                date_min: Some("2026-09-28".into()),
+                date_max: Some("2026-09-28".into()),
+                note: String::new(),
+            },
+            // 同日同名 "A" 但 Qt 码不同：0x41（字母）与 0x01000020（Qt_Shift）
+            keys: vec![
+                WpKeyDailyRow {
+                    day: "2026-09-28".into(),
+                    qt_key: 0x41,
+                    label: "A".into(),
+                    count: 30,
+                },
+                WpKeyDailyRow {
+                    day: "2026-09-28".into(),
+                    qt_key: 0x01000020,
+                    label: "A".into(),
+                    count: 5,
+                },
+            ],
+            // 同日同名 "Editor" 但 path 不同
+            apps: vec![
+                WpAppDailyRow {
+                    day: "2026-09-28".into(),
+                    path: "c:/a/editor.exe".into(),
+                    name: "Editor".into(),
+                    seconds: 100,
+                    keys: 4,
+                    clicks: 1,
+                },
+                WpAppDailyRow {
+                    day: "2026-09-28".into(),
+                    path: "c:/b/editor.exe".into(),
+                    name: "Editor".into(),
+                    seconds: 60,
+                    keys: 2,
+                    clicks: 1,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        drop(w);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+
+        let keys = query_wp_keys(&conn, "2026-09-01", "2026-09-30", 10).unwrap();
+        assert_eq!(keys.len(), 2, "同名不同 Qt 码必须各自成行");
+        assert_eq!(
+            keys.iter().map(|r| (r.day.as_str(), r.qt_key, r.label.as_str(), r.count)).collect::<Vec<_>>(),
+            vec![("2026-09-28", 0x41, "A", 30), ("2026-09-28", 0x01000020, "A", 5)]
+        );
+        let apps = query_wp_apps(&conn, "2026-09-01", "2026-09-30", 10).unwrap();
+        assert_eq!(apps.len(), 2, "同名不同 path 必须各自成行");
+        assert_eq!(
+            apps.iter().map(|r| (r.day.as_str(), r.path.as_str(), r.name.as_str())).collect::<Vec<_>>(),
+            vec![("2026-09-28", "c:/a/editor.exe", "Editor"), ("2026-09-28", "c:/b/editor.exe", "Editor")]
+        );
+
+        // camelCase 线形状：qtKey 在场且为码值、qt_key 缺席；path 在场
+        let js = serde_json::to_string(&keys[0]).unwrap();
+        assert!(js.contains(r#""qtKey":65"#) && !js.contains("qt_key"), "{js}");
+        let japp = serde_json::to_string(&apps[0]).unwrap();
+        assert!(japp.contains(r#""path":"c:/a/editor.exe""#), "{japp}");
     }
 
     /// 未导入：meta=None、全部查询为空（引导态）。

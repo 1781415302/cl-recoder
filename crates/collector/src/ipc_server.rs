@@ -9,21 +9,27 @@
 //! - 命令：`status` / `set_paused` / `shutdown`，置位 [`Flags`]；响应形状
 //!   `{"ok":true,"data":{...}}` / `{"ok":true,"data":null}` / `{"ok":false,"error":"..."}`，
 //!   逐字对齐 §4.4 线格式示例（未知命令恒回 `"unknown command"`）。
-//! - 线程模型：单接受线程串行处理；`shutdown` 命令置位后服务线程在处理完当前连接后退出
-//!   （main 线程 join 后退出进程，PLAN §5.1）。线程内禁止 panic（PLAN §9.4）。
+//! - 线程模型：accept 线程循环「建监听实例 → 等连接 → 移交工作线程」；每连接一个 worker
+//!   执行 [`serve_client`]（阻塞读写语义与 PLAN §4.4 不变）。`shutdown` 置位后 worker 经
+//!   [`wake_accept`] 自连唤醒 accept（[`prod_pipe`] 的 `CreateFileW` 任何结果不区分处理），
+//!   accept 二次查 flag 后关闭实例退出；main 在 `ipc.join()` 前再以 `prod_pipe` 兜底。
+//!   线程内禁止 panic（PLAN §9.4）。
+//! - 已知取舍（worker 线程堆积）：worker 无读超时、detach 语义、随进程退出回收；
+//!   同用户 SID 的 DACL 即威胁边界——同用户恶意进程理论上可堆积 N 个阻塞线程，
+//!   比「整条管道被单个卡死连接占死」的现状已是严格改善。
 //!
 //! S8 集成单测（进程内）：起 server → 客户端三条请求往返逐字对齐 §4.4 示例。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clrecoder_core::day::now_local_rfc3339;
 use clrecoder_core::ipc::{CtlRequest, CtlResponse, StatusData, MAX_REQUEST_BYTES, PIPE_NAME};
 use windows::core::{Error as WError, HSTRING, HRESULT, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, E_FAIL, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_UNICODE_TRANSLATION, ERROR_PIPE_CONNECTED,
-    HANDLE, HLOCAL, LocalFree,
+    GENERIC_READ, HANDLE, HLOCAL, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -32,7 +38,8 @@ use windows::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    FlushFileBuffers, OPEN_EXISTING, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -118,7 +125,7 @@ impl RuntimeStatus {
 }
 
 /// 启动 pipe 服务线程：先创建显式 DACL 的安全描述符（进程生命周期内一次），
-/// 然后循环「创建监听实例 → 等待客户端 → 处理一请求一响应 → 断开」，
+/// 然后循环「创建监听实例 → 等待客户端 → 移交工作线程 serve_client → 唤醒 accept 退出」，
 /// 直至 [`Flags::shutdown`] 置位。返回服务线程句柄，main（S9）join 后退出进程。
 ///
 /// 安全描述符创建失败（SDDL 转换异常等）时线程立即退出——属于启动期致命错误，
@@ -129,6 +136,27 @@ pub fn spawn(flags: Arc<Flags>, status: Arc<RuntimeStatus>) -> std::thread::Join
         .name("ipc_server".into())
         .spawn(move || run_server(&flags, &status))
         .expect("ipc_server 线程创建失败")
+}
+
+/// windows 0.62 的 HANDLE 是 *mut c_void 包装、非 Send——句柄移交工作线程必须经此 newtype。
+///
+/// SAFETY：内核句柄进程内全局有效；Send 仅表达所有权移交（单 worker，无需 Sync）。
+struct SendHandle(HANDLE);
+
+// SAFETY: 见类型文档——句柄仅在进程内有效，移交 worker 单线程持有直到 serve_client 关闭。
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    /// 消费并取出内部句柄；仅应在持有它的 worker 线程内调用。
+    fn into_handle(self) -> HANDLE {
+        self.0
+    }
+}
+
+/// 在 worker 线程内处理移交的管道连接（整参接收 `SendHandle`，避免精确捕获拆出非 Send 字段）。
+fn serve_moved_client(pipe: SendHandle, flags: &Flags, status: &RuntimeStatus) {
+    // SAFETY: pipe.0 为 accept 线程移交的有效已连入句柄；serve_client 结束时负责断开并关闭。
+    unsafe { serve_client(pipe.into_handle(), flags, status) };
 }
 
 /// 持有管道实例的安全属性；析构时归还 [`ConvertStringSecurityDescriptorToSecurityDescriptorW`]
@@ -147,13 +175,22 @@ impl Drop for OwnedSecurityAttributes {
     }
 }
 
-/// 服务线程主体：见 [`spawn`]。
-fn run_server(flags: &Flags, status: &RuntimeStatus) {
+/// 服务线程主体（accept 线程）：见 [`spawn`]。
+///
+/// 每个成功连入的客户端经 [`SendHandle`] 移交独立 worker（`drop` JoinHandle 显式 detach）。
+/// 所有退出路径（含安全描述符创建失败早退）都会置位 `accept_done`，供 worker 唤醒器收敛。
+fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
+    // accept 线程退出标志：worker 唤醒器与所有退出路径置位
+    let accept_done = Arc::new(AtomicBool::new(false));
     // SAFETY: 仅调用 Win32 API；返回的 SECURITY_ATTRIBUTES 内的 SD 指针由 guard 在线程退出时释放。
     let owned_sa = match unsafe { build_security_attributes() } {
         Ok(sa) => OwnedSecurityAttributes { sa },
         Err(err) => {
             debug_log!("创建安全描述符（显式 DACL）失败，pipe 服务未启动: {err}");
+            // S1（§4.1）：生产 IPC 启动期致命故障 → facade error（经 adapter 进 collector.log，
+            // 按 target 限频）；debug_log! 的 stderr 习惯保留
+            log::error!("创建安全描述符（显式 DACL）失败，pipe 服务未启动: {err}");
+            accept_done.store(true, Ordering::Release);
             return;
         }
     };
@@ -166,7 +203,7 @@ fn run_server(flags: &Flags, status: &RuntimeStatus) {
             break;
         }
         // SAFETY: sa 的 SD 在 guard 释放前始终有效；name 为本函数内存活的 HSTRING；
-        // 成功创建的句柄由 serve_client 关闭，失败路径立即 CloseHandle。
+        // 成功创建的句柄由 worker 关闭，失败路径立即 CloseHandle。
         let handle = unsafe {
             let open_mode = if first_instance {
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
@@ -186,7 +223,11 @@ fn run_server(flags: &Flags, status: &RuntimeStatus) {
             )
         };
         if handle.is_invalid() {
+            // 紧跟失败调用取错误码（中间不得插入可能改写 LastError 的操作）
+            let os_err = std::io::Error::last_os_error();
             debug_log!("CreateNamedPipeW 失败，1s 后重试");
+            // S1（§4.1）：生产 IPC 故障 → facade warn（同 target 共享 60s 限频桶，重试不刷盘）
+            log::warn!("CreateNamedPipeW 失败，1s 后重试: {os_err}");
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
@@ -199,6 +240,8 @@ fn run_server(flags: &Flags, status: &RuntimeStatus) {
             Err(err) if err.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => {}
             Err(err) => {
                 debug_log!("ConnectNamedPipe 失败: {err}");
+                // S1（§4.1）：生产 IPC 故障 → facade warn（按 target 限频 60s/桶）
+                log::warn!("ConnectNamedPipe 失败: {err}");
                 // SAFETY: handle 有效；释放后回到循环顶部重建监听实例。
                 unsafe {
                     let _ = CloseHandle(handle);
@@ -206,8 +249,72 @@ fn run_server(flags: &Flags, status: &RuntimeStatus) {
                 continue;
             }
         }
-        // SAFETY: handle 已连入客户端；serve_client 负责断开并关闭句柄。
-        unsafe { serve_client(handle, flags, status) };
+        // Ok 与 ERROR_PIPE_CONNECTED 两条路径统一在此再查一次 shutdown：
+        // 置位 → 关闭实例并退出，保证 join 返回时管道名已消失；未置位 → 移交 worker。
+        if flags.shutdown.load(Ordering::Acquire) {
+            // SAFETY: handle 有效；关闭服务端实例后 break。
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            break;
+        }
+        let worker_flags = Arc::clone(flags);
+        let worker_status = Arc::clone(status);
+        let worker_accept_done = Arc::clone(&accept_done);
+        // SAFETY: handle 有效且已连入客户端；SendHandle 仅表达所有权移交（单 worker）。
+        let pipe = SendHandle(handle);
+        drop(std::thread::spawn(move || {
+            // 整参移交，闭包只捕获 SendHandle（Send），不拆出非 Send 的 HANDLE 字段
+            serve_moved_client(pipe, &worker_flags, &worker_status);
+            // worker 返回后：shutdown 置位则唤醒可能仍阻塞在 ConnectNamedPipe 的 accept
+            if worker_flags.shutdown.load(Ordering::Acquire) {
+                wake_accept(&worker_accept_done);
+            }
+        }));
+    }
+    // 所有退出路径（含 build_security_attributes 失败早退）在此置位
+    accept_done.store(true, Ordering::Release);
+}
+
+/// 单次自连探测：尝试以客户端身份打开管道，成功即关闭。
+/// 供唤醒循环与 main 的 join 兜底共用。
+pub(crate) fn prod_pipe() {
+    let name = HSTRING::from(PIPE_NAME);
+    // 参数对齐测试 open_client：GENERIC_READ（单边打开 duplex 管道合法）、share=0、
+    // OPEN_EXISTING、FILE_FLAGS_AND_ATTRIBUTES(0)、sa=None。
+    // SAFETY: name 为本函数内存活的 HSTRING；sa=None 仅用于唤醒 accept，不改变 DACL 语义。
+    if let Ok(h) = unsafe {
+        CreateFileW(
+            &name,
+            GENERIC_READ.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    } {
+        // SAFETY: h 刚由 CreateFileW 成功打开，立即关闭。
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+    }
+    // 任何错误码不区分处理：失败不重判，由调用方按统一节奏重试
+}
+
+/// 唤醒可能阻塞在 `ConnectNamedPipe` 的 accept 线程：循环 [`prod_pipe`]，
+/// 退出条件只有 `accept_done` 置位或累计约 5s。
+///
+/// `CreateFileW` 任何结果（成功、`ERROR_PIPE_BUSY`、`ERROR_FILE_NOT_FOUND` 或其它）
+/// 都不区分处理：成功立即 CloseHandle，失败不重判，统一睡 ~20ms 再试。
+/// 理由：accept 只可能死在 `ConnectNamedPipe`（此时实例必存在，prod 必成功）或
+/// 1s 建实例失败 sleep（循环顶自查退出）；`CreateNamedPipeW` syscall 期间存在
+/// 「零实例」微秒窗口，`FILE_NOT_FOUND` 早退会让 accept 在新实例上永久阻塞 → join 挂死。
+fn wake_accept(accept_done: &AtomicBool) {
+    let started = Instant::now();
+    while !accept_done.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(5) {
+        prod_pipe();
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -642,7 +749,52 @@ mod tests {
         server.join().expect("服务线程应随 shutdown 正常退出");
     }
 
-    /// 当前进程令牌的用户 SID 原始字节（自相对 SID 结构拷贝）。
+    /// 卡死连接不阻塞新连接：stalled 客户端连入后不发数据，后续 transact 照常成功。
+#[test]
+fn stalled_client_does_not_block_new_connections() {
+    let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let flags = Arc::new(Flags::default());
+    let status = Arc::new(test_status());
+    let server = spawn(flags.clone(), status.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    // 卡死客户端：连入后不发任何数据（worker 阻塞在 ReadFile）
+    let stalled = unsafe { open_client(deadline) };
+
+    // 后续连接不受影响：status / shutdown 照常往返
+    let response =
+        unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("stall 下 status 往返");
+    assert!(
+        response.contains(r#""ok":true"#),
+        "stalled 连接不得阻塞新连接: {response}"
+    );
+
+    let response =
+        unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("stall 下 shutdown 往返");
+    assert_eq!(response, r#"{"ok":true,"data":null}"#);
+
+    // 断言完成后关闭 stalled 句柄——泄漏的服务端实例会撑住管道名，后续测试
+    // 首个 FILE_FLAG_FIRST_PIPE_INSTANCE 实例创建会永久 ERROR_ACCESS_DENIED → 连锁超时
+    // SAFETY: stalled 为本测试打开的客户端句柄。
+    unsafe {
+        let _ = CloseHandle(stalled);
+    }
+
+    // 收尾 join 用有界等待（is_finished + deadline），让回归失败表现为 fail 而非 CI 挂起
+    let join_deadline = Instant::now() + Duration::from_secs(10);
+    while !server.is_finished() {
+        assert!(
+            Instant::now() < join_deadline,
+            "服务线程应在 shutdown 后退出"
+        );
+        // 生产侧同款兜底：自连唤醒 accept
+        prod_pipe();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.join().expect("服务线程应随 shutdown 正常退出");
+}
+
+/// 当前进程令牌的用户 SID 原始字节（自相对 SID 结构拷贝）。
     unsafe fn current_user_sid_bytes() -> Vec<u8> {
         let mut token = HANDLE::default();
         // SAFETY: token 由系统写出，函数结束前关闭。
