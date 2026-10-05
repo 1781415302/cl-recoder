@@ -359,3 +359,125 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+/* ========== 运动展示组件（motion-dpi §4.6 S7） ========== */
+/* 概览指标条 / 热力圆盘 / 控件图 / DPI 编辑 / 来源选择。
+   数据刷新无动画、不发光；仅交互 hover/focus 保留短 transition（reduced-motion 由上方全局块接管）；
+   颜色一律取令牌；正文 ≥14px、次级 ≥12px、数字 tabular。 */
+
+/* —— 概览指标条（MotionSummary） —— */
+.motion-summary { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-5); margin: 0; }
+.motion-summary-item { min-width: 140px; }
+.motion-summary-label { font-size: var(--text-caption); color: var(--color-text-muted); }
+.motion-summary-value {
+  margin: var(--space-1) 0 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-body-lg);
+  font-weight: 600;
+}
+.motion-summary-hint { margin: var(--space-1) 0 0; font-size: var(--text-caption); color: var(--color-text-muted); }
+
+/* —— 摇杆热力圆盘（StickHeatmap） —— */
+.heat-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin-top: var(--space-2);
+  font-size: var(--text-caption);
+  color: var(--color-text-muted);
+}
+.heat-meta .num { color: var(--color-text); }
+.heat-disc-wrap { position: relative; max-width: 336px; margin: var(--space-3) auto 0; padding: 18px 24px; }
+.heat-disc { display: block; width: 100%; height: auto; cursor: pointer; touch-action: manipulation; }
+.heat-dir {
+  position: absolute;
+  font-size: var(--text-caption);
+  color: var(--color-text-muted);
+  line-height: 1;
+  pointer-events: none;
+}
+.heat-dir-n { top: 0; left: 50%; transform: translateX(-50%); }
+.heat-dir-s { bottom: 0; left: 50%; transform: translateX(-50%); }
+.heat-dir-w { left: 0; top: 50%; transform: translateY(-50%); }
+.heat-dir-e { right: 0; top: 50%; transform: translateY(-50%); }
+.heat-slider {
+  display: block;
+  width: 100%;
+  max-width: 336px;
+  margin: var(--space-2) auto 0;
+  accent-color: var(--color-primary);
+}
+
+/* —— 控件图（PeripheralControlsStats：鼠标/手柄） —— */
+.mc-stage { overflow-x: auto; padding-bottom: var(--space-1); } /* 窄容器横向滚动，不缩放（点击区域不缩水） */
+.mc-stage-inner { position: relative; margin: 0 auto; }
+.mc-svg { display: block; }
+.mc-body { fill: var(--color-bg); stroke: var(--color-divider); stroke-width: 1.5; }
+.mc-line { stroke: var(--color-divider); stroke-width: 1; }
+.mc-detail { fill: var(--color-muted); stroke: var(--color-divider); }
+.mc-shape { fill: var(--color-card); stroke: var(--color-divider); }
+.mc-label { fill: var(--color-text); font-family: var(--font-sans); text-anchor: middle; pointer-events: none; }
+.mc-hit {
+  position: absolute;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0 0 3px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.mc-hit:hover { box-shadow: inset 0 0 0 1px var(--color-primary); }
+.mc-hit[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--color-primary); }
+.mc-hit-round { border-radius: 50%; }
+.mc-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-caption);
+  color: var(--color-text);
+  line-height: 1.1;
+  pointer-events: none;
+}
+
+/* —— DPI 编辑侧栏（MouseDpiEditor） —— */
+.dpi-current { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.dpi-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+.dpi-readonly {
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-muted);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-body);
+}
+.dpi-editor { display: flex; flex-direction: column; gap: var(--space-2); }
+.dpi-editor .input { width: 100%; }
+.dpi-error { margin: 0; font-size: var(--text-caption); color: var(--color-danger); }
+.dpi-actions { display: flex; gap: var(--space-2); }
+
+/* —— 来源选择（MouseSourcePicker） —— */
+.picker-list { display: flex; flex-direction: column; gap: var(--space-2); }
+.picker-group-title { font-size: var(--text-caption); color: var(--color-text-muted); margin: var(--space-1) 0; }
+.picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 44px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-sm);
+  background: var(--color-card);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  text-align: left;
+  cursor: pointer;
+  transition: var(--transition);
+}
+.picker-option:hover { background: var(--color-muted); }
+.picker-option[aria-pressed="true"] { border-color: var(--color-primary); background: var(--color-muted); font-weight: 600; }
+.picker-option-label { overflow-wrap: anywhere; }
+.picker-option-chips { display: flex; flex-wrap: wrap; gap: var(--space-1); justify-content: flex-end; flex-shrink: 0; }

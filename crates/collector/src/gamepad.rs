@@ -1,6 +1,10 @@
-//! 手柄采集线程（PLAN §4.6 gamepad.rs 契约，gilrs xinput 后端）。
+//! 手柄采集线程（PLAN §4.6 gamepad.rs 契约，gilrs xinput 后端 + motion-dpi §4.3 运动帧）。
 //!
-//! - `spawn(tx)`：独立线程轮询 [`Gilrs::next_event`]（**非阻塞**）+ `sleep(8ms)`（≈125Hz）。
+//! - `spawn(tx, motion)`：独立线程轮询 [`Gilrs::next_event`]（**非阻塞**）+ `sleep(8ms)`
+//!   （≈125Hz）——**维持原按钮/扳机循环与节拍不变**；同一循环内每 ≥20ms 经
+//!   [`XInputMotionSampler`] 直接 `XInputGetState` 采样完整四轴（与 gilrs 已 deadzone
+//!   过滤的轴缓存隔离，见 [`crate::xinput_motion`]），运动帧与按钮事件经同一 `tx` 送
+//!   aggregator（按钮走 `AggEvent::Input`，摇杆走 `AggEvent::GamepadMotion`）。
 //! - `ButtonPressed` → [`RawEvent::GamepadPress`]（只投递按下边沿）；
 //!   **LeftTrigger2/RightTrigger2（物理 LT/RT 模拟扳机）例外**——它们由 [`EventType::ButtonChanged`] 的模拟量
 //!   以上穿 0.33 计 1 次、下穿复位（见 [`TriggerGate`]）。gilrs 0.11 的轴→按键合成逻辑
@@ -12,22 +16,31 @@
 //!   故 vid/pid 固定为 0；`name` 取 `gamepad.name()`，非空否则兜底 `"未知手柄"`。
 //!   xinput 后端 name 恒定（实测源码常量 `"Xbox Controller"`），因此所有 XInput 手柄
 //!   仍按 `UNIQUE(kind, vid, pid, name)` 合并为一行——对 R3 的已声明降级（PLAN §9.3）。
+//!   motion-dpi 的摇杆帧固定复用同一型号行（[`device_key`]，§4.3"与既有型号行一致"）。
 //! - DeviceKey 与触发器迟滞状态**按连接（GamepadId）缓存**：`Connected` 时建立，
 //!   `Disconnected` 时移除；启动时已插着的 pads 不补发 `Connected` 事件
 //!   （gilrs `finish_gamepads_creation` 静默注册），故任何事件遇到未知 id 时懒建兜底。
+//! - 生命周期（motion-dpi §4.3.1）：轮询循环与 gilrs init 重试均检查
+//!   `producer_stop`（经 [`MotionRuntime::stop_requested`]）——main 的退出屏障据此对
+//!   本线程**确定性 join**（≤~10ms 退出，panic 时 join 返回 Err 不阻塞收尾）；
+//!   轮询上下文 panic 重建时 sampler 一并重建，摇杆连接代际自然换代际。
 //!
 //! 本模块不做键名翻译、不知道 WhatPulse 存在（PLAN §2.5）；失败一律降级继续，绝不 panic。
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use gilrs::{Button as GilrsButton, Event, EventType, GamepadId, Gilrs};
 
 use clrecoder_core::codes::{DeviceKind, GamepadButton};
 use clrecoder_core::event::{AggEvent, DeviceKey, RawEvent};
+
+use crate::motion_runtime::MotionRuntime;
+use crate::xinput_motion::{XInputMotionSampler, XINPUT_SAMPLE_INTERVAL};
 
 /// 触发器（LeftTrigger2/RightTrigger2）模拟量计数阈值：事件值上穿它计 1 次（PLAN §4.6/§5.3）。
 const TRIGGER_THRESHOLD: f32 = 0.33;
@@ -41,24 +54,28 @@ const INIT_RETRY: Duration = Duration::from_millis(5000);
 /// panic 兜底重启前的等待（避免持续 panic 时热循环烧 CPU，PLAN §9.4）。
 const RESTART_DELAY: Duration = Duration::from_secs(1);
 
-/// 启动手柄采集线程。事件以 [`AggEvent::Input`] 投入 `tx`；接收端（aggregator）关闭后线程自行退出。
-pub fn spawn(tx: Sender<AggEvent>) -> JoinHandle<()> {
+/// 启动手柄采集线程（PLAN §4.6 + motion-dpi §4.3）：gilrs 按钮轮询与直接 XInput 摇杆
+/// 采样同线程驱动。事件以 [`AggEvent::Input`] / [`AggEvent::GamepadMotion`] 投入 `tx`；
+/// 接收端（aggregator）关闭后线程自行退出；`producer_stop`（§4.3.1）后确定性退出
+/// ——main 退出屏障 join 本线程即覆盖按钮与摇杆两个生产路径。
+pub fn spawn(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) -> JoinHandle<()> {
     thread::Builder::new()
         .name("gamepad".to_string())
-        .spawn(move || run(tx))
+        .spawn(move || run(tx, motion))
         .expect("创建 gamepad 采集线程失败")
 }
 
-/// 活跃根：S9 组装把 `spawn` 接入 main.rs 之前，以此引用维持整模块不被 dead_code 判死；
-/// 接线后本常量冗余但无害。
-const _: fn(Sender<AggEvent>) -> JoinHandle<()> = spawn;
-
 /// 线程主体：轮询循环 panic 时记录并重建 gilrs 上下文继续（PLAN §9.4 catch_unwind 兜底）；
-/// 通道关闭（aggregator 已停止）则正常退出。
-fn run(tx: Sender<AggEvent>) {
+/// 通道关闭（aggregator 已停止）或 `producer_stop` 则正常退出。
+fn run(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) {
     loop {
-        // Gilrs 持有平台句柄（非 UnwindSafe），跨 catch_unwind 传递需断言；重建即全新状态，安全。
-        match catch_unwind(AssertUnwindSafe(|| poll_loop(tx.clone()))) {
+        // §4.3.1：停机请求后不再重建上下文
+        if motion.stop_requested() {
+            return;
+        }
+        // Gilrs 持有平台句柄（非 UnwindSafe），跨 catch_unwind 传递需断言；重建即全新
+        // 状态（含摇杆 sampler——连接代际换代际），安全。
+        match catch_unwind(AssertUnwindSafe(|| poll_loop(tx.clone(), &motion))) {
             Ok(()) => return,
             Err(_) => {
                 log::error!("gamepad 轮询线程 panic，{}ms 后重建上下文继续", RESTART_DELAY.as_millis());
@@ -68,10 +85,13 @@ fn run(tx: Sender<AggEvent>) {
     }
 }
 
-/// 轮询循环：drain 所有待处理事件 → sleep 8ms → 重复。
-/// 返回即表示通道关闭（接收端消失），线程应退出；其余错误一律降级继续。
-fn poll_loop(tx: Sender<AggEvent>) {
-    let mut gilrs = init_gilrs();
+/// 轮询循环：drain 所有待处理事件 → 每 ≥[`XINPUT_SAMPLE_INTERVAL`] 直接 XInput 采样
+/// 完整四轴 → sleep 8ms → 重复。
+/// 返回即线程退出（通道关闭 / aggregator 已停止 / `producer_stop`，§4.3.1）；
+/// 其余错误一律降级继续。
+fn poll_loop(tx: Sender<AggEvent>, motion: &Arc<MotionRuntime>) {
+    // §4.3.1：init 重试检查 producer_stop——停机请求后不再重建，直接退出。
+    let Some(mut gilrs) = init_gilrs(motion) else { return };
     // 启动时枚举一次已连接手柄（gilrs 对启动即插入的 pads 不补发 Connected）。
     {
         let mut n = 0;
@@ -89,6 +109,11 @@ fn poll_loop(tx: Sender<AggEvent>) {
     let mut gates: HashMap<GamepadId, [TriggerGate; 2]> = HashMap::new();
     // 数字键按下状态（ButtonPressed/ButtonChanged 去重）。
     let mut digital: HashMap<(GamepadId, GilrsButton), bool> = HashMap::new();
+    // motion-dpi §4.3：直接 XInput 摇杆采样器（与 gilrs 按钮事件隔离；随本函数重建
+    // ——panic 重建即换代际）。None=尚未采样：首轮立即采样，接入时已偏转的摇杆按
+    // 首帧规则建锚点。
+    let mut sampler = XInputMotionSampler::new();
+    let mut last_sample: Option<Instant> = None;
 
     loop {
         while let Some(event) = gilrs.next_event() {
@@ -96,18 +121,46 @@ fn poll_loop(tx: Sender<AggEvent>) {
                 return; // 通道关闭：aggregator 已停止，线程正常收尾
             }
         }
+        // motion-dpi §4.3：每 ≥20ms 直接采样一次完整四轴（无变化也采样；不读取 gilrs
+        // 已过滤的轴缓存）。stamp/control 由 MotionRuntime 同一采样时刻成对取得。
+        let sample_due = last_sample.is_none_or(|t| t.elapsed() >= XINPUT_SAMPLE_INTERVAL);
+        if sample_due {
+            last_sample = Some(Instant::now());
+            let stamp = motion.stamp();
+            let control = motion.control();
+            for ev in sampler.sample(stamp, control, motion) {
+                if tx.send(ev).is_err() {
+                    return; // 通道关闭：aggregator 已停止
+                }
+            }
+        }
         thread::sleep(POLL_INTERVAL);
+        // §4.3.1：生产者停机请求——确定性退出（main 退出屏障 join 收敛，不再依赖宽限期）
+        if motion.stop_requested() {
+            return;
+        }
     }
 }
 
-/// 创建 gilrs 上下文；失败记录日志并周期重试（手柄缺失不是错误，xinput 初始化失败才走此处）。
-fn init_gilrs() -> Gilrs {
+/// 创建 gilrs 上下文；失败记录日志并周期重试（手柄缺失不是错误，xinput 初始化失败才走
+/// 此处）。§4.3.1：重试等待切成 100ms 小片并检查 `producer_stop`——停机请求后不再
+/// 重建，返回 `None`（调用方直接退出线程）。
+fn init_gilrs(motion: &MotionRuntime) -> Option<Gilrs> {
     loop {
+        if motion.stop_requested() {
+            return None;
+        }
         match Gilrs::new() {
-            Ok(gilrs) => return gilrs,
+            Ok(gilrs) => return Some(gilrs),
             Err(e) => {
                 log::error!("gilrs 初始化失败，{}ms 后重试: {e}", INIT_RETRY.as_millis());
-                thread::sleep(INIT_RETRY);
+                let slices = u32::try_from(INIT_RETRY.as_millis() / 100).unwrap_or(50);
+                for _ in 0..slices {
+                    if motion.stop_requested() {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
@@ -211,7 +264,9 @@ fn cached_device(
 
 /// 由 gilrs 的连接名构造 DeviceKey：`name` 非空（含全空白视为空）否则兜底 `"未知手柄"`；
 /// gilrs xinput 后端无 VID/PID，恒为 0（见模块文档）。
-fn device_key(name: &str) -> DeviceKey {
+/// （`pub(crate)`：motion-dpi 摇杆帧复用同一构造——`crate::xinput_motion` 固定传
+/// `"Xbox Controller"`，与既有型号行一致，§4.3。）
+pub(crate) fn device_key(name: &str) -> DeviceKey {
     DeviceKey {
         kind: DeviceKind::Gamepad,
         vid: 0,

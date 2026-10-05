@@ -1,5 +1,6 @@
-// 键盘 / 鼠标 / 手柄三个页面的共享实现（usability-runtime-v3 §4.5/§4.6/§4.8）。
-// 数据全部来自 §4.7 命令（get_devices / get_top_keys / get_key_daily / get_mouse_distance），
+// 键盘页共享实现（motion-dpi S8 收窄：鼠标/手柄旧支路与旧 80 换算展示已移入
+// pages/Mouse.tsx、pages/Gamepad.tsx 的新版页面；本组件仅服务键盘页，键盘合同逐字保留）。
+// 数据全部来自 §4.7 命令（get_devices / get_top_keys / get_key_daily），
 // 页面不做聚合（PLAN §2.5）。
 // §4.5：默认今日（useStatisticsRange）；统计 interval 仅范围含当前 today 时启用；
 // keyDaily 仅"逐日明细"展开且 active 时查询；跨设备/范围不用 keepPreviousData（先显示加载态）。
@@ -9,7 +10,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as client from "../api/client";
-import type { DeviceRow } from "../api/types";
 import { useDevices } from "../api/queries";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "./DataTable";
@@ -24,31 +24,22 @@ import { useStatisticsRange } from "../lib/useStatisticsRange";
 import { IconPlug } from "./icons";
 
 interface DeviceStatsPageProps {
-  kind: DeviceRow["kind"];
+  /** 键盘页专用（鼠标/手柄已改用各自 motion 页面，见 pages/Mouse.tsx、pages/Gamepad.tsx） */
+  kind: "keyboard";
   title: string;
   description: string;
   /** 图表主色（token 名；保留页面入参兼容——布局/排行填充为中性，本组件不再使用） */
   colorVar: string;
-  /** 鼠标页：附带移动距离卡片 */
-  showMouseDistance?: boolean;
 }
-
-const INCH_TO_M = 0.0254;
 
 /** §4.5：设备输入专用 limit——u16 完整值域，返回全部已计数键（不做 Top-N 截断） */
 const TOP_KEYS_LIMIT = 65_536;
-
-function fmtMeters(inches: number): string {
-  const m = inches * INCH_TO_M;
-  if (m >= 1000) return `${fmtNum(Math.round(m / 100) / 10)} km`;
-  return `${fmtNum(Math.round(m * 10) / 10)} m`;
-}
 
 function goSettings() {
   window.location.hash = "settings";
 }
 
-export function DeviceStatsPage({ kind, title, description, showMouseDistance }: DeviceStatsPageProps) {
+export function DeviceStatsPage({ kind, title, description }: DeviceStatsPageProps) {
   const { range, onChange } = useStatisticsRange();
   const activity = useAppActivity();
   // §4.5：统计 interval 仅范围包含当前 today 时传入（历史固定范围不轮询）
@@ -87,12 +78,6 @@ export function DeviceStatsPage({ kind, title, description, showMouseDistance }:
     queryFn: () => client.getKeyDaily(deviceId!, range.from, range.to),
     ...statsPolicy,
     enabled: deviceId !== null && dailyOpen && statsPolicy.enabled,
-  });
-  const mouseDist = useQuery({
-    queryKey: ["mouseDistance", range.from, range.to],
-    queryFn: () => client.getMouseDistance(range.from, range.to),
-    ...statsPolicy,
-    enabled: !!showMouseDistance && statsPolicy.enabled,
   });
 
   // 活动初始化完成前查询被 gating（无凭据不臆断"无数据"），按加载态呈现
@@ -134,30 +119,6 @@ export function DeviceStatsPage({ kind, title, description, showMouseDistance }:
         />
       ) : (
         <>
-          {showMouseDistance ? (
-            mouseDist.isLoading || !activity.ready ? (
-              <SkeletonCard rows={2} height="110px" />
-            ) : (
-              <div className="card">
-                <h2 className="card-title">鼠标移动距离</h2>
-                <p className="card-sub">按设备累计相对位移（约 80 counts/inch 折算，与 WhatPulse 近似同口径）</p>
-                <div style={{ display: "flex", gap: "var(--space-4)", flexWrap: "wrap", marginTop: "var(--space-2)" }}>
-                  <div>
-                    <div style={{ fontSize: "var(--text-caption)", color: "var(--color-text-muted)" }}>范围内总距离</div>
-                    <div className="num" style={{ fontSize: 28, fontWeight: 700 }}>
-                      {fmtMeters(mouseDist.data?.totalInches ?? 0)}
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: "var(--text-caption)", color: "var(--color-text-muted)" }}>英寸原值</div>
-                    <div className="num" style={{ fontSize: 20, fontWeight: 600 }}>
-                      {fmtNum(Math.round(mouseDist.data?.totalInches ?? 0))} in
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )
-          ) : null}
           <DeviceTabs
             devices={kindDevices}
             selectedId={deviceId}

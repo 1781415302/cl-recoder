@@ -14,9 +14,14 @@ import type {
   DeviceRow,
   DiagnosticsInfo,
   ExportReport,
+  GamepadMotionSummary,
   ImportReport,
   KeyDailyRowLabeled,
+  LegacyMouseSummary,
   MouseDistance,
+  MouseMotionSummary,
+  MouseSourceRow,
+  MouseSources,
   Overview,
   Settings,
   SettingsPatch,
@@ -200,4 +205,46 @@ export function getSettings(): Promise<Settings> {
 /** set_settings(patch: SettingsPatch) -> Settings */
 export function setSettings(patch: SettingsPatch): Promise<Settings> {
   return call("set_settings", { patch }, () => mock.mockSetSettings(patch));
+}
+
+/* ===== 运动查询与配置（motion-dpi §4.5：查询返回 Result，SQL 失败不伪装成空数据） ===== */
+
+/** get_mouse_sources() -> MouseSources（availability=needs_upgrade 为旧 schema 引导态） */
+export function getMouseSources(): Promise<MouseSources> {
+  return call("get_mouse_sources", undefined, () => mock.mockGetMouseSources());
+}
+
+/** get_mouse_motion(sourceId, from, to) -> MouseMotionSummary（未知 sourceId 返回错误，不静默切全部鼠标） */
+export function getMouseMotion(
+  sourceId: number,
+  from: string,
+  to: string,
+): Promise<MouseMotionSummary> {
+  return call("get_mouse_motion", { sourceId, from, to }, () =>
+    mock.mockGetMouseMotion(sourceId, from, to));
+}
+
+/** get_mouse_legacy(deviceId, from, to) -> LegacyMouseSummary（按型号查询旧算法读数） */
+export function getMouseLegacy(
+  deviceId: number,
+  from: string,
+  to: string,
+): Promise<LegacyMouseSummary> {
+  return call("get_mouse_legacy", { deviceId, from, to }, () =>
+    mock.mockGetMouseLegacy(deviceId, from, to));
+}
+
+/** set_mouse_dpi(sourceId, dpi|null) -> MouseSourceRow（null 清除手动后备；失败抛错由调用方保留编辑内容） */
+export function setMouseDpi(sourceId: number, dpi: number | null): Promise<MouseSourceRow> {
+  return call("set_mouse_dpi", { sourceId, dpi }, () => mock.mockSetMouseDpi(sourceId, dpi));
+}
+
+/** get_gamepad_motion(deviceId, from, to) -> GamepadMotionSummary（按型号查询，dwellSeconds 恰 625 格） */
+export function getGamepadMotion(
+  deviceId: number,
+  from: string,
+  to: string,
+): Promise<GamepadMotionSummary> {
+  return call("get_gamepad_motion", { deviceId, from, to }, () =>
+    mock.mockGetGamepadMotion(deviceId, from, to));
 }

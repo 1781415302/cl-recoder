@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codes::{DeviceKind, GamepadButton, MouseButton};
+use crate::motion::{GamepadMotionFrame, MotionConnectionId, MouseSourceState, MouseTravelDelta};
 
 /// 设备标识（跨进程共享的设备身份）。
 ///
@@ -85,7 +86,9 @@ pub enum RawEvent {
 
 /// 送入 aggregator 的聚合事件：`Input` 走统计，`Foreground` 更新当前归属 exe，
 /// `SourceRemoved` / `KeyboardSourcesReset` 为生命周期控制事件（不写统计、不增加
-/// events_seen、不改变 paused/shutdown）。
+/// events_seen、不改变 paused/shutdown），`MouseSourceState` / `MouseTravel` /
+/// `GamepadMotion` / `GamepadMotionDisconnected` 为运动事件（motion-dpi §4.1/§4.3
+/// ——不增加 events_seen/按钮总量、不计入应用键鼠次数）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AggEvent {
     /// 原始输入事件（键盘/鼠标/手柄）
@@ -102,11 +105,34 @@ pub enum AggEvent {
     },
     /// 全部键盘来源重置（待机/系统级重置）：aggregator 据此清空 Engine 按下状态
     KeyboardSourcesReset,
+    /// 鼠标来源状态心跳（motion-dpi §4.3，约每 2s/状态变化一次）：采集侧发布，
+    /// aggregator 注册来源并落库 connected/probe_status/auto_dpi（元数据非增量，
+    /// 失败可重试、不涉及 counts）。连接代际由 aggregator 门控（旧代结果拒绝）。
+    MouseSourceState(MouseSourceState),
+    /// 鼠标位移增量（motion-dpi §4.3）：按（来源, 捕获本地日, EffectiveDpi 桶）批发的
+    /// raw counts。paused 包不累计、DPI 快照/日期/暂停代际变化整桶批发——计数与
+    /// 暂停语义由采集侧按捕获 control 快照保证，aggregator 无条件落库。
+    MouseTravel(MouseTravelDelta),
+    /// 手柄摇杆完整帧（motion-dpi §4.3）：直接 XInput 状态另取两根摇杆，与 gilrs 按钮
+    /// 事件隔离（四轴一次快照同帧读取）。tracker（aggregator 侧按连接×side 维护）由
+    /// 捕获 control 与当前快照比对决定喂入或 reset/跳过——不跨短暂停连接坐标。
+    GamepadMotion(GamepadMotionFrame),
+    /// 手柄摇杆连接结束（motion-dpi §4.3）：`ERROR_DEVICE_NOT_CONNECTED` 断连、其他
+    /// 读取失败或轮询上下文重建——aggregator 据此 reset 该连接全部摇杆 tracker，
+    /// 不跨断点连线；断连绝不携带合成的回中立路程帧。
+    GamepadMotionDisconnected {
+        /// 结束的运动连接代际
+        connection: MotionConnectionId,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion::{
+        DpiOrigin, DpiProbeStatus, EffectiveDpi, GamepadMotionFrame, MotionConnectionId,
+        MotionControlSnapshot, MotionStamp, MouseSourceDescriptor, StickPoint,
+    };
 
     #[test]
     fn device_key_serde_round_trip() {
@@ -200,6 +226,93 @@ mod tests {
     // ------------------------------------------------------------------
     // correctness-v2 §4.1：InputSourceId 线上形状
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // motion-dpi §4.3：鼠标运动事件变体（AggEvent serde 往返）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn motion_dpi_agg_event_mouse_variants_serde_round_trip() {
+        let state = AggEvent::MouseSourceState(MouseSourceState {
+            descriptor: MouseSourceDescriptor {
+                source_key: r"\\?\hid#vid_046d&pid_c08b&mi_00#7&2f3a3d&0&0000".to_string(),
+                model: DeviceKey {
+                    kind: DeviceKind::Mouse,
+                    vid: 0x046D,
+                    pid: 0xC08B,
+                    name: "测试鼠标".to_string(),
+                },
+                interface_path: None,
+                physical: true,
+            },
+            connection: MotionConnectionId(5),
+            connected: true,
+            stamp: MotionStamp { mono_us: 1_000, unix_us: 1_780_272_000_000_000 },
+            probe_status: DpiProbeStatus::Available,
+            auto_dpi: Some(800),
+            auto_valid_until_unix_us: Some(1_780_272_004_000_000),
+        });
+        let travel = AggEvent::MouseTravel(MouseTravelDelta {
+            descriptor: MouseSourceDescriptor {
+                source_key: "virtual:unknown".to_string(),
+                model: DeviceKey {
+                    kind: DeviceKind::Mouse,
+                    vid: 0,
+                    pid: 0,
+                    name: "未知/虚拟设备".to_string(),
+                },
+                interface_path: None,
+                physical: false,
+            },
+            connection: MotionConnectionId(6),
+            day: "2026-06-15".to_string(),
+            counts: 42.5,
+            dpi: EffectiveDpi { value: None, origin: DpiOrigin::Unknown },
+            control: MotionControlSnapshot { epoch: 1, paused: false },
+        });
+        for e in [state, travel] {
+            let s = serde_json::to_string(&e).unwrap();
+            let back: AggEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // motion-dpi §4.3：手柄运动事件变体（AggEvent serde 往返，S5）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn motion_dpi_agg_event_gamepad_variants_serde_round_trip() {
+        let frame = AggEvent::GamepadMotion(GamepadMotionFrame {
+            device: DeviceKey {
+                kind: DeviceKind::Gamepad,
+                vid: 0x045E,
+                pid: 0x028E,
+                name: "Xbox Controller".to_string(),
+            },
+            connection: MotionConnectionId(11),
+            stamp: MotionStamp { mono_us: 77_000, unix_us: 1_780_272_000_077_000 },
+            left: StickPoint { x: -0.5, y: 1.0 },
+            right: StickPoint { x: 0.0, y: -1.0 },
+            control: MotionControlSnapshot { epoch: 3, paused: false },
+        });
+        let disconnected =
+            AggEvent::GamepadMotionDisconnected { connection: MotionConnectionId(11) };
+        for e in [frame, disconnected] {
+            let s = serde_json::to_string(&e).unwrap();
+            let back: AggEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, e);
+        }
+        // 线形状锚点：变体名不漂移、连接代际为裸 u64 newtype 直传
+        assert_eq!(
+            serde_json::to_string(&AggEvent::GamepadMotionDisconnected {
+                connection: MotionConnectionId(11)
+            })
+            .unwrap(),
+            r#"{"GamepadMotionDisconnected":{"connection":11}}"#
+        );
+    }
+
 
     #[test]
     fn correctness_v2_input_source_id_serde_transparent() {

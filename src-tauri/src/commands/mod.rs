@@ -7,6 +7,8 @@
 //! 错误语义（§5.1/§5.3）：查询类命令在 stats.db 缺失/短暂 BUSY/任何查询失败时
 //! **返回空数据**（[`swallow`]）+ 前端引导态/React Query 容错重试，绝不弹错；
 //! 设置/导入/导出/采集器控制类命令返回真实 `Result::Err(String)`。
+//! 例外（motion-dpi §4.5）：新增运动查询（mouse_motion/gamepad_motion）**不 swallow**
+//! ——SQL 真实错误原样返回，仅无 schema 走 availability=needs_upgrade 引导态。
 
 pub mod apps;
 pub mod collector_ctl;
@@ -15,8 +17,10 @@ pub mod combos;
 pub mod devices;
 pub mod diagnostics;
 pub mod export;
+pub mod gamepad_motion;
 pub mod import;
 pub mod keys;
+pub mod mouse_motion;
 pub mod overview;
 pub mod settings;
 pub mod wp;
@@ -86,6 +90,13 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         settings::get_settings,
         settings::set_settings,
         devices::set_device_nickname,
+        // 鼠标/手柄运动查询与手动 DPI 配置（motion-dpi §4.5：查询不 swallow、
+        // set 为 open_rw 有限配置入口）
+        mouse_motion::get_mouse_sources,
+        mouse_motion::get_mouse_motion,
+        mouse_motion::get_mouse_legacy,
+        mouse_motion::set_mouse_dpi,
+        gamepad_motion::get_gamepad_motion,
         // 诊断日志（S1 §4.1：GUI sink 状态 + 打开日志目录；前端均无参数）
         diagnostics::get_diagnostics_info,
         diagnostics::open_diagnostics_directory,

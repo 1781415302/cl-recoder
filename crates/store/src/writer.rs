@@ -7,6 +7,10 @@
 //!   （app_daily 三个计数列同语义累加）——同键 flush 两次计数翻倍；
 //!   失败语义：整批回滚返回 Err，调用方（aggregator）保留聚合桶、下个 tick 重试、日志限频
 //!   ——flush 失败绝不丢计数、绝不 panic（PLAN §9.4）；
+//!   motion-dpi §4.4：新两类运动增量（mouse_motion/stick_motion）与旧统计**同一个事务**，
+//!   任一部分失败全回滚；空批次提前返回判定纳入运动字段（纯热度批也必须落库）；
+//! - [`Writer::register_mouse_source`] / [`Writer::update_mouse_source_state`] /
+//!   [`Writer::manual_dpi`]：来源元数据/手动配置（不是增量，幂等可重试；SQL 在 [`crate::motion`]）；
 //! - [`Writer::rebuild_wp_tables`] / [`rebuild_wp_tables_with`]：WhatPulse 导入单事务整体重建
 //!   （wp_* 的 SQL 唯一归属本 crate，§2.2；import.rs 只做编排）。
 
@@ -16,15 +20,20 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use clrecoder_core::day;
+use clrecoder_core::motion::{MouseSourceDescriptor, MouseSourceState};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::motion::{
+    self as motion_sql, dpi_origin_to_text, stick_side_to_text, validate_mouse_motion_write,
+    validate_finite_nonneg, MouseConfigRow, MouseMotionWrite, StickMotionWrite,
+};
 use crate::reader::{
     WpAppDailyRow, WpComboDailyRow, WpKeyDailyRow, WpMetaRow, WpMouseButtonDailyRow,
     WpMouseDailyRow, WpMouseScrollDailyRow,
 };
 use crate::schema;
-use crate::{count_to_i64, kind_to_text, Result};
+use crate::{count_to_i64, kind_to_text, Result, StoreError};
 
 /// 每 0.5s flush 一次的批量写载荷（近实时；PLAN §4.5 批量语义保留）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -37,6 +46,10 @@ pub struct FlushBatch {
     pub apps: Vec<(String, String, u64, u64, u64)>,
     /// mouse_move_daily 增量：(device_id, day, distance_inches)。
     pub mouse_move: Vec<(i64, String, f64)>,
+    /// mouse_motion_daily 增量（motion-dpi §4.4：来源×日×DPI 桶；与旧统计同事务）。
+    pub mouse_motion: Vec<MouseMotionWrite>,
+    /// gamepad_motion_daily + gamepad_heat_daily 增量（同事务写入；空 bin 不落行）。
+    pub stick_motion: Vec<StickMotionWrite>,
 }
 
 /// WhatPulse 导入载荷（PLAN §4.5：字段 = 各 wp_* 表行结构 + meta；行结构与 [`crate::reader`] 共用）。
@@ -132,10 +145,20 @@ impl Writer {
     /// （app_daily 的 foreground_secs/key_count/click_count 三列同语义累加；
     ///  mouse_move_daily 的 distance_inches 同语义累加）。
     ///
+    /// motion-dpi §4.4：`mouse_motion`（按 来源×日×DPI 桶）与 `stick_motion`
+    /// （motion 行 + 热度 bins，空 bin 不落行）在同一事务内追加——任何部分失败全回滚；
+    /// 空批次提前返回判定纳入两类运动字段（只有保持帧产生的热度也必须落库）。
+    ///
     /// 同时把本批涉及设备的 `last_seen` 刷新一次（"节流：每 flush 一次"的落地处）。
     /// 失败语义：任一步出错整批回滚并返回 Err；调用方保留聚合桶、下个 tick 重试——绝不丢计数。
     pub fn flush(&self, b: &FlushBatch) -> Result<()> {
-        if b.input.is_empty() && b.combos.is_empty() && b.apps.is_empty() && b.mouse_move.is_empty() {
+        if b.input.is_empty()
+            && b.combos.is_empty()
+            && b.apps.is_empty()
+            && b.mouse_move.is_empty()
+            && b.mouse_motion.is_empty()
+            && b.stick_motion.is_empty()
+        {
             return Ok(());
         }
         let conn = self.lock_conn();
@@ -187,6 +210,70 @@ impl Writer {
                 stmt.execute(params![device_id, day, inches])?;
             }
         }
+        // motion-dpi §4.4：鼠标运动按（来源, 日, DPI 桶）累加——与旧统计同事务，失败全回滚；
+        // Rust 先行校验 counts 有限非负与 dpi×origin 配对（§6.1 不只依赖 CHECK），坏值报错回滚。
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO mouse_motion_daily(source_id, day, dpi, dpi_origin, counts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_id, day, dpi, dpi_origin) DO UPDATE SET
+                   counts = counts + excluded.counts",
+            )?;
+            for w in &b.mouse_motion {
+                validate_mouse_motion_write(w)?;
+                stmt.execute(params![
+                    w.source_id,
+                    w.day,
+                    w.dpi,
+                    dpi_origin_to_text(w.origin),
+                    w.counts
+                ])?;
+            }
+        }
+        // 手柄摇杆逐日运动行（active_us/travel_r 累加；travel_r 同样 Rust 先行校验）
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO gamepad_motion_daily(device_id, day, stick, active_us, travel_r)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(device_id, day, stick) DO UPDATE SET
+                   active_us = active_us + excluded.active_us,
+                   travel_r = travel_r + excluded.travel_r",
+            )?;
+            for w in &b.stick_motion {
+                validate_finite_nonneg(w.travel_r)?;
+                stmt.execute(params![
+                    w.device_id,
+                    w.day,
+                    stick_side_to_text(w.side),
+                    count_to_i64(w.active_us)?,
+                    w.travel_r
+                ])?;
+            }
+        }
+        // 手柄停留热力行（§6.1"空 bin 不写行"：dwell_us=0 的增量跳过；其余按格累加）
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO gamepad_heat_daily(device_id, day, stick, bin, dwell_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(device_id, day, stick, bin) DO UPDATE SET
+                   dwell_us = dwell_us + excluded.dwell_us",
+            )?;
+            for w in &b.stick_motion {
+                let side = stick_side_to_text(w.side);
+                for bin in &w.bins {
+                    if bin.dwell_us == 0 {
+                        continue;
+                    }
+                    let bin_id = i64::from(bin.bin);
+                    if bin_id > 624 {
+                        return Err(StoreError::InvalidMotionField(format!(
+                            "热力格号 {bin_id} 超出 0..=624"
+                        )));
+                    }
+                    stmt.execute(params![w.device_id, w.day, side, bin_id, count_to_i64(bin.dwell_us)?])?;
+                }
+            }
+        }
         // last_seen 节流刷新：本批涉及的设备每 flush 恰好一次
         {
             let mut stmt = tx.prepare("UPDATE devices SET last_seen = ?1 WHERE id = ?2")?;
@@ -213,6 +300,30 @@ impl Writer {
             params![nick, device_id],
         )?;
         Ok(())
+    }
+
+    /// 注册鼠标运动来源（motion-dpi §4.4）：model 行经既有设备缓存解析/创建
+    /// （"model id 复用 Writer 缓存"），来源行按 source_key 幂等、重注册返回既有 id。
+    /// 元数据写入不是增量：失败可重试、不涉及任何 counts。
+    pub fn register_mouse_source(&self, descriptor: &MouseSourceDescriptor) -> Result<i64> {
+        let device_id = self.get_or_create_device(&descriptor.model)?;
+        let conn = self.lock_conn();
+        motion_sql::register_mouse_source(&conn, descriptor, device_id, &day::now_local_rfc3339())
+    }
+
+    /// 应用鼠标来源状态快照（motion-dpi §4.4 心跳）：connected 为缓存证据，
+    /// 读取侧另有 last_seen≤5 秒新鲜度门（§6.1）。同来源连接代际的旧代结果拒绝
+    /// 由 aggregator 侧在调用前完成（连接 ID 只在内存）。
+    pub fn update_mouse_source_state(&self, id: i64, state: &MouseSourceState) -> Result<()> {
+        let conn = self.lock_conn();
+        motion_sql::update_mouse_source_state(&conn, id, state)
+    }
+
+    /// 批量读取来源手动 DPI 配置（motion-dpi §4.4：DPI worker ≤500ms 批读；
+    /// 未注册的 key 不在返回中，已注册未配置的 manual_dpi=None）。
+    pub fn manual_dpi(&self, keys: &[String]) -> Result<Vec<MouseConfigRow>> {
+        let conn = self.lock_conn();
+        motion_sql::read_manual_dpi(&conn, keys)
     }
 
     /// WhatPulse 导入整体重建（PLAN §4.5/§5.4）：单事务清空全部 wp_* 表并写入 `b`，
@@ -316,9 +427,14 @@ pub fn rebuild_wp_tables_with(conn: &Connection, b: &WpImportBatch) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion::{MouseMotionWrite, StickMotionWrite};
     use crate::testutil::TempDb;
     use clrecoder_core::codes::{mods, DeviceKind};
     use clrecoder_core::event::DeviceKey;
+    use clrecoder_core::motion::{
+        DpiOrigin, DpiProbeStatus, MotionConnectionId, MotionStamp, MouseSourceDescriptor,
+        MouseSourceState, StickBinDelta, StickSide,
+    };
 
     fn open_writer(tag: &str) -> (TempDb, Writer) {
         let db = TempDb::new(tag);
@@ -655,5 +771,334 @@ mod tests {
         let a: i64 =
             conn.query_row("SELECT COUNT(*) FROM app_daily", [], |r| r.get(0)).unwrap();
         assert_eq!(a, 0);
+    }
+
+    // ---------------- motion-dpi §8-S2：FlushBatch 运动字段与同事务写入 ----------------
+
+    const MOTION_DAY: &str = "2026-09-28";
+
+    /// 物理鼠标来源描述。
+    fn mouse_descriptor(key: &str, model_name: &str) -> MouseSourceDescriptor {
+        MouseSourceDescriptor {
+            source_key: key.to_string(),
+            model: DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 0x1532,
+                pid: 0x0045,
+                name: model_name.to_string(),
+            },
+            interface_path: None,
+            physical: true,
+        }
+    }
+
+    /// §8-S2 验收点："空批次提前返回"判定纳入运动字段——只有运动增量（无任何旧统计）
+    /// 的批次也必须写库（"只有保持帧产生的热度也必须落库"）。
+    #[test]
+    fn motion_dpi_flush_pure_motion_batch_is_not_treated_as_empty() {
+        let (_db, w) = open_writer("motion-pure-batch");
+        let sid = w.register_mouse_source(&mouse_descriptor("k1", "鼠标")).unwrap();
+        // 纯鼠标运动批
+        w.flush(&FlushBatch {
+            mouse_motion: vec![MouseMotionWrite {
+                source_id: sid,
+                day: MOTION_DAY.into(),
+                dpi: 0,
+                origin: DpiOrigin::Unknown,
+                counts: 5.0,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        // 纯摇杆热度批（保持帧）：无 input/apps/mouse_move 也必须落库
+        w.flush(&FlushBatch {
+            stick_motion: vec![StickMotionWrite {
+                device_id: 1,
+                day: MOTION_DAY.into(),
+                side: StickSide::Left,
+                active_us: 250_000,
+                travel_r: 0.0,
+                bins: vec![StickBinDelta { bin: 312, dwell_us: 250_000 }],
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let conn = w.lock_conn();
+        let (mm, gm, gh): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM mouse_motion_daily),
+                        (SELECT COUNT(*) FROM gamepad_motion_daily),
+                        (SELECT COUNT(*) FROM gamepad_heat_daily)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((mm, gm, gh), (1, 1, 1), "纯运动批必须落库");
+    }
+
+    /// §8-S2 验收点：800/1600/unknown 三桶写入并按桶累加（同键再 flush 翻倍，
+    /// 与旧表累加语义一致）；dpi×origin 配对由写入层校验。
+    #[test]
+    fn motion_dpi_flush_mouse_motion_buckets_accumulate() {
+        let (_db, w) = open_writer("motion-mm-accum");
+        let sid = w.register_mouse_source(&mouse_descriptor("k1", "鼠标")).unwrap();
+        let batch = |extra: f64| FlushBatch {
+            mouse_motion: vec![
+                MouseMotionWrite {
+                    source_id: sid,
+                    day: MOTION_DAY.into(),
+                    dpi: 800,
+                    origin: DpiOrigin::Manual,
+                    counts: 800.0 + extra,
+                },
+                MouseMotionWrite {
+                    source_id: sid,
+                    day: MOTION_DAY.into(),
+                    dpi: 1600,
+                    origin: DpiOrigin::Manual,
+                    counts: 1600.0,
+                },
+                MouseMotionWrite {
+                    source_id: sid,
+                    day: MOTION_DAY.into(),
+                    dpi: 0,
+                    origin: DpiOrigin::Unknown,
+                    counts: 400.0,
+                },
+            ],
+            ..Default::default()
+        };
+        w.flush(&batch(0.0)).unwrap();
+        w.flush(&batch(100.0)).unwrap(); // 同桶再 flush：累加而非新增行
+        let conn = w.lock_conn();
+        let mut rows: Vec<(i64, String, f64)> = conn
+            .prepare(
+                "SELECT dpi, dpi_origin, counts FROM mouse_motion_daily
+                 WHERE source_id=?1 AND day=?2 ORDER BY dpi",
+            )
+            .unwrap()
+            .query_map(params![sid, MOTION_DAY], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.sort_by_key(|(dpi, _, _)| *dpi);
+        assert_eq!(
+            rows,
+            vec![
+                (0, "unknown".to_string(), 800.0), // 400+400 累加
+                (800, "manual".to_string(), 1700.0), // 800+900 累加
+                (1600, "manual".to_string(), 3200.0),
+            ]
+        );
+    }
+
+    /// §8-S2 验收点：stick motion 行与热度 bins 按键累加；空 bin（dwell_us=0）不写行。
+    #[test]
+    fn motion_dpi_flush_stick_motion_and_heat_accumulate_skip_empty_bins() {
+        let (_db, w) = open_writer("motion-stick-accum");
+        // device_id=1 需存在（FK）：注册一个来源即建出第一台设备
+        w.register_mouse_source(&mouse_descriptor("k1", "鼠标")).unwrap();
+        let stick = |bins: Vec<StickBinDelta>| StickMotionWrite {
+            device_id: 1,
+            day: MOTION_DAY.into(),
+            side: StickSide::Right,
+            active_us: 500_000,
+            travel_r: 0.25,
+            bins,
+        };
+        w.flush(&FlushBatch {
+            stick_motion: vec![stick(vec![
+                StickBinDelta { bin: 312, dwell_us: 300_000 },
+                StickBinDelta { bin: 313, dwell_us: 200_000 },
+                StickBinDelta { bin: 400, dwell_us: 0 }, // 空 bin：不得落行
+            ])],
+            ..Default::default()
+        })
+        .unwrap();
+        w.flush(&FlushBatch {
+            stick_motion: vec![stick(vec![StickBinDelta { bin: 312, dwell_us: 250_000 }])],
+            ..Default::default()
+        })
+        .unwrap();
+        let conn = w.lock_conn();
+        let (active, travel): (i64, f64) = conn
+            .query_row(
+                "SELECT active_us, travel_r FROM gamepad_motion_daily
+                 WHERE device_id=1 AND day=?1 AND stick='right'",
+                params![MOTION_DAY],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, travel), (1_000_000, 0.5), "motion 行同键累加");
+        let mut bins: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT bin, dwell_us FROM gamepad_heat_daily
+                 WHERE device_id=1 AND day=?1 AND stick='right' ORDER BY bin",
+            )
+            .unwrap()
+            .query_map(params![MOTION_DAY], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        bins.sort();
+        assert_eq!(bins, vec![(312, 550_000), (313, 200_000)], "dwell_us=0 的 bin 不写行");
+    }
+
+    /// §8-S2 验收点（bin/summary 原子）：运动增量与旧统计同事务——任一部分失败全回滚，
+    /// 已执行的合法前半（input 桶）同样回滚，绝不部分提交。
+    #[test]
+    fn motion_dpi_flush_motion_and_legacy_buckets_rollback_together() {
+        let (_db, w) = open_writer("motion-atomic");
+        let dev = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0,
+                pid: 0,
+                name: "K".into(),
+            })
+            .unwrap();
+        let err = w
+            .flush(&FlushBatch {
+                input: vec![(dev, MOTION_DAY.into(), 0x1E, 5)], // 合法前半
+                mouse_motion: vec![MouseMotionWrite {
+                    source_id: 999, // 不存在的来源 → FK 失败
+                    day: MOTION_DAY.into(),
+                    dpi: 800,
+                    origin: DpiOrigin::Manual,
+                    counts: 10.0,
+                }],
+                stick_motion: vec![StickMotionWrite {
+                    device_id: dev,
+                    day: MOTION_DAY.into(),
+                    side: StickSide::Left,
+                    active_us: 1_000,
+                    travel_r: 0.1,
+                    bins: vec![StickBinDelta { bin: 0, dwell_us: 1_000 }],
+                }],
+                ..Default::default()
+            })
+            .unwrap_err();
+        let _ = err; // FK 错误（rusqlite），不强校验具体类型
+        let conn = w.lock_conn();
+        for table in
+            ["input_daily", "mouse_motion_daily", "gamepad_motion_daily", "gamepad_heat_daily"]
+        {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "失败批次的 {table} 必须整批回滚");
+        }
+    }
+
+    /// §6.1"不只依赖 REAL CHECK 拒绝 NaN"：counts/travel_r 非有限非负在 Rust 侧拒绝、
+    /// 整批回滚（含批内合法的旧统计行）。
+    #[test]
+    fn motion_dpi_flush_rejects_nonfinite_and_negative_motion_values() {
+        let (_db, w) = open_writer("motion-nonfinite");
+        let sid = w.register_mouse_source(&mouse_descriptor("k1", "鼠标")).unwrap();
+        let dev = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0,
+                pid: 0,
+                name: "K".into(),
+            })
+            .unwrap();
+        let mm = |counts: f64| MouseMotionWrite {
+            source_id: sid,
+            day: MOTION_DAY.into(),
+            dpi: 800,
+            origin: DpiOrigin::Manual,
+            counts,
+        };
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let err = w
+                .flush(&FlushBatch {
+                    input: vec![(dev, MOTION_DAY.into(), 0x1E, 3)],
+                    mouse_motion: vec![mm(bad)],
+                    ..Default::default()
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("运动计数值非法"), "bad={bad}: {err}");
+        }
+        // travel_r 负数同样拒绝
+        let err = w
+            .flush(&FlushBatch {
+                stick_motion: vec![StickMotionWrite {
+                    device_id: dev,
+                    day: MOTION_DAY.into(),
+                    side: StickSide::Left,
+                    active_us: 1_000,
+                    travel_r: -0.5,
+                    bins: vec![],
+                }],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("运动计数值非法"), "{err}");
+        // 全部失败后库内无残留（合法 input 前半也回滚）
+        let conn = w.lock_conn();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM input_daily", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "校验失败的批次必须整批回滚");
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM mouse_motion_daily", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// §8-S2：Writer 三个来源元数据助手——register 复用设备缓存（同型号两来源同 device_id）、
+    /// update_mouse_source_state 落库、manual_dpi 批读往返。
+    #[test]
+    fn motion_dpi_writer_source_helpers_roundtrip() {
+        let (_db, w) = open_writer("motion-writer-helpers");
+        let d1 = mouse_descriptor("k1", "同型号鼠标");
+        let d2 = mouse_descriptor("k2", "同型号鼠标");
+        let s1 = w.register_mouse_source(&d1).unwrap();
+        let s2 = w.register_mouse_source(&d2).unwrap();
+        assert_ne!(s1, s2, "不同路径 = 不同来源");
+        let (dev1, dev2): (i64, i64) = {
+            let conn = w.lock_conn();
+            conn.query_row(
+                "SELECT MAX(device_id), MIN(device_id) FROM mouse_motion_sources",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(dev1, dev2, "同型号两来源共用同一 device 行（model id 复用缓存）");
+
+        // update_mouse_source_state：心跳落库（经 list_mouse_sources 验证）
+        let st = MouseSourceState {
+            descriptor: d1.clone(),
+            connection: MotionConnectionId(1),
+            connected: true,
+            stamp: MotionStamp { mono_us: 0, unix_us: 1_780_272_000_000_000 },
+            probe_status: DpiProbeStatus::Available,
+            auto_dpi: Some(800),
+            auto_valid_until_unix_us: Some(1_780_272_004_000_000),
+        };
+        w.update_mouse_source_state(s1, &st).unwrap();
+        // manual_dpi 批读：set_manual_dpi 走 free function（GUI 例外路径，S6 接线）
+        {
+            let conn = w.lock_conn();
+            crate::motion::set_manual_dpi(&conn, s2, Some(1600)).unwrap();
+        }
+        let rows = w.manual_dpi(&["k1".to_string(), "k2".to_string(), "ghost".to_string()]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], MouseConfigRow { source_key: "k1".into(), manual_dpi: None });
+        assert_eq!(rows[1], MouseConfigRow { source_key: "k2".into(), manual_dpi: Some(1600) });
+
+        // 状态已落库：connected 证据 + auto 值可经 list 读出（last_seen=stamp 时刻，
+        // 以 stamp 对应的 unix µs 作为 now 校验新鲜窗口内）
+        let rows = {
+            let conn = w.lock_conn();
+            crate::motion::list_mouse_sources(&conn, 1_780_272_000_000_000).unwrap()
+        };
+        let r1 = rows.iter().find(|r| r.id == s1).unwrap();
+        assert!(r1.connected);
+        assert_eq!(r1.auto_dpi, Some(800));
+        assert_eq!(r1.effective_dpi, Some(800));
     }
 }

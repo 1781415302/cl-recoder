@@ -203,3 +203,91 @@ export interface SettingsPatch {
   guiAutostart?: boolean;
   wpDbPath?: string | null;
 }
+
+/* ===== 运动命令（motion-dpi §4.5 逐字对齐；DTO camelCase 由 src-tauri serde 保证） ===== */
+
+/** 运动查询可用性：needs_upgrade=库仍是旧 schema（组件旁引导"启动/更新采集器后可用"，不阻挡原按钮页） */
+export type MotionAvailability = "ready" | "needs_upgrade";
+
+/** DPI 取值来源（effectiveDpi 的出处；unknown=未配置，无换算） */
+export type DpiOrigin = "auto" | "manual" | "unknown";
+
+/** DPI 探测状态（unavailable=探测失败，业务降级；disconnected=来源已断连） */
+export type DpiProbeStatus =
+  | "pending"
+  | "available"
+  | "unsupported"
+  | "ambiguous"
+  | "unavailable"
+  | "disconnected";
+
+/** 鼠标运动来源行：id 是独立物理来源（同型号两只鼠标是两行）；deviceId 只供型号按钮查询 */
+export interface MouseSourceRow {
+  id: number;
+  deviceId: number;
+  name: string;
+  /** 用户自定义昵称（可空；展示优先于 name） */
+  nickname: string | null;
+  /** 虚拟/未知桶为 false，禁配置/换算 DPI */
+  physical: boolean;
+  /** collector 发布的在线证据且观测 ≤5 秒，否则 false */
+  connected: boolean;
+  /** 手动配置 DPI（持久，可离线显示；仅用于之后采集，不回算历史） */
+  manualDpi: number | null;
+  /** 当前有效的自动 DPI（要求 connected 且未过期，否则 null） */
+  autoDpi: number | null;
+  /** 自动 DPI 失效时刻（RFC3339；仅与 autoDpi 同真） */
+  autoValidUntil: string | null;
+  /** 换算里程所用有效 DPI（auto 有效 > manual > null） */
+  effectiveDpi: number | null;
+  dpiOrigin: DpiOrigin;
+  probeStatus: DpiProbeStatus;
+}
+
+export interface MouseSources {
+  availability: MotionAvailability;
+  sources: MouseSourceRow[];
+}
+
+export interface MouseMotionDay {
+  day: string;
+  rawCounts: number;
+  /** 当日已配置部分折算米数；没有任何已配置移动时 null（不用 0 米冒充，UI 显示"未配置/暂无可换算数据"） */
+  meters: number | null;
+  unconfiguredCounts: number;
+}
+
+/** 单来源运动区间汇总；days 随 summary 返回（展开表复用它，不额外查询） */
+export interface MouseMotionSummary {
+  availability: MotionAvailability;
+  sourceId: number;
+  rawCounts: number;
+  meters: number | null;
+  unconfiguredCounts: number;
+  /** 已配置 counts / 总 counts（total=0 时 null） */
+  coverage: number | null;
+  days: MouseMotionDay[];
+}
+
+/** 旧算法鼠标移动读数（旧表×80 只还原原始累计量，不换算米、不归物理来源） */
+export interface LegacyMouseSummary {
+  deviceId: number;
+  rawCounts: number;
+  quality: "legacy_uncalibrated";
+}
+
+/** 单侧摇杆运动汇总（dwellSeconds 恰 625、row-major；无数据全 0） */
+export interface StickMotionSummary {
+  side: "left" | "right";
+  activeSeconds: number;
+  travelR: number;
+  dwellSeconds: number[];
+}
+
+export interface GamepadMotionSummary {
+  availability: MotionAvailability;
+  deviceId: number;
+  gridSize: 25;
+  left: StickMotionSummary;
+  right: StickMotionSummary;
+}

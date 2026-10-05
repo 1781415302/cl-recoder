@@ -18,7 +18,18 @@ clrecoder-diagnostics = { path = "../diagnostics" }
 # Win32_System_IO：windows 0.62 中所有带 OVERLAPPED 参数的 API（含命名管道必需的
 # ReadFile/WriteFile/ConnectNamedPipe，S8 §4.4）被该 feature 门控，白名单内的
 # Win32_System_Pipes/Win32_Storage_FileSystem 本身不够。
-windows = { workspace = true, features = ["Win32_System_IO", "Win32_System_Console"] }
+# S3（motion-dpi §3）：HID++ 只读 provider 所需系统 feature——HID 枚举/CAPS
+# （Win32_Devices_HumanInterfaceDevice）、SetupAPI/CM 设备树（DeviceAndDriverInstallation）、
+# DEVPKEY_Device_*（Properties）、XInput 完整帧（UI_Input_XboxController，S5 使用）。
+# 现有 IO/Threading/Storage_FileSystem 等 workspace feature 复用，不新增包、不改版本。
+windows = { workspace = true, features = [
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_UI_Input_XboxController",
+] }
 # serde_json（白名单内，§9.1）：NDJSON 一行请求/一行响应的编解码（S8 §4.4）。
 serde_json = { workspace = true }
 gilrs = { workspace = true }

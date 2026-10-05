@@ -21,11 +21,12 @@
 //! S8 集成单测（进程内）：起 server → 客户端三条请求往返逐字对齐 §4.4 示例。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use clrecoder_core::day::now_local_rfc3339;
 use clrecoder_core::ipc::{CtlRequest, CtlResponse, StatusData, MAX_REQUEST_BYTES, PIPE_NAME};
+use clrecoder_core::motion::MotionControlSnapshot;
 use windows::core::{Error as WError, HSTRING, HRESULT, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, E_FAIL, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_UNICODE_TRANSLATION, ERROR_PIPE_CONNECTED,
@@ -63,12 +64,56 @@ const PIPE_BUFFER_SIZE: u32 = 8192;
 ///
 /// 构造后经 `Arc` 共享：ipc_server 写入、engine_loop（S9）读取。
 /// 暂停状态不持久化（PLAN §6）——collector 重启即恢复统计。
+///
+/// motion-dpi §4.3.1 追加（均**不进 IPC 线格式**）：
+/// - `producer_stop`：main 发现 shutdown 请求后置位，各采集生产者在注册失败重试、
+///   批次边界检查（Raw 注册失败重试、gamepad init 重试、DPI 协调 worker 节拍）；
+/// - `producers_drained`：全部生产者停止后由 main 发布——aggregator 看到 shutdown
+///   但未 drained 时继续接收已捕获增量，drained 后才排空并最后 flush；
+/// - `motion_control_state`：暂停控制快照（[`MotionControlSnapshot`]）——epoch 与
+///   paused 在锁内一致变更/读取，绝不把 AtomicBool 与 epoch 分开读。[`Self::set_paused`]
+///   仅当暂停状态实际改变时递增 epoch：真实暂停即使发生在两个采样之间又恢复，
+///   epoch 仍变化，tracker/分桶必须换新（不跨暂停积分）。旧 app 计时继续使用
+///   `paused` AtomicBool 的既有观察逻辑，本轮不重写。
 #[derive(Debug, Default)]
 pub struct Flags {
     /// true=暂停统计（aggregator 丢弃 Input 事件，Foreground 照常）
     pub paused: AtomicBool,
     /// true=请求采集进程优雅退出
     pub shutdown: AtomicBool,
+    /// true=生产者停机请求（main 置位；生产者自查，不进 IPC 线格式）
+    pub producer_stop: AtomicBool,
+    /// true=全部生产者已停止并排空（main 退出序发布；不进 IPC 线格式）
+    pub producers_drained: AtomicBool,
+    /// 暂停控制快照（Mutex 保护；epoch 与 paused 一致变更/读取，§4.3）
+    motion_control_state: Mutex<MotionControlSnapshot>,
+}
+
+impl Flags {
+    /// 暂停/恢复（§4.3）：锁内仅当状态实际改变时递增 epoch，同时更新旧 `paused`
+    /// AtomicBool。IPC `SetPaused` 调用本方法——线格式不变。
+    pub fn set_paused(&self, paused: bool) {
+        {
+            let mut guard = self
+                .motion_control_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.paused != paused {
+                guard.epoch += 1;
+                guard.paused = paused;
+            }
+        }
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// 一致读取暂停控制快照（§4.3）：producer（raw_input/gamepad 采样）与 aggregator
+    /// 都用它判定 epoch/暂停态，不得把 AtomicBool＋epoch 分开读。
+    pub fn motion_control(&self) -> MotionControlSnapshot {
+        *self
+            .motion_control_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// 服务端要报告的运行时状态（[`StatusData`] 的数据来源）。
@@ -402,7 +447,8 @@ fn handle_request(line: &[u8], flags: &Flags, status: &RuntimeStatus) -> CtlResp
             CtlResponse::ok_with(status.snapshot(flags.paused.load(Ordering::Acquire)))
         }
         Ok(CtlRequest::SetPaused { paused }) => {
-            flags.paused.store(paused, Ordering::Release);
+            // motion-dpi §4.3：经 Flags::set_paused 递增暂停代际（线格式不变）
+            flags.set_paused(paused);
             CtlResponse::ok_no_data()
         }
         Ok(CtlRequest::Shutdown) => {
@@ -513,6 +559,31 @@ unsafe fn token_user_sid_string(token: HANDLE) -> windows::core::Result<String> 
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    // ---------------- motion-dpi §4.3：暂停控制快照（Flags） ----------------
+
+    /// set_paused 仅当状态实际改变时递增 epoch；motion_control 返回一致快照，
+    /// 旧 paused AtomicBool 同步更新（app 计时观察逻辑不变，线格式不变）。
+    #[test]
+    fn motion_dpi_set_paused_increments_epoch_only_on_change() {
+        let flags = Flags::default();
+        // 初始：epoch 0、未暂停
+        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 0, paused: false });
+        // 暂停 → epoch 1
+        flags.set_paused(true);
+        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 1, paused: true });
+        assert!(flags.paused.load(Ordering::Acquire), "旧 AtomicBool 必须同步更新");
+        // 重复暂停（状态未变）→ epoch 不变
+        flags.set_paused(true);
+        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 1, paused: true });
+        // 恢复 → epoch 2（短暂停再恢复也换代际）
+        flags.set_paused(false);
+        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 2, paused: false });
+        assert!(!flags.paused.load(Ordering::Acquire));
+        // 重复恢复 → epoch 不变
+        flags.set_paused(false);
+        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 2, paused: false });
+    }
 
     use windows::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, WIN32_ERROR,

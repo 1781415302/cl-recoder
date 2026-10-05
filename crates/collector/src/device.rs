@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 
 use clrecoder_core::codes::DeviceKind;
 use clrecoder_core::event::DeviceKey;
+use clrecoder_core::motion::MouseSourceDescriptor;
 use regex::Regex;
 use windows::core::{HSTRING, PWSTR};
 use windows::Win32::Foundation::{
@@ -47,6 +48,10 @@ const MAX_DEVICE_NAME_READ_ATTEMPTS: usize = 3;
 
 /// 未知/虚拟设备桶的固定显示名（§4.2：按 kind 分桶，keyboard/mouse 各一）。
 pub(crate) const UNKNOWN_DEVICE_NAME: &str = "未知/虚拟设备";
+
+/// 鼠标运动来源的固定虚拟桶 key（motion-dpi §4.1：路径不可读/hDevice==0 归入
+/// `virtual:unknown`，physical=false，保留 raw counts，禁自动/手动物理 DPI）。
+pub(crate) const VIRTUAL_MOUSE_SOURCE_KEY: &str = "virtual:unknown";
 
 /// 从 raw input 设备路径解析出的 HID 信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +109,13 @@ fn extract_vid_pid(device_id: &str) -> Option<(u16, u16)> {
 
 /// hDevice → DeviceKey 解析器（§4.2：结果按句柄+种类缓存，热插拔后新句柄自然重解析；
 /// 缓存键含 kind，防御同一句柄被不同 RIM 类型事件引用的假想情形）。
+///
+/// motion-dpi §4.3 追加：鼠标运动来源描述（[`MouseSourceDescriptor`]）按句柄缓存——
+/// 接口路径/ContainerID 只在注册或重连时查询（沿用 heap-safe 原生读取），
+/// [`DeviceResolver::forget_handle`] 与既有 DeviceKey 缓存一并失效。
 pub(crate) struct DeviceResolver {
     cache: HashMap<(isize, DeviceKind), DeviceKey>,
+    mouse_cache: HashMap<isize, MouseSourceDescriptor>,
 }
 
 impl Default for DeviceResolver {
@@ -117,7 +127,7 @@ impl Default for DeviceResolver {
 impl DeviceResolver {
     /// 创建空缓存解析器。
     pub(crate) fn new() -> Self {
-        Self { cache: HashMap::new() }
+        Self { cache: HashMap::new(), mouse_cache: HashMap::new() }
     }
 
     /// 解析（带缓存）。hDevice==0 / 取路径失败 / 非 HID 形态 / 注册表与兜底均失败时
@@ -128,12 +138,40 @@ impl DeviceResolver {
 
     /// 移除该原生句柄的**所有 kind** 缓存（§4.3：设备拔出通知时由 raw_input 同步调用——
     /// Windows 可能把回收后的句柄值复用给另一台设备，失效前缓存的 DeviceKey 会张冠李戴）。
-    /// 未知句柄调用无副作用。
+    /// 未知句柄调用无副作用。鼠标运动来源描述缓存一并失效。
     pub fn forget_handle(&mut self, hdevice: HANDLE) {
         let key = hdevice.0 as isize;
         for kind in [DeviceKind::Keyboard, DeviceKind::Mouse, DeviceKind::Gamepad] {
             self.cache.remove(&(key, kind));
         }
+        self.mouse_cache.remove(&key);
+    }
+
+    /// 解析鼠标运动来源描述（motion-dpi §4.3：注册或重连时调用一次，结果按句柄缓存）。
+    ///
+    /// - hDevice==0 / 路径不可读 / 非 HID 形态（RDP/虚拟设备）→ 固定桶
+    ///   [`VIRTUAL_MOUSE_SOURCE_KEY`]（`physical=false`，保留 raw counts，禁物理 DPI）；
+    /// - 真实鼠标：`source_key` 为完整接口路径按 Windows 大小写不敏感语义规范化的小写
+    ///   形式；`interface_path` 保留原路径供 HID 定位；`model` 复用既有注册表名称解析链
+    ///   （与按键统计的 DeviceKey 同名——型号行天然复用）。
+    pub fn mouse_source(&mut self, hdevice: HANDLE) -> MouseSourceDescriptor {
+        self.mouse_source_with(hdevice, || raw_input_device_name(hdevice), registry_device_name)
+    }
+
+    /// [`DeviceResolver::mouse_source`] 的可注入版（单测桩：不触真实 IO）。
+    pub(crate) fn mouse_source_with(
+        &mut self,
+        hdevice: HANDLE,
+        path_provider: impl FnOnce() -> Option<String>,
+        name_provider: impl FnOnce(&HidPathInfo) -> Option<String>,
+    ) -> MouseSourceDescriptor {
+        let key = hdevice.0 as isize;
+        if let Some(d) = self.mouse_cache.get(&key) {
+            return d.clone();
+        }
+        let d = mouse_source_uncached(hdevice, path_provider, name_provider);
+        self.mouse_cache.insert(key, d.clone());
+        d
     }
 
     /// 可注入路径/名称来源的解析核心：生产路径与单测共用同一逻辑，
@@ -176,6 +214,45 @@ fn resolve_uncached(
     let name = name_provider(&info)
         .unwrap_or_else(|| format!("HID 设备 {:04X}:{:04X}", info.vid, info.pid));
     DeviceKey { kind, vid: info.vid, pid: info.pid, name }
+}
+
+/// 无缓存的鼠标运动来源解析（motion-dpi §4.1/§4.3 逐条兜底；不猜物理设备——
+/// 一切不可读/非 HID 形态均归 virtual:unknown 固定桶，physical=false）。
+fn mouse_source_uncached(
+    hdevice: HANDLE,
+    path_provider: impl FnOnce() -> Option<String>,
+    name_provider: impl FnOnce(&HidPathInfo) -> Option<String>,
+) -> MouseSourceDescriptor {
+    if hdevice.is_invalid() {
+        return virtual_mouse_descriptor();
+    }
+    let Some(path) = path_provider() else {
+        return virtual_mouse_descriptor();
+    };
+    let Some(info) = parse_device_path(&path) else {
+        // 非 HID 形态（RDP/虚拟设备）或无法提取 VID/PID → 固定桶
+        return virtual_mouse_descriptor();
+    };
+    let name = name_provider(&info)
+        .unwrap_or_else(|| format!("HID 设备 {:04X}:{:04X}", info.vid, info.pid));
+    MouseSourceDescriptor {
+        // Windows 路径大小写不敏感语义：source_key 规范化为小写完整路径
+        source_key: path.to_lowercase(),
+        model: DeviceKey { kind: DeviceKind::Mouse, vid: info.vid, pid: info.pid, name },
+        // 原路径保留原大小写供 HID 定位（hid_transport 经它定位 devnode）
+        interface_path: Some(path),
+        physical: true,
+    }
+}
+
+/// 鼠标运动来源的固定虚拟桶（motion-dpi §4.1：physical=false，保留 raw counts）。
+fn virtual_mouse_descriptor() -> MouseSourceDescriptor {
+    MouseSourceDescriptor {
+        source_key: VIRTUAL_MOUSE_SOURCE_KEY.to_string(),
+        model: unknown_device(DeviceKind::Mouse),
+        interface_path: None,
+        physical: false,
+    }
 }
 
 /// 注册表取显示名：实例键 `FriendlyName` → `DeviceDesc`；实例键打不开时枚举设备键
@@ -759,8 +836,98 @@ mod tests {
         assert_eq!(mouse_calls.get(), 2, "mouse 缓存应被失效");
     }
 
-    // ---------- collector_heap_*（DEVPLAN 堆损坏修复 §8 S1 确定性回归） ----------
+    // ---------- motion-dpi §4.1/§4.3：鼠标运动来源描述解析 ----------
 
+    /// 真实鼠标：source_key 为完整路径的小写规范化；interface_path 保留原大小写；
+    /// model 复用注册表名称解析链（VID/PID 与按键统计 DeviceKey 一致）。
+    #[test]
+    fn motion_dpi_mouse_source_lowercases_source_key_and_keeps_original_path() {
+        let mut r = DeviceResolver::new();
+        let d = r.mouse_source_with(
+            handle(0x501),
+            || Some(r"\\?\HID#VID_046D&PID_C08B&MI_00#7&2f3a3d&0&0000".to_string()),
+            |_| Some("G502 HERO".to_string()),
+        );
+        assert_eq!(
+            d.source_key,
+            r"\\?\hid#vid_046d&pid_c08b&mi_00#7&2f3a3d&0&0000",
+            "source_key 必须按 Windows 大小写不敏感语义规范化为小写完整路径"
+        );
+        assert_eq!(
+            d.interface_path.as_deref(),
+            Some(r"\\?\HID#VID_046D&PID_C08B&MI_00#7&2f3a3d&0&0000"),
+            "原路径保留原大小写供 HID 定位"
+        );
+        assert!(d.physical);
+        assert_eq!((d.model.vid, d.model.pid, d.model.kind), (0x046D, 0xC08B, DeviceKind::Mouse));
+        assert_eq!(d.model.name, "G502 HERO");
+    }
+
+    /// hDevice==0 / 路径不可读 / 非 HID 形态 → virtual:unknown 固定桶（physical=false）。
+    #[test]
+    fn motion_dpi_mouse_source_virtual_buckets_for_zero_handle_and_non_hid() {
+        let mut r = DeviceResolver::new();
+        let expected = MouseSourceDescriptor {
+            source_key: VIRTUAL_MOUSE_SOURCE_KEY.to_string(),
+            model: unknown_device(DeviceKind::Mouse),
+            interface_path: None,
+            physical: false,
+        };
+        // hDevice==0
+        let d = r.mouse_source_with(
+            HANDLE::default(),
+            || panic!("hDevice==0 不应查询设备路径"),
+            |_: &HidPathInfo| panic!("hDevice==0 不应查询注册表"),
+        );
+        assert_eq!(d, expected);
+        // 路径不可读
+        let d = r.mouse_source_with(handle(0x502), || None, |_: &HidPathInfo| panic!("无路径不应查注册表"));
+        assert_eq!(d, expected);
+        // 非 HID 形态（RDP 虚拟鼠标）
+        let d = r.mouse_source_with(
+            handle(0x503),
+            || Some(r"\\?\RDP_MOU#0000#{6f1b8e80-b74f-4a12-9c9d-000000000000}".to_string()),
+            |_: &HidPathInfo| panic!("非 HID 路径不应查注册表"),
+        );
+        assert_eq!(d, expected);
+    }
+
+    /// 鼠标描述缓存与 forget_handle 一并失效（句柄复用防护）；注册表名缺失走
+    /// VID/PID 兜底名。
+    #[test]
+    fn motion_dpi_mouse_source_caches_per_handle_and_forget_clears() {
+        let mut r = DeviceResolver::new();
+        let calls = Cell::new(0u32);
+        let d1 = r.mouse_source_with(
+            handle(0x504),
+            || {
+                calls.set(calls.get() + 1);
+                Some(MOUSE_PATH.to_string())
+            },
+            |_| None,
+        );
+        assert_eq!(d1.model.name, "HID 设备 1532:0045");
+        // 缓存命中：不再查询路径
+        let _ = r.mouse_source_with(
+            handle(0x504),
+            || panic!("缓存命中不应再次查询路径"),
+            |_: &HidPathInfo| panic!("缓存命中不应再次查询注册表"),
+        );
+        assert_eq!(calls.get(), 1);
+        // forget_handle 失效 → 重新解析
+        r.forget_handle(handle(0x504));
+        let _ = r.mouse_source_with(
+            handle(0x504),
+            || {
+                calls.set(calls.get() + 1);
+                Some(KEYBOARD_PATH.to_string())
+            },
+            |_| Some("新名字".to_string()),
+        );
+        assert_eq!(calls.get(), 2, "forget_handle 后必须重新解析");
+    }
+
+    // ---------- collector_heap_*（DEVPLAN 堆损坏修复 §8 S1 确定性回归） ----------
     /// 构造去重的非 NUL UTF-16 序列（CJK 区，避免与终止符混淆）。
     fn cjk_units(len: usize) -> Vec<u16> {
         (0..len).map(|i| 0x4E00u16.wrapping_add(i as u16)).collect()

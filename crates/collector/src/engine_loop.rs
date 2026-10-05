@@ -11,6 +11,20 @@
 //! - **SourceRemoved / KeyboardSourcesReset**：生命周期控制事件（correctness-v2 §4.3）——
 //!   无论 paused 均执行：设备拔出清该来源按下状态（其他来源修饰位保留）、loop 重建清空
 //!   全部键盘来源；不写统计、不记 events_seen、不动 paused/shutdown。
+//! - **MouseSourceState / MouseTravel**（motion-dpi §4.3/§4.4）：运动事件，无论 paused
+//!   均处理、不增加 events_seen/按钮总量/应用键鼠次数。MouseSourceState 注册来源
+//!   （按 source_key 幂等）并落库 connected/probe/auto 状态——连接代际门控（旧代
+//!   disconnect 不得把新连接标离线；进程重启首见即接受，不与上个进程数字比较）；
+//!   MouseTravel 按 (source_key, 捕获日, dpi, origin) 桶累计（暂停过滤在采集侧按捕获
+//!   control 完成，此处无条件落库），flush 时注册来源绑定数据库 id——注册失败按
+//!   source_key 压缩保留重试，不丢 counts；与旧统计同事务、失败全回滚合桶。
+//! - **GamepadMotion / GamepadMotionDisconnected**（motion-dpi §4.3，S5）：手柄摇杆
+//!   运动事件，同样不增加 events_seen/按钮总量。每个连接×side 一个
+//!   [`StickMotionTracker`]（连接独立）；每帧前读 [`Flags::motion_control`]——当前
+//!   epoch 变化 reset 全部摇杆 tracker，捕获 epoch 与当前不一致或任一 paused 时
+//!   reset/跳过（不跨短暂停连接坐标）；产出增量按（型号, 日, side）桶累计，flush 时
+//!   绑定 device_id（型号注册失败按 DeviceKey×日×side 压缩保留）；断连/读取失败
+//!   （`GamepadMotionDisconnected`）清该连接全部 tracker。
 //! - **Foreground**：暂停时也照常处理（保持 exe 归属正确，§4.6）。事件与暂停/恢复旗标
 //!   并发时，先在 [`Aggregator::handle_event`] 入口消解未观察的沿（观察延迟至多一个心跳
 //!   [`POLL_INTERVAL`]）——否则归账区间会横跨暂停间隔、把暂停秒数记为活动秒数。
@@ -65,7 +79,13 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use clrecoder_core::day;
 use clrecoder_core::event::{AggEvent, DeviceKey, RawEvent};
+use clrecoder_core::motion::{
+    DpiOrigin, EffectiveDpi, GamepadMotionFrame, MotionConnectionId, MouseSourceDescriptor,
+    MouseSourceState, MouseTravelDelta, StickBinDelta, StickDayDelta, StickSide,
+};
+use clrecoder_engine::stick_motion::StickMotionTracker;
 use clrecoder_engine::Engine;
+use clrecoder_store::motion::{MouseMotionWrite, StickMotionWrite};
 use clrecoder_store::writer::{FlushBatch, Writer};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
@@ -99,6 +119,32 @@ struct AppAcc {
     keys: u64,
     /// 该应用内鼠标点击数
     clicks: u64,
+}
+
+/// 鼠标运动桶键（motion-dpi §4.3/§4.4）：来源（key 身份）×捕获本地日×有效 DPI 桶。
+/// 以 source_key 而非数据库 id 为键：来源注册失败时增量按 key 压缩保留、成功后
+/// flush 时绑定 id（§4.4"不丢新 counts、不重新喂旧坐标"）。
+type MotionBucketKey = (String, String, u32, DpiOrigin);
+
+/// 鼠标运动来源的登记缓存行：描述（注册入参）+ 数据库 id（None=尚未注册成功）。
+#[derive(Debug, Clone)]
+struct MouseSourceRef {
+    descriptor: MouseSourceDescriptor,
+    id: Option<i64>,
+}
+
+/// 摇杆运动桶键（motion-dpi §4.4）：型号身份×捕获本地日×摇杆侧。以 DeviceKey 而非
+/// 数据库 id 为键——型号注册失败时增量按 DeviceKey×日×side 压缩保留、成功后 flush
+/// 绑定 id（"不丢新 counts、不重新喂旧坐标"）。
+type StickBucketKey = (DeviceKey, String, StickSide);
+
+/// 摇杆运动累计（motion-dpi §4.4）：活动微秒 + 路程（R）+ 各格停留微秒。
+/// 不变量 `active_us == Σbins.dwell_us` 由 tracker 逐帧保证、累计保持。
+#[derive(Debug, Default, Clone)]
+struct StickAccum {
+    active_us: u64,
+    travel_r: f64,
+    bins: HashMap<u16, u64>,
 }
 
 /// 启动 aggregator 线程（PLAN §4.6 逐字契约）。
@@ -172,6 +218,13 @@ fn aggregate_loop(
         combos: HashMap::new(),
         apps: HashMap::new(),
         mouse_move: HashMap::new(),
+        mouse_sources: HashMap::new(),
+        mouse_connections: HashMap::new(),
+        mouse_motion: HashMap::new(),
+        motion_register_fail_streak: 0,
+        stick_trackers: HashMap::new(),
+        motion_epoch_observed: 0,
+        stick_motion: HashMap::new(),
         ledger: AppTimeLedger::new(),
         wall_now: Local::now,
         today: day::today_local(),
@@ -212,8 +265,12 @@ fn aggregate_loop(
             agg.on_pause_transition(paused, now);
         }
 
-        // shutdown：排空余事件 → 终账（暂停中则冻结区间不归账）→ 最后一批 flush → 退出
-        if flags.shutdown.load(Ordering::Acquire) {
+        // shutdown：排空余事件 → 终账（暂停中则冻结区间不归账）→ 最后一批 flush → 退出。
+        // motion-dpi §4.3.1：看到 shutdown 但生产者未 drained 时继续接收已捕获增量，
+        // drained 后才排空并最后 flush（不得提前 finish）。
+        if flags.shutdown.load(Ordering::Acquire)
+            && flags.producers_drained.load(Ordering::Acquire)
+        {
             agg.finish(rx);
             return;
         }
@@ -260,6 +317,24 @@ struct Aggregator {
     apps: HashMap<(String, String), AppAcc>,
     /// `mouse_move_daily` 桶：(device_id, day) → distance_inches
     mouse_move: HashMap<(i64, String), f64>,
+    /// 鼠标运动来源缓存：source_key → (描述, 数据库 id——None=尚未注册成功)
+    /// （motion-dpi §4.4：注册失败按 source_key 压缩保留，成功后绑定 id 再 flush）
+    mouse_sources: HashMap<String, MouseSourceRef>,
+    /// 每来源已应用的最新连接代际（§4.4 代际门：旧代状态拒绝；进程重启首见即接受）
+    mouse_connections: HashMap<String, u64>,
+    /// `mouse_motion_daily` 桶：(source_key, day, dpi, origin) → counts
+    /// （按 source_key 而非数据库 id 分桶：注册失败压缩保留，成功后 flush 绑定 id）
+    mouse_motion: HashMap<MotionBucketKey, f64>,
+    /// 鼠标来源注册连续失败次数（日志限频用）
+    motion_register_fail_streak: u64,
+    /// 摇杆 tracker：连接 → [左, 右]（motion-dpi §4.3：连接独立 tracker；暂停 epoch
+    /// 变化/断连 reset——不跨短暂停连接坐标、不跨断点连线）
+    stick_trackers: HashMap<MotionConnectionId, [StickMotionTracker; 2]>,
+    /// 摇杆已观察的控制快照 epoch（§4.3.1：当前 epoch 变化 reset 全部摇杆 tracker）
+    motion_epoch_observed: u64,
+    /// `gamepad_motion_daily`/`gamepad_heat_daily` 桶：型号×日×side → 累计
+    /// （按 DeviceKey 而非数据库 id 分桶：注册失败压缩保留，成功后 flush 绑定 id）
+    stick_motion: HashMap<StickBucketKey, StickAccum>,
     /// 前台时长的亚秒余数账本（correctness-v2 §4.4）：按 `(day, exe)` 累计不足整秒零头、
     /// 凑满整秒经 [`AppTimeLedger::account_interval`] 产出并入 `AppAcc.secs`。与统计桶
     /// 生命周期分离——flush 成功不清账、失败回并桶时也不回滚/清账（§5.3-5）。
@@ -316,6 +391,18 @@ impl Aggregator {
             // 不写统计、不记 events_seen、不动 paused/shutdown（"全局清空不能替代来源移除"）。
             AggEvent::SourceRemoved { source } => self.engine.remove_source(source),
             AggEvent::KeyboardSourcesReset => self.engine.clear_sources(),
+            // 运动事件（motion-dpi §4.1/§4.3）：无论 paused 均处理（暂停过滤在采集侧按
+            // 捕获 control 完成，已捕获为非暂停的增量无条件落库）；不增加 events_seen、
+            // 不写按钮统计、不计入应用键鼠次数。
+            AggEvent::MouseSourceState(state) => self.on_mouse_source_state(state),
+            AggEvent::MouseTravel(delta) => self.on_mouse_travel(delta),
+            // 手柄运动事件（motion-dpi §4.3，S5）：同样不增加 events_seen/按钮总量
+            AggEvent::GamepadMotion(frame) => self.on_gamepad_motion(frame),
+            AggEvent::GamepadMotionDisconnected { connection } => {
+                // 断连/读取失败/上下文重建：清该连接全部摇杆 tracker（不跨断点连线）。
+                // 未知连接为 no-op（防御兜底，绝不 panic）。
+                self.stick_trackers.remove(&connection);
+            }
         }
     }
 
@@ -369,6 +456,136 @@ impl Aggregator {
                 }
                 let Some(dev_id) = self.device_id(&device) else { return };
                 *self.mouse_move.entry((dev_id, day.clone())).or_insert(0.0) += distance_inches;
+            }
+        }
+    }
+
+    // ---------- 鼠标运动事件（motion-dpi §4.3/§4.4） ----------
+
+    /// MouseSourceState：注册来源（按 source_key 幂等）并落库状态快照。
+    ///
+    /// 连接代际门（§4.4）：旧代 disconnect 不得把新连接标离线——已应用的代际更大时
+    /// 整条拒绝；进程重启首见即接受（内存表为空，不与上个进程数字比较）。元数据非
+    /// 增量：写入失败不丢计数，约 2s 心跳会重发（§4.4"幂等写入失败可重试"）。
+    fn on_mouse_source_state(&mut self, state: MouseSourceState) {
+        let key = state.descriptor.source_key.clone();
+        if let Some(&current) = self.mouse_connections.get(&key) {
+            if state.connection.0 < current {
+                return; // 旧代状态拒绝（不回退新连接状态）
+            }
+        }
+        self.mouse_connections.insert(key.clone(), state.connection.0);
+        self.note_descriptor(&state.descriptor);
+        let Some(id) = self.mouse_source_id(&key) else { return };
+        if let Err(e) = self.writer.update_mouse_source_state(id, &state) {
+            log::warn!("鼠标来源状态写入失败（心跳会重试，不影响计数）: {e}");
+        }
+    }
+
+    /// MouseTravel：按 (source_key, 捕获日, dpi, origin) 桶累计。暂停过滤在采集侧
+    /// 按捕获 control 完成——此处无条件落库（§4.3"已捕获为非暂停的独立 counts 增量
+    /// 可落库"）。dpi×origin 配对归一到 store 约束（dpi=0 ↔ unknown）。
+    fn on_mouse_travel(&mut self, delta: MouseTravelDelta) {
+        if !(delta.counts.is_finite() && delta.counts > 0.0) {
+            return; // 防御兜底：非有限/零增量不入桶（§1 原则 3）
+        }
+        self.note_descriptor(&delta.descriptor);
+        let (dpi, origin) = match delta.dpi {
+            EffectiveDpi { value: Some(v), origin } if origin != DpiOrigin::Unknown && v > 0 => {
+                (v, origin)
+            }
+            _ => (0, DpiOrigin::Unknown),
+        };
+        *self
+            .mouse_motion
+            .entry((delta.descriptor.source_key, delta.day, dpi, origin))
+            .or_insert(0.0) += delta.counts;
+    }
+
+    // ---------- 手柄摇杆运动事件（motion-dpi §4.3/§4.4，S5） ----------
+
+    /// GamepadMotion：喂连接独立的摇杆 tracker（§4.3.1 暂停条款逐字）。
+    ///
+    /// - 每帧前读 [`Flags::motion_control`]：当前 epoch 变化 → reset **全部**摇杆
+    ///   tracker（短暂停再恢复也换代际，不跨暂停积分）；
+    /// - 捕获 epoch 与当前不一致，或任一 paused → reset/跳过该帧——不跨短暂停连接坐标；
+    /// - 其余帧喂 [左, 右] 两个 tracker（首帧仅建锚点），产出增量按（型号, 日, side）
+    ///   入桶——绑定 device_id 延后到 flush（注册失败压缩保留）。
+    fn on_gamepad_motion(&mut self, frame: GamepadMotionFrame) {
+        let current = self.flags.motion_control();
+        if current.epoch != self.motion_epoch_observed {
+            self.motion_epoch_observed = current.epoch;
+            self.stick_trackers.clear();
+        }
+        if frame.control.epoch != current.epoch || frame.control.paused || current.paused {
+            self.stick_trackers.remove(&frame.connection);
+            return;
+        }
+        let mut deltas: Vec<StickDayDelta> = Vec::new();
+        {
+            let pair = self
+                .stick_trackers
+                .entry(frame.connection)
+                .or_insert_with(|| [StickMotionTracker::new(), StickMotionTracker::new()]);
+            deltas.extend(pair[0].feed(frame.stamp, StickSide::Left, frame.left));
+            deltas.extend(pair[1].feed(frame.stamp, StickSide::Right, frame.right));
+        }
+        for delta in deltas {
+            self.accumulate_stick(&frame.device, delta);
+        }
+    }
+
+    /// 摇杆增量入桶（型号×捕获日×side）。tracker 保证增量有限非负且
+    /// `active_us == Σbins.dwell_us`；累计保持该不变量（dwell=0 的格不入桶）。
+    fn accumulate_stick(&mut self, device: &DeviceKey, delta: StickDayDelta) {
+        let entry = self
+            .stick_motion
+            .entry((device.clone(), delta.day, delta.side))
+            .or_default();
+        entry.active_us = entry.active_us.saturating_add(delta.active_us);
+        entry.travel_r += delta.travel_r;
+        for b in delta.bins {
+            if b.dwell_us > 0 {
+                *entry.bins.entry(b.bin).or_insert(0) += b.dwell_us;
+            }
+        }
+    }
+
+    /// 登记来源描述（首次见到时缓存；注册/绑定延后到 flush）。
+    fn note_descriptor(&mut self, descriptor: &MouseSourceDescriptor) {
+        self.mouse_sources
+            .entry(descriptor.source_key.clone())
+            .or_insert_with(|| MouseSourceRef { descriptor: descriptor.clone(), id: None });
+    }
+
+    /// source_key → 数据库 id（缓存命中零 SQL）。注册失败限频记录并返回 None——
+    /// 增量按 source_key 压缩保留在桶内，注册成功后的 flush 再绑定（§4.4）。
+    fn mouse_source_id(&mut self, source_key: &str) -> Option<i64> {
+        if let Some(r) = self.mouse_sources.get(source_key) {
+            if let Some(id) = r.id {
+                return Some(id);
+            }
+        }
+        let descriptor = self.mouse_sources.get(source_key)?.descriptor.clone();
+        match self.writer.register_mouse_source(&descriptor) {
+            Ok(id) => {
+                self.motion_register_fail_streak = 0;
+                if let Some(r) = self.mouse_sources.get_mut(source_key) {
+                    r.id = Some(id);
+                }
+                Some(id)
+            }
+            Err(e) => {
+                self.motion_register_fail_streak += 1;
+                if self.motion_register_fail_streak == 1
+                    || self.motion_register_fail_streak.is_multiple_of(DEVICE_LOG_EVERY)
+                {
+                    log::error!(
+                        "鼠标运动来源注册失败（连续第 {} 次），增量按 source_key 保留重试: {e}",
+                        self.motion_register_fail_streak
+                    );
+                }
+                None
             }
         }
     }
@@ -484,13 +701,78 @@ impl Aggregator {
 
     /// 取出全部聚合桶构造 [`FlushBatch`] 单事务 flush；成功清桶、失败原样合并回桶
     /// （下个 tick 重试——绝不丢计数，§4.5），日志限频。
+    ///
+    /// motion-dpi §4.4：鼠标运动增量与摇杆运动增量同旧统计**同一个事务**——任何部分
+    /// 失败全回滚、全部合回；运动行先经来源/型号注册绑定数据库 id，注册失败的 key 按
+    /// source_key / DeviceKey×日×side 压缩保留在桶内（不下批、不丢 counts），注册成功
+    /// 后随下批 flush。空批次提前返回判定纳入两类运动字段（纯摇杆热度批也必须落库）。
     fn flush_buckets(&mut self) {
         let inputs = std::mem::take(&mut self.inputs);
         let combos = std::mem::take(&mut self.combos);
         let apps = std::mem::take(&mut self.apps);
         let mouse_move = std::mem::take(&mut self.mouse_move);
-        if inputs.is_empty() && combos.is_empty() && apps.is_empty() && mouse_move.is_empty() {
+        let mouse_motion = std::mem::take(&mut self.mouse_motion);
+        let stick_motion = std::mem::take(&mut self.stick_motion);
+        if inputs.is_empty()
+            && combos.is_empty()
+            && apps.is_empty()
+            && mouse_move.is_empty()
+            && mouse_motion.is_empty()
+            && stick_motion.is_empty()
+        {
             return; // 不脏：无写库（§4.6"若脏"）
+        }
+        // 来源注册 + 行装配：解析成功的进批次（行与桶键同行携带，便于失败整桶回并），
+        // 失败的压缩保留（重试后再绑定）
+        let mut rows: Vec<(MotionBucketKey, MouseMotionWrite)> =
+            Vec::with_capacity(mouse_motion.len());
+        let mut kept = HashMap::new();
+        for (key, counts) in mouse_motion {
+            match self.mouse_source_id(&key.0) {
+                Some(id) => rows.push((
+                    key.clone(),
+                    MouseMotionWrite {
+                        source_id: id,
+                        day: key.1.clone(),
+                        dpi: key.2,
+                        origin: key.3,
+                        counts,
+                    },
+                )),
+                None => {
+                    kept.insert(key, counts);
+                }
+            }
+        }
+        // 摇杆行装配（型号注册 + bins 按格号升序装配，确定性批序）
+        let mut stick_rows: Vec<(StickBucketKey, StickMotionWrite)> =
+            Vec::with_capacity(stick_motion.len());
+        let mut stick_kept: HashMap<StickBucketKey, StickAccum> = HashMap::new();
+        for (key, acc) in stick_motion {
+            match self.device_id(&key.0) {
+                Some(id) => {
+                    let mut bins: Vec<StickBinDelta> = acc
+                        .bins
+                        .iter()
+                        .map(|(bin, dwell_us)| StickBinDelta { bin: *bin, dwell_us: *dwell_us })
+                        .collect();
+                    bins.sort_by_key(|b| b.bin);
+                    stick_rows.push((
+                        key.clone(),
+                        StickMotionWrite {
+                            device_id: id,
+                            day: key.1.clone(),
+                            side: key.2,
+                            active_us: acc.active_us,
+                            travel_r: acc.travel_r,
+                            bins,
+                        },
+                    ));
+                }
+                None => {
+                    stick_kept.insert(key, acc);
+                }
+            }
         }
         let batch = FlushBatch {
             input: inputs
@@ -509,6 +791,8 @@ impl Aggregator {
                 .iter()
                 .map(|((dev, d), inches)| (*dev, d.clone(), *inches))
                 .collect(),
+            mouse_motion: rows.iter().map(|(_, w)| w.clone()).collect(),
+            stick_motion: stick_rows.iter().map(|(_, w)| w.clone()).collect(),
         };
         if let Err(e) = self.writer.flush(&batch) {
             self.flush_fail_streak += 1;
@@ -528,8 +812,38 @@ impl Aggregator {
                 apps,
                 mouse_move,
             );
+            // 运动行合回（同键压缩累计）：已装配行与注册失败保留的 kept 都不丢
+            for (key, w) in rows {
+                *self.mouse_motion.entry(key).or_insert(0.0) += w.counts;
+            }
+            for (key, counts) in kept {
+                *self.mouse_motion.entry(key).or_insert(0.0) += counts;
+            }
+            for (key, w) in stick_rows {
+                let entry = self.stick_motion.entry(key).or_default();
+                entry.active_us = entry.active_us.saturating_add(w.active_us);
+                entry.travel_r += w.travel_r;
+                for b in w.bins {
+                    if b.dwell_us > 0 {
+                        *entry.bins.entry(b.bin).or_insert(0) += b.dwell_us;
+                    }
+                }
+            }
+            for (key, acc) in stick_kept {
+                let entry = self.stick_motion.entry(key).or_default();
+                entry.active_us = entry.active_us.saturating_add(acc.active_us);
+                entry.travel_r += acc.travel_r;
+                for (bin, dwell_us) in acc.bins {
+                    if dwell_us > 0 {
+                        *entry.bins.entry(bin).or_insert(0) += dwell_us;
+                    }
+                }
+            }
         } else {
             self.flush_fail_streak = 0;
+            // 成功：注册失败保留的部分继续留在桶内（下个 tick 重试绑定）
+            self.mouse_motion = kept;
+            self.stick_motion = stick_kept;
         }
     }
 
@@ -582,6 +896,10 @@ mod tests {
 
     use clrecoder_core::codes::{mods, DeviceKind};
     use clrecoder_core::event::InputSourceId;
+    use clrecoder_core::motion::{
+        local_day_from_unix_us, GamepadMotionFrame, MotionConnectionId, MotionControlSnapshot,
+        MotionStamp, StickPoint, StickSide,
+    };
 
     // ---------------- correctness-v2 §4.4：前台时长 ledger 接线（S4/F4） ----------------
     //
@@ -967,6 +1285,13 @@ mod tests {
             combos: HashMap::new(),
             apps: HashMap::new(),
             mouse_move: HashMap::new(),
+            mouse_sources: HashMap::new(),
+            mouse_connections: HashMap::new(),
+            mouse_motion: HashMap::new(),
+            motion_register_fail_streak: 0,
+            stick_trackers: HashMap::new(),
+            motion_epoch_observed: 0,
+            stick_motion: HashMap::new(),
             ledger: AppTimeLedger::new(),
             wall_now: wall_noon,
             today: day::today_local(),
@@ -1343,6 +1668,492 @@ mod tests {
         assert_eq!(agg.mouse_move, mouse_move_before, "生命周期事件不得写 mouse_move 桶");
         // 已入桶计数保持不变（幂等引用：dev_id 桶仍存在）
         assert_eq!(agg.inputs.get(&(dev_id, day::today_local(), 0x1E)), Some(&1));
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    // ---------------- motion-dpi §4.3/§4.4：鼠标运动事件消费 ----------------
+
+    const MOTION_DAY: &str = "2026-09-28";
+
+    /// 合成鼠标来源描述（§8：唯一 key，不与真实/未知桶冲突）。
+    fn motion_descriptor(key: &str) -> MouseSourceDescriptor {
+        MouseSourceDescriptor {
+            source_key: key.to_string(),
+            model: DeviceKey {
+                kind: DeviceKind::Mouse,
+                vid: 0x046D,
+                pid: 0xC08B,
+                name: "测试鼠标".to_string(),
+            },
+            interface_path: None,
+            physical: true,
+        }
+    }
+
+    fn travel(descriptor: &MouseSourceDescriptor, counts: f64, dpi: u32) -> AggEvent {
+        AggEvent::MouseTravel(MouseTravelDelta {
+            descriptor: descriptor.clone(),
+            connection: MotionConnectionId(1),
+            day: MOTION_DAY.to_string(),
+            counts,
+            dpi: if dpi == 0 {
+                EffectiveDpi { value: None, origin: DpiOrigin::Unknown }
+            } else {
+                EffectiveDpi { value: Some(dpi), origin: DpiOrigin::Manual }
+            },
+            control: MotionControlSnapshot { epoch: 0, paused: false },
+        })
+    }
+
+    /// 运动事件不增加 events_seen、不写按钮/应用统计（§4.1：生命周期/运动不是按钮事件）。
+    #[test]
+    fn motion_dpi_motion_events_do_not_touch_status_or_button_buckets() {
+        let (mut agg, db) = agg_with_frozen_cursor("motion-status", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let desc = motion_descriptor("k1");
+        agg.handle_event(travel(&desc, 100.0, 800));
+        agg.handle_event(AggEvent::MouseSourceState(MouseSourceState {
+            descriptor: desc.clone(),
+            connection: MotionConnectionId(1),
+            connected: true,
+            stamp: MotionStamp { mono_us: 0, unix_us: 0 },
+            probe_status: clrecoder_core::motion::DpiProbeStatus::Pending,
+            auto_dpi: None,
+            auto_valid_until_unix_us: None,
+        }));
+        assert_eq!(
+            agg.status.events_seen.load(Ordering::Relaxed),
+            0,
+            "运动事件不得增加 events_seen"
+        );
+        assert!(agg.inputs.is_empty() && agg.combos.is_empty() && agg.apps.is_empty());
+        assert!(agg.mouse_move.is_empty(), "运动事件不得写旧 mouse_move 桶");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// MouseTravel 按 (source_key, 日, dpi, origin) 桶累计；flush 注册来源绑定 id 并清桶；
+    /// 同键再送再 flush 继续累加（写库累加语义由 store 侧覆盖，此处锚定桶级装配）。
+    #[test]
+    fn motion_dpi_mouse_travel_accumulates_by_key_and_flush_binds_source_id() {
+        let (mut agg, db) = agg_with_frozen_cursor("motion-flush", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let desc = motion_descriptor("k1");
+        // 同桶两笔（800）+ 异桶两笔（1600、unknown 400）
+        agg.handle_event(travel(&desc, 500.0, 800));
+        agg.handle_event(travel(&desc, 300.0, 800));
+        agg.handle_event(travel(&desc, 1600.0, 1600));
+        agg.handle_event(travel(&desc, 400.0, 0));
+        let key800 = ("k1".to_string(), MOTION_DAY.to_string(), 800u32, DpiOrigin::Manual);
+        let key1600 = ("k1".to_string(), MOTION_DAY.to_string(), 1600u32, DpiOrigin::Manual);
+        let key_unknown = ("k1".to_string(), MOTION_DAY.to_string(), 0u32, DpiOrigin::Unknown);
+        assert_eq!(agg.mouse_motion[&key800], 800.0, "同桶累计");
+        assert_eq!(agg.mouse_motion[&key1600], 1600.0);
+        assert_eq!(agg.mouse_motion[&key_unknown], 400.0, "unknown 桶编码 dpi=0");
+
+        agg.flush_buckets();
+        assert!(agg.mouse_motion.is_empty(), "成功 flush 后清桶");
+        let id = agg.mouse_sources["k1"].id.expect("注册成功必须绑定数据库 id");
+        assert!(id >= 1);
+        assert_eq!(agg.flush_fail_streak, 0);
+
+        // 同键再送：绑定的 id 复用（缓存命中，不再注册）
+        agg.handle_event(travel(&desc, 100.0, 800));
+        agg.flush_buckets();
+        assert_eq!(agg.mouse_sources["k1"].id, Some(id), "来源 id 缓存复用");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// flush 失败（§8.3 手法：ghost 输入行令事务失败）→ 运动桶整批合回（同键压缩累计），
+    /// 清除标记重试后成功清桶——注册成功的行不丢 counts、不重复提交。
+    #[test]
+    fn motion_dpi_flush_failure_merges_motion_bucket_back_and_retry_succeeds() {
+        let (mut agg, db) = agg_with_frozen_cursor("motion-rollback", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let desc = motion_descriptor("k1");
+        agg.handle_event(travel(&desc, 800.0, 800));
+        // ghost 标记：输入桶引用不存在的 device_id → 外键事务失败（§8.3 允许手法）
+        let ghost = 7_654_321i64;
+        agg.inputs.insert((ghost, MOTION_DAY.to_string(), 0x1E), 1);
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 1, "ghost 标记必须令事务失败");
+        let key800 = ("k1".to_string(), MOTION_DAY.to_string(), 800u32, DpiOrigin::Manual);
+        assert_eq!(agg.mouse_motion[&key800], 800.0, "运动桶必须整批合回");
+        // 清除标记重试：成功清桶
+        agg.inputs.remove(&(ghost, MOTION_DAY.to_string(), 0x1E));
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 0);
+        assert!(agg.mouse_motion.is_empty(), "重试成功后清桶");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 暂停期间到达的 MouseTravel 照常落库（§4.3：已捕获为非暂停的独立 counts 增量
+    /// 可落库——暂停过滤在采集侧按捕获 control 完成，aggregator 不按当前暂停态丢弃）。
+    #[test]
+    fn motion_dpi_travel_lands_while_paused() {
+        let (mut agg, db) = agg_with_frozen_cursor("motion-paused", Duration::ZERO);
+        // 模拟暂停（§4.3.1：selftest 场景统一经 set_paused 携带代际）
+        agg.flags.set_paused(true);
+        let desc = motion_descriptor("k1");
+        agg.handle_event(travel(&desc, 250.0, 1600));
+        let key = ("k1".to_string(), MOTION_DAY.to_string(), 1600u32, DpiOrigin::Manual);
+        assert_eq!(agg.mouse_motion[&key], 250.0, "捕获为非暂停的增量必须落库");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 连接代际门（§4.4）：旧代 disconnect 不得把新连接标离线——
+    /// 先应用新代际（connected），再来的旧代断连状态整条拒绝。
+    #[test]
+    fn motion_dpi_stale_generation_state_is_rejected() {
+        let (mut agg, db) = agg_with_frozen_cursor("motion-generation", Duration::ZERO);
+        let desc = motion_descriptor("k1");
+        let state_of = |connection: u64, connected: bool| MouseSourceState {
+            descriptor: desc.clone(),
+            connection: MotionConnectionId(connection),
+            connected,
+            stamp: MotionStamp { mono_us: 0, unix_us: 0 },
+            probe_status: clrecoder_core::motion::DpiProbeStatus::Disconnected,
+            auto_dpi: None,
+            auto_valid_until_unix_us: None,
+        };
+        // 新连接（代际 6）在线状态：接受并应用
+        agg.on_mouse_source_state(state_of(6, true));
+        assert_eq!(agg.mouse_connections["k1"], 6);
+        // 旧代（代际 5）断连：拒绝——代际表不回退
+        agg.on_mouse_source_state(state_of(5, false));
+        assert_eq!(agg.mouse_connections["k1"], 6, "旧代状态不得回退代际表");
+        // 更新代际（7）：接受
+        agg.on_mouse_source_state(state_of(7, false));
+        assert_eq!(agg.mouse_connections["k1"], 7);
+        // 进程首见即接受（不与既有数字比较方向的另一侧：更小首见值也接受）
+        let (mut agg2, db2) = agg_with_frozen_cursor("motion-generation-first", Duration::ZERO);
+        agg2.on_mouse_source_state(state_of(3, true));
+        assert_eq!(agg2.mouse_connections["k1"], 3, "进程重启首见即接受");
+        drop(agg);
+        cleanup_db(&db);
+        drop(agg2);
+        cleanup_db(&db2);
+    }
+
+    // ---------------- motion-dpi §4.3：手柄摇杆运动消费（S5） ----------------
+
+    /// 基准 UTC µs：2026-06-01T00:00:00Z（帧跨度 60ms，任意真实时区下四帧同属一个本地日
+    /// ——时区偏移均为 15 分钟整数倍，不可能落在该窗口内的本地午夜 ±60ms）。
+    const GP_BASE_UNIX_US: i64 = 1_780_272_000_000_000;
+
+    /// 手柄帧的本地归属日（由 stamp 换算，与 tracker 的日归属口径一致）。
+    fn gp_day() -> String {
+        local_day_from_unix_us(GP_BASE_UNIX_US)
+            .map(day::format_day)
+            .expect("基准时刻应可换算本地日期")
+    }
+
+    /// 合成手柄设备（独立 vid/pid/name，不与真实 gilrs "Xbox Controller" 行冲突）。
+    fn pad_device() -> DeviceKey {
+        DeviceKey {
+            kind: DeviceKind::Gamepad,
+            vid: 0x045E,
+            pid: 0x028E,
+            name: "测试手柄".to_string(),
+        }
+    }
+
+    /// 构造一帧摇杆运动（stamp 单调 µs 自 GP_BASE_UNIX_US 起步进）。
+    fn gp_frame(
+        connection: u64,
+        mono_us: u64,
+        left: (f64, f64),
+        right: (f64, f64),
+        control: MotionControlSnapshot,
+    ) -> AggEvent {
+        AggEvent::GamepadMotion(GamepadMotionFrame {
+            device: pad_device(),
+            connection: MotionConnectionId(connection),
+            stamp: MotionStamp { mono_us, unix_us: GP_BASE_UNIX_US + mono_us as i64 },
+            left: StickPoint { x: left.0, y: left.1 },
+            right: StickPoint { x: right.0, y: right.1 },
+            control,
+        })
+    }
+
+    /// 取某侧摇杆桶（None=该侧无任何增量）。
+    fn stick_side_bucket(agg: &Aggregator, side: StickSide) -> Option<&StickAccum> {
+        agg.stick_motion.iter().find(|(k, _)| k.2 == side).map(|(_, a)| a)
+    }
+
+    /// 验收点：(0.5,0.5) 中心出发 ≈0.707107R——中心锚点后一帧 (0.5,0.5) 的欧氏路程。
+    #[test]
+    fn motion_dpi_gamepad_center_to_half_half_travels_0_707107() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-half-half", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(gp_frame(1, 0, (0.0, 0.0), (0.0, 0.0), MotionControlSnapshot::default()));
+        agg.handle_event(gp_frame(
+            1,
+            20_000,
+            (0.5, 0.5),
+            (0.0, 0.0),
+            MotionControlSnapshot::default(),
+        ));
+        let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+        assert!(
+            (left.travel_r - 0.5f64.hypot(0.5)).abs() < 1e-9,
+            "(0.5,0.5) 中心出发应 ≈0.707107R，实际 {}",
+            left.travel_r
+        );
+        assert_eq!(left.active_us, 0, "[中心, (0.5,0.5)) 区间静止，无停留");
+        assert!(left.bins.is_empty(), "静止区间不产出停留格");
+        assert!(stick_side_bucket(&agg, StickSide::Right).is_none(), "右摇杆全程中性无桶");
+        assert_eq!(agg.stick_motion.len(), 1, "桶按 side 分立");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 验收点：原始 (1,1)（半径 >1）径向规范为 1R——不逐轴硬压对角。
+    #[test]
+    fn motion_dpi_gamepad_raw_one_one_radially_normalized_to_1r() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-one-one", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(gp_frame(1, 0, (0.0, 0.0), (0.0, 0.0), MotionControlSnapshot::default()));
+        agg.handle_event(gp_frame(
+            1,
+            20_000,
+            (1.0, 1.0),
+            (0.0, 0.0),
+            MotionControlSnapshot::default(),
+        ));
+        let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+        assert!(
+            (left.travel_r - 1.0).abs() < 1e-9,
+            "原始 (1,1) 径向规范后应为 1R，实际 {}",
+            left.travel_r
+        );
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 验收点：静止连续帧保持时间——固定点逐帧累计停留（保持帧产生热度）、行程 0。
+    #[test]
+    fn motion_dpi_gamepad_static_consecutive_frames_keep_time() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-static", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        for i in 0..4u64 {
+            agg.handle_event(gp_frame(
+                1,
+                i * 20_000,
+                (1.0, 0.0),
+                (0.0, 0.0),
+                MotionControlSnapshot::default(),
+            ));
+        }
+        let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+        assert_eq!(left.active_us, 60_000, "3 个 20ms 保持区间全部累计");
+        assert!((left.travel_r).abs() < 1e-12, "固定点不得增加行程");
+        assert_eq!(left.bins.get(&324), Some(&60_000), "满幅右 = row12×col24 = 324");
+        assert_eq!(left.bins.len(), 1, "停留只落实际采样格");
+        assert!(stick_side_bucket(&agg, StickSide::Right).is_none(), "右摇杆全程中性");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 验收点：20ms 两帧间短暂停再恢复不跨段——当前 epoch 变化 reset 全部 tracker，
+    /// 恢复首帧仅重锚（即使坐标跳到对侧）；捕获 epoch 与当前不一致或捕获 paused
+    /// 的帧 reset/跳过。
+    #[test]
+    fn motion_dpi_gamepad_pause_between_20ms_frames_does_not_cross() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-pause-cross", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let active = MotionControlSnapshot { epoch: 0, paused: false };
+        agg.handle_event(gp_frame(1, 0, (1.0, 0.0), (0.0, 0.0), active));
+        agg.handle_event(gp_frame(1, 20_000, (1.0, 0.0), (0.0, 0.0), active));
+        // 20ms 两帧之间真实暂停又恢复（selftest/生产同款合法入口 set_paused）：
+        // epoch 0→1→2，短暂停也换代际
+        agg.flags.set_paused(true);
+        agg.flags.set_paused(false);
+        // 恢复后首帧：tracker 已被当前 epoch 变化 reset——坐标跳到对侧也不画 2R 连线
+        let resumed = MotionControlSnapshot { epoch: 2, paused: false };
+        agg.handle_event(gp_frame(1, 40_000, (-1.0, 0.0), (0.0, 0.0), resumed));
+        {
+            let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+            assert!(left.travel_r.abs() < 1e-12, "短暂停不得跨段连线：{}", left.travel_r);
+            assert_eq!(left.active_us, 20_000, "暂停区间不补停留");
+            assert_eq!(left.bins.get(&324), Some(&20_000), "暂停前停留保持");
+            assert!(!left.bins.contains_key(&300), "恢复后首帧仅重锚，不积分");
+        }
+        // 恢复后正常积分：对侧格 20ms
+        agg.handle_event(gp_frame(1, 60_000, (-1.0, 0.0), (0.0, 0.0), resumed));
+        {
+            let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+            assert_eq!(left.active_us, 40_000);
+            assert_eq!(left.bins.get(&300), Some(&20_000));
+            assert!(left.travel_r.abs() < 1e-12);
+        }
+        // 捕获 epoch 与当前不一致（旧捕获的迟到帧）→ reset/跳过
+        agg.handle_event(gp_frame(
+            1,
+            80_000,
+            (-1.0, 0.0),
+            (0.0, 0.0),
+            MotionControlSnapshot { epoch: 1, paused: false },
+        ));
+        // 捕获 paused 的帧 → 同样 reset/跳过
+        agg.handle_event(gp_frame(
+            1,
+            100_000,
+            (-1.0, 0.0),
+            (0.0, 0.0),
+            MotionControlSnapshot { epoch: 2, paused: true },
+        ));
+        // 两次跳过后正常帧仅重锚：无跨跳过帧的积分或连线
+        agg.handle_event(gp_frame(1, 120_000, (-1.0, 0.0), (0.0, 0.0), resumed));
+        {
+            let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+            assert_eq!(left.active_us, 40_000, "捕获 epoch 不一致/paused 的帧必须跳过");
+            assert!(left.travel_r.abs() < 1e-12, "跳过帧后重锚不得画线");
+        }
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 验收点：重连不连线——断连（Disconnected）清该连接 tracker，新连接首帧重锚，
+    /// 新旧连接的停留不串、跨断点无路程。
+    #[test]
+    fn motion_dpi_gamepad_reconnect_does_not_connect_lines() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-reconnect", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(gp_frame(1, 0, (1.0, 0.0), (0.0, 0.0), MotionControlSnapshot::default()));
+        agg.handle_event(gp_frame(
+            1,
+            20_000,
+            (1.0, 0.0),
+            (0.0, 0.0),
+            MotionControlSnapshot::default(),
+        ));
+        agg.handle_event(AggEvent::GamepadMotionDisconnected { connection: MotionConnectionId(1) });
+        assert!(
+            !agg.stick_trackers.contains_key(&MotionConnectionId(1)),
+            "断连必须清该连接全部 tracker"
+        );
+        // 重连（新连接代际 2）：位置跳到对侧——不得与断点连线
+        agg.handle_event(gp_frame(2, 40_000, (-1.0, 0.0), (0.0, 0.0), MotionControlSnapshot::default()));
+        agg.handle_event(gp_frame(
+            2,
+            60_000,
+            (-1.0, 0.0),
+            (0.0, 0.0),
+            MotionControlSnapshot::default(),
+        ));
+        let left = stick_side_bucket(&agg, StickSide::Left).expect("左摇杆应有桶");
+        assert!(left.travel_r.abs() < 1e-12, "重连不得与断点连线：{}", left.travel_r);
+        assert_eq!(left.active_us, 40_000, "断点两侧停留各自归档");
+        assert_eq!(left.bins.get(&324), Some(&20_000), "断连前停留保持");
+        assert_eq!(left.bins.get(&300), Some(&20_000), "重连后停留归对侧格");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 验收点：motion 不增 events_seen、不写按钮/应用统计（手柄运动同鼠标运动条款）。
+    #[test]
+    fn motion_dpi_gamepad_motion_events_do_not_touch_status_or_button_buckets() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-status", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        agg.handle_event(gp_frame(1, 0, (1.0, 0.0), (0.5, 0.5), MotionControlSnapshot::default()));
+        agg.handle_event(gp_frame(
+            1,
+            20_000,
+            (1.0, 0.0),
+            (0.5, 0.5),
+            MotionControlSnapshot::default(),
+        ));
+        agg.handle_event(AggEvent::GamepadMotionDisconnected { connection: MotionConnectionId(1) });
+        assert_eq!(
+            agg.status.events_seen.load(Ordering::Relaxed),
+            0,
+            "手柄运动事件不得增加 events_seen"
+        );
+        assert!(agg.inputs.is_empty() && agg.combos.is_empty() && agg.apps.is_empty());
+        assert!(agg.mouse_move.is_empty() && agg.mouse_motion.is_empty());
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// 纯摇杆批可 flush：空批次提前返回判定纳入 stick_motion——只有保持帧产生的热度
+    /// 也必须落库（无任何旧统计的批次不得被当作"不脏"跳过）。
+    #[test]
+    fn motion_dpi_gamepad_pure_stick_batch_flushes_and_binds_device() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-pure-flush", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        for i in 0..4u64 {
+            agg.handle_event(gp_frame(
+                1,
+                i * 20_000,
+                (1.0, 0.0),
+                (0.0, 0.0),
+                MotionControlSnapshot::default(),
+            ));
+        }
+        agg.flush_buckets();
+        assert!(agg.stick_motion.is_empty(), "纯摇杆批必须写库并清桶");
+        assert_eq!(agg.flush_fail_streak, 0, "纯摇杆批不得 flush 失败");
+        assert!(agg.devices.contains_key(&pad_device()), "flush 时绑定型号 device_id");
+        // 后续保持帧再次入桶 → flush 复用同一 device_id（缓存命中）
+        agg.handle_event(gp_frame(
+            1,
+            80_000,
+            (1.0, 0.0),
+            (0.0, 0.0),
+            MotionControlSnapshot::default(),
+        ));
+        agg.flush_buckets();
+        assert!(agg.stick_motion.is_empty());
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// flush 失败（§8.3 手法：ghost 输入行令事务失败）→ 摇杆桶整批合回（同键压缩
+    /// 累计、bins 不丢），清除标记重试后成功清桶。
+    #[test]
+    fn motion_dpi_flush_failure_merges_stick_bucket_back_and_retry_succeeds() {
+        let (mut agg, db) = agg_with_frozen_cursor("gp-rollback", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        for i in 0..4u64 {
+            agg.handle_event(gp_frame(
+                1,
+                i * 20_000,
+                (1.0, 0.0),
+                (0.0, 0.0),
+                MotionControlSnapshot::default(),
+            ));
+        }
+        // ghost 标记：输入桶引用不存在的 device_id → 外键事务失败（§8.3 允许手法）
+        let ghost = 7_654_321i64;
+        agg.inputs.insert((ghost, gp_day(), 0x1E), 1);
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 1, "ghost 标记必须令事务失败");
+        {
+            let left = stick_side_bucket(&agg, StickSide::Left).expect("失败后摇杆桶必须合回");
+            assert_eq!(left.active_us, 60_000, "active_us 整批合回不丢");
+            assert_eq!(left.bins.get(&324), Some(&60_000), "停留格合回不丢");
+        }
+        // 清除标记重试：成功清桶
+        agg.inputs.remove(&(ghost, gp_day(), 0x1E));
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 0);
+        assert!(agg.stick_motion.is_empty(), "重试成功后清桶");
         drop(agg);
         cleanup_db(&db);
     }

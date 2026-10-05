@@ -3,11 +3,14 @@
 //! - [`schema`]：`migrate(conn)` 幂等执行 schema v1 完整 DDL（§4.5 逐字对齐），`schema_migrations` 表记录版本；
 //! - [`writer`]：collector 唯一写入口 `Writer::{open, get_or_create_device, flush(FlushBatch),
 //!   rebuild_wp_tables(WpImportBatch)}`（单事务批量 upsert，失败保留聚合桶重试、绝不 panic）；
-//! - [`reader`]：GUI 全部查询 SQL 的唯一归属（§4.5 各 query_* 函数与行类型）。
+//! - [`reader`]：GUI 全部查询 SQL 的唯一归属（§4.5 各 query_* 函数与行类型）；
+//! - [`motion`]：schema 3 运动四表的来源注册/状态心跳/手动 DPI/查询汇总/导出 SQL
+//!   （motion-dpi §4.4/§6.1；增量写入本体在 [`writer`]，与旧统计同事务）。
 //!
 //! 约束：不含业务统计逻辑；GUI 对自有统计表只读（仅导入写 wp_* 表）。
 //! 内部行类型不做 camelCase——GUI DTO 的 `#[serde(rename_all="camelCase")]` 映射在 src-tauri 侧完成（§4.7）。
 
+pub mod motion;
 pub mod reader;
 pub mod schema;
 pub mod writer;
@@ -32,6 +35,16 @@ pub enum StoreError {
     /// `devices.kind` 列出现契约外的值（库损坏或被外部改写）。
     #[error("未知设备种类: {0}")]
     UnknownDeviceKind(String),
+    /// 运动计数值（REAL 列）出现 NaN/Inf/负数——§6.1 要求 Rust 先行校验、不只依赖 CHECK 拒绝。
+    #[error("运动计数值非法（须为有限非负数）: {0}")]
+    InvalidMotionCount(f64),
+    /// 运动字段超出 schema v3 CHECK 合同（DPI 范围/dpi×origin 配对/bin 格号等；
+    /// 正常采集不产生，防御性报错并整批回滚）。
+    #[error("运动字段超出合同范围: {0}")]
+    InvalidMotionField(String),
+    /// 查询/配置引用了不存在的鼠标运动来源 id（motion-dpi §4.5"未知 sourceId 返回错误"）。
+    #[error("未知鼠标运动来源 id: {0}")]
+    UnknownMouseSource(i64),
 }
 
 /// store 统一 Result 别名。

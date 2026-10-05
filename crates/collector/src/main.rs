@@ -8,10 +8,13 @@
 //!    必要 Info 走显式代码（`service.started` / `service.stopped`）；sink 失败明确
 //!    stderr-only 降级，日志绝不成为业务失败来源；
 //! 3. 打开/迁移统计库 `%LOCALAPPDATA%\ClRecoder\stats.db`（WAL；打开失败 → 日志 + 退出码非 0，§5.3）；
-//! 4. 起 raw_input / gamepad / apps 三采集线程 + aggregator（engine_loop）+ pipe 服务端
+//! 4. 起 raw_input / gamepad / apps 三采集线程 + MotionRuntime（时钟/连接代际/DPI 协调
+//!    worker，motion-dpi §4.3）+ aggregator（engine_loop）+ pipe 服务端
 //!    （`\\.\pipe\clrecoder-control`，status / set_paused / shutdown 经共享 [`Flags`] 生效）；
-//! 5. 常驻等 `shutdown`（pipe 命令置位）→ join aggregator（排空 + 终账 + 最后一批 flush）
-//!    → join pipe 服务 → 退出。
+//! 5. 常驻等 `shutdown`（pipe 命令置位）→ §4.3.1 退出序：producer_stop → raw_input
+//!    stop_and_join（排尾桶）→ gamepad 确定性 join（按钮+摇杆同线程，producer_stop
+//!    检查，S5）→ 停 DPI 协调 worker → producers_drained → join aggregator（排空 +
+//!    终账 + 最后一批 flush）→ join pipe 服务 → 退出。
 //!
 //! 日志初始化按运行模式分派（§4.1 先解析 mode）：生产 Run 不初始化旧 env_logger；
 //! selftest 单独沿用既有 stderr logger；Version/Help 不碰任何日志。
@@ -28,9 +31,17 @@ mod apps;
 mod device;
 mod engine_loop;
 mod gamepad;
+// S3（motion-dpi §4.3）：只读 HID++ DPI provider 的协议层与传输层。
+// S4 接线：DPI 协调 worker（mouse_dpi）与运动运行时（motion_runtime）。
+mod hidpp_dpi;
+mod hid_transport;
 mod ipc_server;
+mod mouse_dpi;
+mod motion_runtime;
 mod raw_input;
 mod selftest;
+// S5（motion-dpi §4.3）：直接 XInput 完整四轴采样（摇杆运动帧源，与 gilrs 按钮隔离）。
+mod xinput_motion;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -46,6 +57,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::apps::{EXE_UNKNOWN, FgState};
 use crate::ipc_server::{Flags, RuntimeStatus};
+use crate::motion_runtime::MotionRuntime;
 
 /// 单实例互斥体名（§5.1）。`Local\` 前缀 = 每交互会话一份——采集器按会话采集交互输入，
 /// 快速用户切换下各会话实例互不干扰（pipe 名为全局名，多会话并存属未定义部署形态）。
@@ -215,11 +227,14 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
     let status = Arc::new(RuntimeStatus::new(env!("CARGO_PKG_VERSION")));
     let fg = Arc::new(Mutex::new(FgState { exe: EXE_UNKNOWN.to_string(), since: Instant::now() }));
 
-    // 5) 事件通道 + 线程组装（§5.1 顺序：aggregator 先于采集线程就绪，事件不空跑）
+    // 5) 事件通道 + 线程组装（§5.1 顺序：aggregator 先于采集线程就绪，事件不空跑）。
+    //    motion-dpi §4.3：MotionRuntime（时钟/连接代际/DPI worker）先于采集线程就绪；
+    //    DPI 协调 worker 经 MotionRuntime::start 附带启动（offline 模式仅 selftest）。
     let (tx, rx) = crossbeam_channel::unbounded::<AggEvent>();
     let aggregator = engine_loop::spawn(rx, Arc::clone(&writer), Arc::clone(&flags), Arc::clone(&fg), Arc::clone(&status));
-    let _raw_input = raw_input::spawn(tx.clone());
-    let _gamepad = gamepad::spawn(tx.clone());
+    let motion = MotionRuntime::start(Arc::clone(&writer), Arc::clone(&flags), tx.clone());
+    let raw_input_runner = raw_input::spawn(tx.clone(), Arc::clone(&motion));
+    let gamepad_handle = gamepad::spawn(tx.clone(), Arc::clone(&motion));
     let _apps = apps::spawn(tx, Arc::clone(&fg));
     let ipc = ipc_server::spawn(Arc::clone(&flags), Arc::clone(&status));
     // 显式 Info 事件代码（§4.1 受控类别）：service.started——有界日志的启动锚点
@@ -237,8 +252,26 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
         std::thread::sleep(SHUTDOWN_POLL);
     }
 
-    // 7) 收尾：aggregator 排空余事件 → 前台秒数终账 → 最后一批 flush → 退出；
-    //    pipe 服务线程随 shutdown 旗标退出。两者都 join（丢尾批 ≤0.5s 属 §5.3 已接受损耗）。
+    // 7) 收尾（motion-dpi §4.3.1 退出序，S5 后全序生效）：producer_stop → raw_input
+    //    stop_and_join（自有消息线程 WM_QUIT → 窗口线程排出已捕获尾桶并退出）→ gamepad
+    //    确定性 join（gilrs 按钮 + 直接 XInput 摇杆采样同线程，轮询/init 重试均检查
+    //    producer_stop，≤~10ms 退出）→ 停 DPI 协调 worker → 全部生产者停止后发布
+    //    producers_drained → aggregator 排空并最后 flush → pipe 服务线程退出。
+    flags.producer_stop.store(true, Ordering::Release);
+    if raw_input_runner.stop_and_join().is_err() {
+        log::error!("raw_input 生产者线程异常退出（已捕获 join 错误，进入已终止生产者的收尾）");
+    }
+    // gamepad 生产者：S5 起轮询循环检查 producer_stop——此处确定性 join，不再依赖宽限期；
+    // 线程 panic 时 join 返回 Err，写诊断并进入已终止生产者的收尾（§4.3.1：绝不因运动
+    // 线程已 panic 永远等待）。
+    if gamepad_handle.join().is_err() {
+        log::error!("gamepad 生产者线程异常退出（已捕获 join 错误，进入已终止生产者的收尾）");
+    }
+    // 停 DPI 协调 worker：只发停止信号，不等待挂起的原生 IO（执行槽资源由存活线程
+    // 持有到 IO 收尾或进程正常退出，§4.3）；该 slot 不持有 Writer 锁、不阻挡最终 flush。
+    motion.stop_worker();
+    // 全部生产者停止 → 发布 drained：aggregator 排空余事件 → 终账 → 最后一批 flush
+    flags.producers_drained.store(true, Ordering::Release);
     let _ = aggregator.join();
     // join 前自连唤醒兜底：worker 在置位与唤醒之间出意外时，accept 可能仍阻塞在
     // ConnectNamedPipe；反复 prod_pipe 直到 accept 线程结束，再 join。
