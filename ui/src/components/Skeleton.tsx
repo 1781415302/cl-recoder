@@ -6,15 +6,34 @@ interface SkeletonProps {
 }
 
 export function Skeleton({ w = "100%", h = "14px", style }: SkeletonProps) {
-  return <div className="skeleton" style={{ width: w, height: h, ...style }} aria-hidden="true" />;
+  return (
+    <div
+      className="skeleton"
+      style={{ width: w, height: h, ...style }}
+      aria-hidden="true"
+    />
+  );
 }
 
 /** 卡片级骨架：标题 + 若干行 */
-export function SkeletonCard({ rows = 4, height }: { rows?: number; height?: string }) {
+export function SkeletonCard({
+  rows = 4,
+  height,
+}: {
+  rows?: number;
+  height?: string;
+}) {
   return (
     <div className="card" role="status" aria-label="加载中">
       <Skeleton w="40%" h="18px" />
-      <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)", marginTop: "var(--space-4)" }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "var(--space-3)",
+          marginTop: "var(--space-4)",
+        }}
+      >
         {Array.from({ length: rows }, (_, i) => (
           <Skeleton key={i} h={height ?? "14px"} w={`${92 - i * 9}%`} />
         ))}

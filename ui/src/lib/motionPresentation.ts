@@ -28,14 +28,19 @@ export interface HeatCell {
 /** 热力格序列（§4.6）：输入恰 625 个秒数与页面两侧共同最大值，输出恰 625 个单元。
  *  秒数原值透传不做任何换算/排序/缩放（仅 intensity 参与图形）；输入不是 625 格属于上游合同错误——
  *  抛中文错误由测试捕获，绝不补造数据填充。 */
-export function heatCells(dwellSeconds: readonly number[], scaleMaxSeconds: number): HeatCell[] {
+export function heatCells(
+  dwellSeconds: readonly number[],
+  scaleMaxSeconds: number,
+): HeatCell[] {
   if (dwellSeconds.length !== STICK_GRID * STICK_GRID) {
     throw new Error(
       `热力数据必须恰好 ${STICK_GRID * STICK_GRID} 格（25×25 行主序），实际 ${dwellSeconds.length} 格——上游合同错误，不补造数据`,
     );
   }
   const scale =
-    typeof scaleMaxSeconds === "number" && Number.isFinite(scaleMaxSeconds) && scaleMaxSeconds > 0
+    typeof scaleMaxSeconds === "number" &&
+    Number.isFinite(scaleMaxSeconds) &&
+    scaleMaxSeconds > 0
       ? scaleMaxSeconds
       : 0;
   const cells: HeatCell[] = [];
@@ -44,7 +49,12 @@ export function heatCells(dwellSeconds: readonly number[], scaleMaxSeconds: numb
     const col = bin % STICK_GRID;
     const row = Math.floor(bin / STICK_GRID);
     let intensity = 0;
-    if (scale > 0 && typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0) {
+    if (
+      scale > 0 &&
+      typeof seconds === "number" &&
+      Number.isFinite(seconds) &&
+      seconds > 0
+    ) {
       intensity = Math.min(1, Math.sqrt(seconds / scale));
     }
     cells.push({ bin, seconds, x: col + 0.5, y: row + 0.5, intensity });
@@ -52,15 +62,16 @@ export function heatCells(dwellSeconds: readonly number[], scaleMaxSeconds: numb
   return cells;
 }
 
-/* 热力色带两端取自 theme.css 令牌：--color-primary #0D9488 → --color-primary-hover #14B8A6
- * （青绿 → 明亮青绿的单色强度；亮度差由不透明度 0.16→1 表达，改令牌时需同步这两组 RGB）。 */
+/* 旧颜色接口保留兼容；当前圆盘使用 theme.css 的 heat 色带。 */
 const TEAL_DIM = [13, 148, 136];
 const TEAL_BRIGHT = [20, 184, 166];
 
 /** 热力单格颜色（canvas fillStyle 用）：低强度 = 深青绿低不透明度，高强度 = 明亮青绿近实心；
  *  非有限值/越界收敛到 [0,1]。返回稳定格式 "rgba(r,g,b,a)"。 */
 export function heatCellColor(intensity: number): string {
-  const t = Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity)) : 0;
+  const t = Number.isFinite(intensity)
+    ? Math.min(1, Math.max(0, intensity))
+    : 0;
   const r = Math.round(TEAL_DIM[0] + (TEAL_BRIGHT[0] - TEAL_DIM[0]) * t);
   const g = Math.round(TEAL_DIM[1] + (TEAL_BRIGHT[1] - TEAL_DIM[1]) * t);
   const b = Math.round(TEAL_DIM[2] + (TEAL_BRIGHT[2] - TEAL_DIM[2]) * t);
@@ -91,17 +102,32 @@ export const MANUAL_DPI_MAX = 100000;
 
 /** 手动 DPI 解析（§4.6）：仅十进制整数——无小数/负号/科学计数法（也拒绝全角与阿拉伯数字等非 [0-9] 形态），
  *  范围 1..100000；首尾空白容忍，前导零按数值归一。错误消息为中文，区分形态错误与范围错误。 */
-export function parseManualDpi(text: string): { ok: true; dpi: number } | { ok: false; message: string } {
+export function parseManualDpi(
+  text: string,
+): { ok: true; dpi: number } | { ok: false; message: string } {
   const trimmed = text.trim();
   if (trimmed.length === 0) {
-    return { ok: false, message: `请输入 ${MANUAL_DPI_MIN}–${MANUAL_DPI_MAX} 之间的整数 DPI` };
+    return {
+      ok: false,
+      message: `请输入 ${MANUAL_DPI_MIN}–${MANUAL_DPI_MAX} 之间的整数 DPI`,
+    };
   }
   if (!/^\d+$/.test(trimmed)) {
-    return { ok: false, message: "DPI 必须是十进制整数：不能含小数点、负号或科学计数法" };
+    return {
+      ok: false,
+      message: "DPI 必须是十进制整数：不能含小数点、负号或科学计数法",
+    };
   }
   const dpi = Number(trimmed);
-  if (!Number.isSafeInteger(dpi) || dpi < MANUAL_DPI_MIN || dpi > MANUAL_DPI_MAX) {
-    return { ok: false, message: `DPI 需在 ${MANUAL_DPI_MIN}–${MANUAL_DPI_MAX} 之间` };
+  if (
+    !Number.isSafeInteger(dpi) ||
+    dpi < MANUAL_DPI_MIN ||
+    dpi > MANUAL_DPI_MAX
+  ) {
+    return {
+      ok: false,
+      message: `DPI 需在 ${MANUAL_DPI_MIN}–${MANUAL_DPI_MAX} 之间`,
+    };
   }
   return { ok: true, dpi };
 }
@@ -115,7 +141,12 @@ export function formatCellDwell(seconds: number): string {
 /** 选中热力格占活动时间的比例（§4.6）：最多 1 位小数的百分比并 clamp 到 [0,100]；
  *  activeSeconds<=0（无活动）或秒数非有限时返回"—"。 */
 export function dwellShareText(seconds: number, activeSeconds: number): string {
-  if (!Number.isFinite(seconds) || !Number.isFinite(activeSeconds) || activeSeconds <= 0) return "—";
+  if (
+    !Number.isFinite(seconds) ||
+    !Number.isFinite(activeSeconds) ||
+    activeSeconds <= 0
+  )
+    return "—";
   const pct = Math.min(100, Math.max(0, (seconds / activeSeconds) * 100));
   return `${new Intl.NumberFormat("zh-Hans-CN", { maximumFractionDigits: 1 }).format(pct)}%`;
 }
@@ -151,8 +182,8 @@ export interface MotionCanvasSize {
 
 /** 控件图画布尺寸（px；组件固定尺寸渲染，窄容器横向滚动） */
 export const MOTION_CANVAS: Record<"mouse" | "gamepad", MotionCanvasSize> = {
-  mouse: { width: 320, height: 430 },
-  gamepad: { width: 600, height: 420 },
+  mouse: { width: 320, height: 360 },
+  gamepad: { width: 620, height: 340 },
 };
 
 /** 实际点击区域单边下限（§4.6 合同定值） */
@@ -161,41 +192,284 @@ export const MOTION_HIT_MIN_PX = 44;
 /** 中性参考鼠标：9 控件与既有码表一致——左右大面板、中键/滚轮轴居中、X1/X2 沿左侧、
  *  四个滚动方向各自成箭头控件（按下与滚动不合计）。 */
 const MOUSE_CONTROLS: MotionControlSpec[] = [
-  { code: 1, shortLabel: "左键", shape: "panel", cx: 77, cy: 94, w: 106, h: 144, hit: { x: 22, y: 20, w: 110, h: 148 } },
-  { code: 2, shortLabel: "右键", shape: "panel", cx: 243, cy: 94, w: 106, h: 144, hit: { x: 188, y: 20, w: 110, h: 148 } },
-  { code: 3, shortLabel: "中键", shape: "pill", cx: 160, cy: 208, w: 40, h: 44, hit: { x: 138, y: 184, w: 44, h: 48 } },
-  { code: 4, shortLabel: "X1", shape: "pill", cx: 46, cy: 274, w: 40, h: 40, hit: { x: 24, y: 252, w: 44, h: 44 } },
-  { code: 5, shortLabel: "X2", shape: "pill", cx: 46, cy: 326, w: 40, h: 40, hit: { x: 24, y: 304, w: 44, h: 44 } },
-  { code: 6, shortLabel: "滚轮上", shape: "arrow", dir: "up", cx: 160, cy: 44, w: 20, h: 16, hit: { x: 138, y: 20, w: 44, h: 48 } },
-  { code: 7, shortLabel: "滚轮下", shape: "arrow", dir: "down", cx: 160, cy: 150, w: 20, h: 16, hit: { x: 138, y: 128, w: 44, h: 44 } },
-  { code: 8, shortLabel: "滚轮左", shape: "arrow", dir: "left", cx: 108, cy: 208, w: 16, h: 20, hit: { x: 86, y: 184, w: 44, h: 48 } },
-  { code: 9, shortLabel: "滚轮右", shape: "arrow", dir: "right", cx: 212, cy: 208, w: 16, h: 20, hit: { x: 190, y: 184, w: 44, h: 48 } },
+  {
+    code: 1,
+    shortLabel: "左键",
+    shape: "panel",
+    cx: 86,
+    cy: 100,
+    w: 92,
+    h: 148,
+    hit: { x: 40, y: 26, w: 92, h: 148 },
+  },
+  {
+    code: 2,
+    shortLabel: "右键",
+    shape: "panel",
+    cx: 234,
+    cy: 100,
+    w: 92,
+    h: 148,
+    hit: { x: 188, y: 26, w: 92, h: 148 },
+  },
+  {
+    code: 3,
+    shortLabel: "中键",
+    shape: "pill",
+    cx: 160,
+    cy: 102,
+    w: 40,
+    h: 44,
+    hit: { x: 138, y: 80, w: 44, h: 44 },
+  },
+  {
+    code: 4,
+    shortLabel: "X1",
+    shape: "pill",
+    cx: 48,
+    cy: 226,
+    w: 40,
+    h: 40,
+    hit: { x: 26, y: 204, w: 44, h: 44 },
+  },
+  {
+    code: 5,
+    shortLabel: "X2",
+    shape: "pill",
+    cx: 48,
+    cy: 278,
+    w: 40,
+    h: 40,
+    hit: { x: 26, y: 256, w: 44, h: 44 },
+  },
+  {
+    code: 6,
+    shortLabel: "滚轮上",
+    shape: "arrow",
+    dir: "up",
+    cx: 160,
+    cy: 48,
+    w: 18,
+    h: 14,
+    hit: { x: 138, y: 26, w: 44, h: 44 },
+  },
+  {
+    code: 7,
+    shortLabel: "滚轮下",
+    shape: "arrow",
+    dir: "down",
+    cx: 160,
+    cy: 150,
+    w: 18,
+    h: 14,
+    hit: { x: 138, y: 128, w: 44, h: 44 },
+  },
+  {
+    code: 8,
+    shortLabel: "滚轮左",
+    shape: "arrow",
+    dir: "left",
+    cx: 108,
+    cy: 215,
+    w: 14,
+    h: 18,
+    hit: { x: 86, y: 193, w: 44, h: 44 },
+  },
+  {
+    code: 9,
+    shortLabel: "滚轮右",
+    shape: "arrow",
+    dir: "right",
+    cx: 212,
+    cy: 215,
+    w: 14,
+    h: 18,
+    hit: { x: 190, y: 193, w: 44, h: 44 },
+  },
 ];
 
-/** Xbox 参考手柄：17 控件与既有码表一致——顶部扳机 + 横向肩键、View/Menu/Guide 居中、
- *  圆形 ABXY（Y 上/X 左/B 右/A 下）、十字 D-pad（四臂各 44×44）、圆形 LS/RS。 */
+/** Xbox 的空间关系保留，控件与点击区域按紧凑仪器面板重新排布。 */
 const GAMEPAD_CONTROLS: MotionControlSpec[] = [
-  { code: 6, shortLabel: "LT", shape: "panel", cx: 150, cy: 26, w: 92, h: 26, hit: { x: 100, y: 4, w: 100, h: 44 } },
-  { code: 8, shortLabel: "RT", shape: "panel", cx: 450, cy: 26, w: 92, h: 26, hit: { x: 400, y: 4, w: 100, h: 44 } },
-  { code: 5, shortLabel: "LB", shape: "panel", cx: 150, cy: 76, w: 110, h: 32, hit: { x: 90, y: 53, w: 120, h: 46 } },
-  { code: 7, shortLabel: "RB", shape: "panel", cx: 450, cy: 76, w: 110, h: 32, hit: { x: 390, y: 53, w: 120, h: 46 } },
-  { code: 9, shortLabel: "View", shape: "circle", cx: 240, cy: 128, w: 26, h: 26, hit: { x: 218, y: 106, w: 44, h: 44 } },
-  { code: 11, shortLabel: "Guide", shape: "circle", cx: 300, cy: 118, w: 36, h: 36, hit: { x: 278, y: 96, w: 44, h: 44 } },
-  { code: 10, shortLabel: "Menu", shape: "circle", cx: 360, cy: 128, w: 26, h: 26, hit: { x: 338, y: 106, w: 44, h: 44 } },
-  { code: 12, shortLabel: "LS", shape: "circle", cx: 150, cy: 207, w: 72, h: 72, hit: { x: 110, y: 167, w: 80, h: 80 } },
-  { code: 13, shortLabel: "RS", shape: "circle", cx: 385, cy: 343, w: 64, h: 64, hit: { x: 349, y: 307, w: 72, h: 72 } },
-  { code: 14, shortLabel: "十字上", shape: "arrow", dir: "up", cx: 285, cy: 239, w: 18, h: 14, hit: { x: 263, y: 217, w: 44, h: 44 } },
-  { code: 15, shortLabel: "十字下", shape: "arrow", dir: "down", cx: 285, cy: 327, w: 18, h: 14, hit: { x: 263, y: 305, w: 44, h: 44 } },
-  { code: 16, shortLabel: "十字左", shape: "arrow", dir: "left", cx: 241, cy: 283, w: 14, h: 18, hit: { x: 219, y: 261, w: 44, h: 44 } },
-  { code: 17, shortLabel: "十字右", shape: "arrow", dir: "right", cx: 329, cy: 283, w: 14, h: 18, hit: { x: 307, y: 261, w: 44, h: 44 } },
-  { code: 3, shortLabel: "Y", shape: "circle", cx: 470, cy: 187, w: 40, h: 40, hit: { x: 448, y: 165, w: 44, h: 44 } },
-  { code: 4, shortLabel: "X", shape: "circle", cx: 422, cy: 235, w: 40, h: 40, hit: { x: 400, y: 213, w: 44, h: 44 } },
-  { code: 2, shortLabel: "B", shape: "circle", cx: 518, cy: 235, w: 40, h: 40, hit: { x: 496, y: 213, w: 44, h: 44 } },
-  { code: 1, shortLabel: "A", shape: "circle", cx: 470, cy: 283, w: 40, h: 40, hit: { x: 448, y: 261, w: 44, h: 44 } },
+  {
+    code: 6,
+    shortLabel: "LT",
+    shape: "panel",
+    cx: 140,
+    cy: 26,
+    w: 88,
+    h: 30,
+    hit: { x: 96, y: 4, w: 88, h: 44 },
+  },
+  {
+    code: 8,
+    shortLabel: "RT",
+    shape: "panel",
+    cx: 480,
+    cy: 26,
+    w: 88,
+    h: 30,
+    hit: { x: 436, y: 4, w: 88, h: 44 },
+  },
+  {
+    code: 5,
+    shortLabel: "LB",
+    shape: "panel",
+    cx: 140,
+    cy: 76,
+    w: 108,
+    h: 34,
+    hit: { x: 86, y: 54, w: 108, h: 44 },
+  },
+  {
+    code: 7,
+    shortLabel: "RB",
+    shape: "panel",
+    cx: 480,
+    cy: 76,
+    w: 108,
+    h: 34,
+    hit: { x: 426, y: 54, w: 108, h: 44 },
+  },
+  {
+    code: 9,
+    shortLabel: "View",
+    shape: "circle",
+    cx: 255,
+    cy: 106,
+    w: 30,
+    h: 30,
+    hit: { x: 233, y: 84, w: 44, h: 44 },
+  },
+  {
+    code: 11,
+    shortLabel: "Guide",
+    shape: "circle",
+    cx: 310,
+    cy: 95,
+    w: 38,
+    h: 38,
+    hit: { x: 288, y: 73, w: 44, h: 44 },
+  },
+  {
+    code: 10,
+    shortLabel: "Menu",
+    shape: "circle",
+    cx: 365,
+    cy: 106,
+    w: 30,
+    h: 30,
+    hit: { x: 343, y: 84, w: 44, h: 44 },
+  },
+  {
+    code: 12,
+    shortLabel: "LS",
+    shape: "circle",
+    cx: 130,
+    cy: 178,
+    w: 68,
+    h: 68,
+    hit: { x: 92, y: 140, w: 76, h: 76 },
+  },
+  {
+    code: 13,
+    shortLabel: "RS",
+    shape: "circle",
+    cx: 365,
+    cy: 258,
+    w: 64,
+    h: 64,
+    hit: { x: 329, y: 222, w: 72, h: 72 },
+  },
+  {
+    code: 14,
+    shortLabel: "十字上",
+    shape: "arrow",
+    dir: "up",
+    cx: 235,
+    cy: 184,
+    w: 18,
+    h: 14,
+    hit: { x: 213, y: 162, w: 44, h: 44 },
+  },
+  {
+    code: 15,
+    shortLabel: "十字下",
+    shape: "arrow",
+    dir: "down",
+    cx: 235,
+    cy: 272,
+    w: 18,
+    h: 14,
+    hit: { x: 213, y: 250, w: 44, h: 44 },
+  },
+  {
+    code: 16,
+    shortLabel: "十字左",
+    shape: "arrow",
+    dir: "left",
+    cx: 191,
+    cy: 228,
+    w: 14,
+    h: 18,
+    hit: { x: 169, y: 206, w: 44, h: 44 },
+  },
+  {
+    code: 17,
+    shortLabel: "十字右",
+    shape: "arrow",
+    dir: "right",
+    cx: 279,
+    cy: 228,
+    w: 14,
+    h: 18,
+    hit: { x: 257, y: 206, w: 44, h: 44 },
+  },
+  {
+    code: 3,
+    shortLabel: "Y",
+    shape: "circle",
+    cx: 485,
+    cy: 137,
+    w: 40,
+    h: 40,
+    hit: { x: 463, y: 115, w: 44, h: 44 },
+  },
+  {
+    code: 4,
+    shortLabel: "X",
+    shape: "circle",
+    cx: 437,
+    cy: 185,
+    w: 40,
+    h: 40,
+    hit: { x: 415, y: 163, w: 44, h: 44 },
+  },
+  {
+    code: 2,
+    shortLabel: "B",
+    shape: "circle",
+    cx: 533,
+    cy: 185,
+    w: 40,
+    h: 40,
+    hit: { x: 511, y: 163, w: 44, h: 44 },
+  },
+  {
+    code: 1,
+    shortLabel: "A",
+    shape: "circle",
+    cx: 485,
+    cy: 233,
+    w: 40,
+    h: 40,
+    hit: { x: 463, y: 211, w: 44, h: 44 },
+  },
 ];
 
 /** 深冻结：几何是共享纯数据，杜绝被渲染层意外改写（同 deviceLayouts 惯例） */
-function freezeControls(controls: MotionControlSpec[]): readonly MotionControlSpec[] {
+function freezeControls(
+  controls: MotionControlSpec[],
+): readonly MotionControlSpec[] {
   for (const c of controls) {
     Object.freeze(c.hit);
     Object.freeze(c);
@@ -204,13 +478,16 @@ function freezeControls(controls: MotionControlSpec[]): readonly MotionControlSp
   return controls;
 }
 
-const CONTROL_LISTS: Record<"mouse" | "gamepad", readonly MotionControlSpec[]> = {
-  mouse: freezeControls(MOUSE_CONTROLS),
-  gamepad: freezeControls(GAMEPAD_CONTROLS),
-};
+const CONTROL_LISTS: Record<"mouse" | "gamepad", readonly MotionControlSpec[]> =
+  {
+    mouse: freezeControls(MOUSE_CONTROLS),
+    gamepad: freezeControls(GAMEPAD_CONTROLS),
+  };
 
 /** 控件几何模板查找：同一 kind 恒返回同一冻结模板（只有 mouse/gamepad 有控件图） */
-export function motionControlSpecs(kind: "mouse" | "gamepad"): readonly MotionControlSpec[] {
+export function motionControlSpecs(
+  kind: "mouse" | "gamepad",
+): readonly MotionControlSpec[] {
   const list = CONTROL_LISTS[kind];
   if (!list) throw new Error(`未知控件种类: ${String(kind)}`);
   return list;
@@ -224,4 +501,6 @@ export interface MouseModelRow {
   nickname: string | null;
 }
 
-export type MouseSelection = { kind: "source"; id: number } | { kind: "model"; id: number };
+export type MouseSelection =
+  | { kind: "source"; id: number }
+  | { kind: "model"; id: number };

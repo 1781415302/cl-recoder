@@ -14,13 +14,25 @@ interface ChartTooltipProps {
   unit?: string;
 }
 
-export function ChartTooltip({ active, payload, label, unit }: ChartTooltipProps) {
+export function ChartTooltip({
+  active,
+  payload,
+  label,
+  unit,
+}: ChartTooltipProps) {
   if (!active || !payload || payload.length === 0) return null;
   return (
     <div className="chart-tooltip">
       <div style={{ fontWeight: 600, marginBottom: 2 }}>{label}</div>
       {payload.map((p, i) => (
-        <div key={i} style={{ display: "flex", gap: "var(--space-2)", justifyContent: "space-between" }}>
+        <div
+          key={i}
+          style={{
+            display: "flex",
+            gap: "var(--space-2)",
+            justifyContent: "space-between",
+          }}
+        >
           <span>{p.name}</span>
           <span className="num">
             {fmtNum(Number(p.value ?? 0))}

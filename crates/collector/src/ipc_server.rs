@@ -25,22 +25,41 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use clrecoder_core::day::now_local_rfc3339;
-use clrecoder_core::ipc::{CtlRequest, CtlResponse, StatusData, MAX_REQUEST_BYTES, PIPE_NAME};
+#[cfg(not(test))]
+use clrecoder_core::ipc::PIPE_NAME;
+use clrecoder_core::ipc::{CtlRequest, CtlResponse, StatusData, MAX_REQUEST_BYTES};
+
+// 服务端与测试客户端使用同一个进程专属名字，绝不连接正在运行的正式采集器。
+#[cfg(test)]
+static TEST_PIPE_NAME: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!(r"\\.\pipe\clrecoder-control-test-{}", std::process::id()));
+
+fn pipe_name() -> &'static str {
+    #[cfg(test)]
+    {
+        TEST_PIPE_NAME.as_str()
+    }
+    #[cfg(not(test))]
+    {
+        PIPE_NAME
+    }
+}
 use clrecoder_core::motion::MotionControlSnapshot;
-use windows::core::{Error as WError, HSTRING, HRESULT, PWSTR};
+use windows::core::{Error as WError, HRESULT, HSTRING, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, E_FAIL, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_UNICODE_TRANSLATION, ERROR_PIPE_CONNECTED,
-    GENERIC_READ, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_UNICODE_TRANSLATION,
+    ERROR_PIPE_CONNECTED, E_FAIL, GENERIC_READ, HANDLE, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
-    FlushFileBuffers, OPEN_EXISTING, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -240,7 +259,7 @@ fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
         }
     };
     let sa = &owned_sa.sa;
-    let name = HSTRING::from(PIPE_NAME);
+    let name = HSTRING::from(pipe_name());
     // FILE_FLAG_FIRST_PIPE_INSTANCE 只能加在首次创建上（此后管道已存在），用于暴露重名实例。
     let mut first_instance = true;
     loop {
@@ -324,7 +343,7 @@ fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
 /// 单次自连探测：尝试以客户端身份打开管道，成功即关闭。
 /// 供唤醒循环与 main 的 join 兜底共用。
 pub(crate) fn prod_pipe() {
-    let name = HSTRING::from(PIPE_NAME);
+    let name = HSTRING::from(pipe_name());
     // 参数对齐测试 open_client：GENERIC_READ（单边打开 duplex 管道合法）、share=0、
     // OPEN_EXISTING、FILE_FLAGS_AND_ATTRIBUTES(0)、sa=None。
     // SAFETY: name 为本函数内存活的 HSTRING；sa=None 仅用于唤醒 accept，不改变 DACL 语义。
@@ -485,7 +504,12 @@ unsafe fn build_security_attributes() -> windows::core::Result<SECURITY_ATTRIBUT
     let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     // SAFETY: sddl 在调用期间存活；psd 由系统分配，成功后由调用方 LocalFree。
     unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut psd, None)?;
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &sddl,
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )?;
     }
     if psd.0.is_null() {
         return Err(WError::from_hresult(E_FAIL));
@@ -534,7 +558,13 @@ unsafe fn token_user_sid_string(token: HANDLE) -> windows::core::Result<String> 
     let mut buf = vec![0u64; len as usize / 8 + 1];
     // SAFETY: buf 按 len 分配且在调用期间存活；TOKEN_USER 由系统写入 buf。
     unsafe {
-        GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len)?;
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )?;
     }
     // SAFETY: buf 刚被 GetTokenInformation 以 TOKEN_USER 布局写入，且容量覆盖整个结构、对齐充分。
     let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
@@ -568,21 +598,54 @@ mod tests {
     fn motion_dpi_set_paused_increments_epoch_only_on_change() {
         let flags = Flags::default();
         // 初始：epoch 0、未暂停
-        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 0, paused: false });
+        assert_eq!(
+            flags.motion_control(),
+            MotionControlSnapshot {
+                epoch: 0,
+                paused: false
+            }
+        );
         // 暂停 → epoch 1
         flags.set_paused(true);
-        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 1, paused: true });
-        assert!(flags.paused.load(Ordering::Acquire), "旧 AtomicBool 必须同步更新");
+        assert_eq!(
+            flags.motion_control(),
+            MotionControlSnapshot {
+                epoch: 1,
+                paused: true
+            }
+        );
+        assert!(
+            flags.paused.load(Ordering::Acquire),
+            "旧 AtomicBool 必须同步更新"
+        );
         // 重复暂停（状态未变）→ epoch 不变
         flags.set_paused(true);
-        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 1, paused: true });
+        assert_eq!(
+            flags.motion_control(),
+            MotionControlSnapshot {
+                epoch: 1,
+                paused: true
+            }
+        );
         // 恢复 → epoch 2（短暂停再恢复也换代际）
         flags.set_paused(false);
-        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 2, paused: false });
+        assert_eq!(
+            flags.motion_control(),
+            MotionControlSnapshot {
+                epoch: 2,
+                paused: false
+            }
+        );
         assert!(!flags.paused.load(Ordering::Acquire));
         // 重复恢复 → epoch 不变
         flags.set_paused(false);
-        assert_eq!(flags.motion_control(), MotionControlSnapshot { epoch: 2, paused: false });
+        assert_eq!(
+            flags.motion_control(),
+            MotionControlSnapshot {
+                epoch: 2,
+                paused: false
+            }
+        );
     }
 
     use windows::Win32::Foundation::{
@@ -590,15 +653,15 @@ mod tests {
     };
     use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl, ACL,
-        ACCESS_ALLOWED_ACE, PSID, SE_DACL_PROTECTED,
+        EqualSid, GetAce, GetLengthSid, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
+        DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
     };
     use windows::Win32::System::Pipes::WaitNamedPipeW;
 
-    /// pipe 名是全局唯一的：同一时刻只允许一个测试持有服务端，避免实例互相干扰。
+    /// 同一测试进程内串行使用独立管道，避免测试之间抢占。
     static SERVER_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_status() -> RuntimeStatus {
@@ -613,7 +676,7 @@ mod tests {
 
     /// 客户端连入（重试直至服务端就绪或超时），返回已连接的管道客户端句柄。
     unsafe fn open_client(deadline: Instant) -> HANDLE {
-        let name = HSTRING::from(PIPE_NAME);
+        let name = HSTRING::from(pipe_name());
         loop {
             if Instant::now() >= deadline {
                 panic!("连接管道超时（服务端未就绪）");
@@ -707,16 +770,23 @@ mod tests {
         let response = unsafe { transact(r#"{"cmd":"set_paused","paused":true}"#, deadline) }
             .expect("set_paused 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
-        assert!(flags.paused.load(Ordering::Acquire), "set_paused 必须置位 Flags.paused");
+        assert!(
+            flags.paused.load(Ordering::Acquire),
+            "set_paused 必须置位 Flags.paused"
+        );
 
         // → {"cmd":"bogus"}  ← {"ok":false,"error":"unknown command"}
         let response = unsafe { transact(r#"{"cmd":"bogus"}"#, deadline) }.expect("bogus 往返");
         assert_eq!(response, r#"{"ok":false,"error":"unknown command"}"#);
 
         // → {"cmd":"shutdown"}  ← {"ok":true,"data":null}，随后服务线程退出
-        let response = unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
+        let response =
+            unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
-        assert!(flags.shutdown.load(Ordering::Acquire), "shutdown 必须置位 Flags.shutdown");
+        assert!(
+            flags.shutdown.load(Ordering::Acquire),
+            "shutdown 必须置位 Flags.shutdown"
+        );
         server.join().expect("服务线程应随 shutdown 正常退出");
     }
 
@@ -734,29 +804,48 @@ mod tests {
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
 
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
-        assert!(response.contains(r#""paused":true"#), "status 需反映暂停状态: {response}");
-        assert!(response.contains(r#""events_seen":0"#), "尚无事件: {response}");
-        assert!(response.contains(r#""last_event_at":null"#), "尚无事件时间: {response}");
+        assert!(
+            response.contains(r#""paused":true"#),
+            "status 需反映暂停状态: {response}"
+        );
+        assert!(
+            response.contains(r#""events_seen":0"#),
+            "尚无事件: {response}"
+        );
+        assert!(
+            response.contains(r#""last_event_at":null"#),
+            "尚无事件时间: {response}"
+        );
 
         // record_event 后计数与时间戳出现（S9 engine_loop 的调用面）
         status.record_event();
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
-        assert!(response.contains(r#""events_seen":1"#), "record_event 后计数 +1: {response}");
-        assert!(!response.contains(r#""last_event_at":null"#), "record_event 后有时间戳: {response}");
+        assert!(
+            response.contains(r#""events_seen":1"#),
+            "record_event 后计数 +1: {response}"
+        );
+        assert!(
+            !response.contains(r#""last_event_at":null"#),
+            "record_event 后有时间戳: {response}"
+        );
 
         // 恢复统计
         let response = unsafe { transact(r#"{"cmd":"set_paused","paused":false}"#, deadline) }
             .expect("set_paused(false) 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
-        assert!(response.contains(r#""paused":false"#), "恢复统计: {response}");
+        assert!(
+            response.contains(r#""paused":false"#),
+            "恢复统计: {response}"
+        );
 
-        let response = unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
+        let response =
+            unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         server.join().expect("服务线程应随 shutdown 正常退出");
 
         // 服务线程退出后所有实例已关闭：管道名消失（重试窗口吸收关闭时延）
-        let name = HSTRING::from(PIPE_NAME);
+        let name = HSTRING::from(pipe_name());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             // SAFETY: 探测性打开；打开成功即说明管道仍在（测试失败），失败取错误码判断。
@@ -802,8 +891,8 @@ mod tests {
         assert_eq!(response, r#"{"ok":false,"error":"invalid request"}"#);
 
         // 已知命令但缺参数 → invalid request（不是 unknown command）
-        let response = unsafe { transact(r#"{"cmd":"set_paused"}"#, deadline) }
-            .expect("缺参 set_paused 往返");
+        let response =
+            unsafe { transact(r#"{"cmd":"set_paused"}"#, deadline) }.expect("缺参 set_paused 往返");
         assert_eq!(response, r#"{"ok":false,"error":"invalid request"}"#);
 
         // 超长行：8KB + 1 字节无换行 → 断开且无响应（读端得到空串或连接错误）
@@ -813,64 +902,69 @@ mod tests {
 
         // 服务端仍活着：正常请求可继续往返
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("恢复后 status");
-        assert!(response.contains(r#""ok":true"#), "超长断开后服务端须继续服务: {response}");
+        assert!(
+            response.contains(r#""ok":true"#),
+            "超长断开后服务端须继续服务: {response}"
+        );
 
-        let response = unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
+        let response =
+            unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         server.join().expect("服务线程应随 shutdown 正常退出");
     }
 
     /// 卡死连接不阻塞新连接：stalled 客户端连入后不发数据，后续 transact 照常成功。
-#[test]
-fn stalled_client_does_not_block_new_connections() {
-    let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let flags = Arc::new(Flags::default());
-    let status = Arc::new(test_status());
-    let server = spawn(flags.clone(), status.clone());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    #[test]
+    fn stalled_client_does_not_block_new_connections() {
+        let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let flags = Arc::new(Flags::default());
+        let status = Arc::new(test_status());
+        let server = spawn(flags.clone(), status.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
 
-    // 卡死客户端：连入后不发任何数据（worker 阻塞在 ReadFile）
-    let stalled = unsafe { open_client(deadline) };
+        // 卡死客户端：连入后不发任何数据（worker 阻塞在 ReadFile）
+        let stalled = unsafe { open_client(deadline) };
 
-    // 后续连接不受影响：status / shutdown 照常往返
-    let response =
-        unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("stall 下 status 往返");
-    assert!(
-        response.contains(r#""ok":true"#),
-        "stalled 连接不得阻塞新连接: {response}"
-    );
-
-    let response =
-        unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("stall 下 shutdown 往返");
-    assert_eq!(response, r#"{"ok":true,"data":null}"#);
-
-    // 断言完成后关闭 stalled 句柄——泄漏的服务端实例会撑住管道名，后续测试
-    // 首个 FILE_FLAG_FIRST_PIPE_INSTANCE 实例创建会永久 ERROR_ACCESS_DENIED → 连锁超时
-    // SAFETY: stalled 为本测试打开的客户端句柄。
-    unsafe {
-        let _ = CloseHandle(stalled);
-    }
-
-    // 收尾 join 用有界等待（is_finished + deadline），让回归失败表现为 fail 而非 CI 挂起
-    let join_deadline = Instant::now() + Duration::from_secs(10);
-    while !server.is_finished() {
+        // 后续连接不受影响：status / shutdown 照常往返
+        let response =
+            unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("stall 下 status 往返");
         assert!(
-            Instant::now() < join_deadline,
-            "服务线程应在 shutdown 后退出"
+            response.contains(r#""ok":true"#),
+            "stalled 连接不得阻塞新连接: {response}"
         );
-        // 生产侧同款兜底：自连唤醒 accept
-        prod_pipe();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    server.join().expect("服务线程应随 shutdown 正常退出");
-}
 
-/// 当前进程令牌的用户 SID 原始字节（自相对 SID 结构拷贝）。
+        let response =
+            unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("stall 下 shutdown 往返");
+        assert_eq!(response, r#"{"ok":true,"data":null}"#);
+
+        // 断言完成后关闭 stalled 句柄——泄漏的服务端实例会撑住管道名，后续测试
+        // 首个 FILE_FLAG_FIRST_PIPE_INSTANCE 实例创建会永久 ERROR_ACCESS_DENIED → 连锁超时
+        // SAFETY: stalled 为本测试打开的客户端句柄。
+        unsafe {
+            let _ = CloseHandle(stalled);
+        }
+
+        // 收尾 join 用有界等待（is_finished + deadline），让回归失败表现为 fail 而非 CI 挂起
+        let join_deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() {
+            assert!(
+                Instant::now() < join_deadline,
+                "服务线程应在 shutdown 后退出"
+            );
+            // 生产侧同款兜底：自连唤醒 accept
+            prod_pipe();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.join().expect("服务线程应随 shutdown 正常退出");
+    }
+
+    /// 当前进程令牌的用户 SID 原始字节（自相对 SID 结构拷贝）。
     unsafe fn current_user_sid_bytes() -> Vec<u8> {
         let mut token = HANDLE::default();
         // SAFETY: token 由系统写出，函数结束前关闭。
         unsafe {
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).expect("OpenProcessToken");
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+                .expect("OpenProcessToken");
         }
         let mut len = 0u32;
         // SAFETY: token 有效；空缓冲探测长度。
@@ -880,8 +974,14 @@ fn stalled_client_does_not_block_new_connections() {
         let mut buf = vec![0u64; len as usize / 8 + 1];
         // SAFETY: buf 对齐且容量覆盖 len 字节。
         unsafe {
-            GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len)
-                .expect("GetTokenInformation");
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast()),
+                len,
+                &mut len,
+            )
+            .expect("GetTokenInformation");
         }
         // SAFETY: token 已查询完毕，关闭。
         unsafe {
@@ -892,7 +992,8 @@ fn stalled_client_does_not_block_new_connections() {
         // SAFETY: user.User.Sid 是 buf 内的有效 SID。
         let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
         // SAFETY: 从有效 SID 起始处读取 GetLengthSid 个字节。
-        let bytes = unsafe { std::slice::from_raw_parts(user.User.Sid.0 as *const u8, sid_len) }.to_vec();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(user.User.Sid.0 as *const u8, sid_len) }.to_vec();
         bytes
     }
 
@@ -926,7 +1027,10 @@ fn stalled_client_does_not_block_new_connections() {
 
         // 恰一条 ACE（受保护 DACL 不允许继承项混入）
         let ace_count = unsafe { (*dacl).AceCount };
-        assert_eq!(ace_count, 1, "显式 DACL 必须恰含一条 ACE，实际 {ace_count} 条");
+        assert_eq!(
+            ace_count, 1,
+            "显式 DACL 必须恰含一条 ACE，实际 {ace_count} 条"
+        );
         let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
         // SAFETY: dacl 有效，索引 0 < AceCount。
         unsafe {
@@ -955,16 +1059,26 @@ fn stalled_client_does_not_block_new_connections() {
         let mut revision = 0u32;
         // SAFETY: sd 由 GetSecurityInfo 返回且在断言期间有效。
         unsafe {
-            GetSecurityDescriptorControl(sd, &mut control, &mut revision).expect("GetSecurityDescriptorControl");
+            GetSecurityDescriptorControl(sd, &mut control, &mut revision)
+                .expect("GetSecurityDescriptorControl");
         }
-        assert_ne!(control & SE_DACL_PROTECTED.0, 0, "DACL 必须受保护（P 标志）");
+        assert_ne!(
+            control & SE_DACL_PROTECTED.0,
+            0,
+            "DACL 必须受保护（P 标志）"
+        );
 
         // SAFETY: 结束探测连接；随后 shutdown 收尾。
         unsafe {
             let _ = CloseHandle(client);
         }
-        let response = unsafe { transact(r#"{"cmd":"shutdown"}"#, Instant::now() + Duration::from_secs(10)) }
-            .expect("shutdown 往返");
+        let response = unsafe {
+            transact(
+                r#"{"cmd":"shutdown"}"#,
+                Instant::now() + Duration::from_secs(10),
+            )
+        }
+        .expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         server.join().expect("服务线程应随 shutdown 正常退出");
     }

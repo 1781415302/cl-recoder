@@ -1,5 +1,6 @@
 // 应用外壳：侧边导航 + 页面切换（白名单无路由库，用状态 + hash 同步实现 8 页导航）。
 import { useEffect, useState } from "react";
+import { IconLocal } from "./components/icons";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { Dashboard } from "./pages/Dashboard";
 import { Keyboard } from "./pages/Keyboard";
@@ -23,34 +24,54 @@ const PAGES: Record<PageId, () => React.JSX.Element> = {
 
 function pageFromHash(): PageId {
   const h = window.location.hash.replace(/^#/, "");
-  return (h in PAGES ? h : "dashboard") as PageId;
+  return (
+    Object.prototype.hasOwnProperty.call(PAGES, h) ? h : "dashboard"
+  ) as PageId;
 }
 
 export default function App() {
   const [page, setPage] = useState<PageId>(pageFromHash);
-
   useEffect(() => {
     const onHash = () => setPage(pageFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-
   function navigate(next: PageId) {
     setPage(next);
-    // 同步 hash：EmptyState 的引导按钮（window.location.hash = "settings"）也能回到同一套路由
     if (window.location.hash !== `#${next}`) window.location.hash = next;
   }
-
   const Page = PAGES[page];
-
+  const labels: Record<PageId, string> = {
+    dashboard: "仪表盘",
+    keyboard: "键盘",
+    mouse: "鼠标",
+    gamepad: "手柄",
+    apps: "应用",
+    combos: "组合键",
+    whatpulse: "WhatPulse",
+    settings: "设置",
+  };
   return (
-    <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
+    <div className="app-shell">
       <Sidebar page={page} onNavigate={navigate} />
-      <main style={{ flex: 1, overflowY: "auto", minWidth: 0 }} aria-live="off">
-        <div className="page" key={page}>
-          <Page />
-        </div>
-      </main>
+      <div className="workspace">
+        <header className="app-bar">
+          <div className="app-breadcrumb">
+            <span>工作台</span>
+            <span aria-hidden="true">/</span>
+            <strong>{labels[page]}</strong>
+          </div>
+          <div className="app-local">
+            <IconLocal size={15} />
+            本地记录
+          </div>
+        </header>
+        <main key={page} className="app-main" aria-live="off">
+          <div className="page">
+            <Page />
+          </div>
+        </main>
+      </div>
     </div>
   );
 }

@@ -1,30 +1,16 @@
-// 摇杆停留热力圆盘（motion-dpi §4.6 S7）：本地 Canvas、25×25 停留量、青绿→明亮青绿单色强度。
-//
-// 边界：组件不查询 API；数值只经 lib/motionPresentation.heatCells 归一化（仅图形，秒数原值透传），
-// 固定空间核（3×3）仅用于渲染平滑，绝不修改 summary.dwellSeconds。圆盘 y 向上：行 0（摇杆前推）
-// 画在顶部；灰色中心死区 + 方向直接标签；scaleMaxSeconds 由页面取左右两图共同最大值传入（共同色标）。
-// 读数入口：点击选格 + 原生 range 滑块（每图唯一 Tab 入口，绝无 625 个）；Escape 清除选择；
-// 选中格显示精确停留时间与占活动时间比例（tooltip 不是唯一读数入口）。数据刷新无动画。
 import { useEffect, useMemo, useRef } from "react";
 import type { StickMotionSummary } from "../api/types";
 import {
-  dwellShareText,
+  heatCells,
+  heatCellIntersectsDisc,
   formatCellDwell,
   formatTravelR,
-  heatCellColor,
-  heatCellIntersectsDisc,
-  heatCells,
+  dwellShareText,
+  type HeatCell,
 } from "../lib/motionPresentation";
 import { fmtDuration } from "../lib/format";
+import { IconStick } from "./icons";
 import { Skeleton } from "./Skeleton";
-
-const GRID = 25;
-const CELLS = GRID * GRID;
-/** 画布逻辑边长（正方形，CSS 等比缩放，圆盘不被拉成椭圆） */
-const DISC_PX = 288;
-/** 固定空间核（渲染平滑用，3×3 加权；仅影响绘制，不改数值） */
-const KERNEL = [1, 2, 1, 2, 4, 2, 1, 2, 1] as const;
-
 export interface StickHeatmapProps {
   title: string;
   summary: StickMotionSummary;
@@ -33,203 +19,253 @@ export interface StickHeatmapProps {
   onSelect: (bin: number | null) => void;
   loading?: boolean;
 }
-
-/** 格中心是否在圆盘内（格单位坐标） */
-function insideDisc(row: number, col: number): boolean {
-  return heatCellIntersectsDisc(row, col);
+const GRID = 25,
+  COUNT = 625,
+  SIZE = 256;
+function positionText(bin: number): string {
+  const x = ((bin % GRID) - 12) / 12.5,
+    y = (12 - Math.floor(bin / GRID)) / 12.5;
+  if (x === 0 && y === 0) return "中心";
+  return [
+    y === 0 ? "" : `${y > 0 ? "上" : "下"} ${Math.round(Math.abs(y) * 100)}%`,
+    x === 0 ? "" : `${x > 0 ? "右" : "左"} ${Math.round(Math.abs(x) * 100)}%`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
-
-/** 选中格相对中心的方向文本（"中心" / "上2格·右3格"） */
-function binPositionText(bin: number): string {
-  const row = Math.floor(bin / GRID);
-  const col = bin % GRID;
-  const dx = col - (GRID - 1) / 2;
-  const dy = row - (GRID - 1) / 2; // dy<0 = 圆盘上方（摇杆前推）
-  if (dx === 0 && dy === 0) return "中心";
-  const parts: string[] = [];
-  if (dy < 0) parts.push(`上${-dy}格`);
-  else if (dy > 0) parts.push(`下${dy}格`);
-  if (dx < 0) parts.push(`左${-dx}格`);
-  else if (dx > 0) parts.push(`右${dx}格`);
-  return parts.join("·");
+/** 纹理只插值显示强度；停留时间与选格读数始终使用原始网格。 */
+function paintDensity(
+  canvas: HTMLCanvasElement,
+  cells: readonly HeatCell[],
+  selectedBin: number | null,
+) {
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = SIZE * dpr;
+  canvas.height = SIZE * dpr;
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const styles = getComputedStyle(document.documentElement);
+  const color = (name: string) => styles.getPropertyValue(name).trim();
+  const rgb = (name: string) =>
+    color(name)
+      .slice(1)
+      .match(/.{2}/g)!
+      .map((part) => parseInt(part, 16));
+  const palette = [rgb("--heat-low"), rgb("--heat-mid"), rgb("--heat-high")];
+  const texture = document.createElement("canvas");
+  texture.width = texture.height = 125;
+  const textureContext = texture.getContext("2d");
+  if (!textureContext) return;
+  const pixels = textureContext.createImageData(125, 125);
+  const intensity = (row: number, col: number) =>
+    cells[
+      Math.max(0, Math.min(24, row)) * GRID + Math.max(0, Math.min(24, col))
+    ].intensity;
+  for (let y = 0; y < 125; y++)
+    for (let x = 0; x < 125; x++) {
+      const gx = (x + 0.5) / 5 - 0.5,
+        gy = (y + 0.5) / 5 - 0.5,
+        c = Math.floor(gx),
+        r = Math.floor(gy),
+        fx = gx - c,
+        fy = gy - r;
+      const top = intensity(r, c) * (1 - fx) + intensity(r, c + 1) * fx;
+      const bottom =
+        intensity(r + 1, c) * (1 - fx) + intensity(r + 1, c + 1) * fx;
+      const t = top * (1 - fy) + bottom * fy,
+        index = t < 0.5 ? 0 : 1,
+        mix = t < 0.5 ? t * 2 : (t - 0.5) * 2,
+        offset = (y * 125 + x) * 4;
+      for (let channel = 0; channel < 3; channel++)
+        pixels.data[offset + channel] = Math.round(
+          palette[index][channel] * (1 - mix) +
+            palette[index + 1][channel] * mix,
+        );
+      pixels.data[offset + 3] = 255;
+    }
+  textureContext.putImageData(pixels, 0, 0);
+  const center = SIZE / 2;
+  context.clearRect(0, 0, SIZE, SIZE);
+  context.save();
+  context.beginPath();
+  context.arc(center, center, center - 1, 0, Math.PI * 2);
+  context.clip();
+  context.drawImage(texture, 0, 0, SIZE, SIZE);
+  context.strokeStyle = color("--color-border");
+  context.lineWidth = 0.8;
+  for (const radius of [center * 0.2, center * 0.5, center * 0.8]) {
+    context.beginPath();
+    context.arc(center, center, radius, 0, Math.PI * 2);
+    context.stroke();
+  }
+  context.setLineDash([3, 5]);
+  context.beginPath();
+  context.moveTo(0, center);
+  context.lineTo(SIZE, center);
+  context.moveTo(center, 0);
+  context.lineTo(center, SIZE);
+  context.stroke();
+  context.setLineDash([]);
+  if (
+    selectedBin !== null &&
+    heatCellIntersectsDisc(Math.floor(selectedBin / GRID), selectedBin % GRID)
+  ) {
+    const x = (((selectedBin % GRID) + 0.5) * SIZE) / GRID,
+      y = ((Math.floor(selectedBin / GRID) + 0.5) * SIZE) / GRID;
+    context.beginPath();
+    context.arc(x, y, 6, 0, Math.PI * 2);
+    context.strokeStyle = "white";
+    context.lineWidth = 4;
+    context.stroke();
+    context.strokeStyle = color("--color-primary");
+    context.lineWidth = 2;
+    context.stroke();
+  }
+  context.restore();
+  context.beginPath();
+  context.arc(center, center, center - 1, 0, Math.PI * 2);
+  context.strokeStyle = color("--color-border");
+  context.lineWidth = 1;
+  context.stroke();
 }
-
-export function StickHeatmap({ title, summary, selectedBin, scaleMaxSeconds, onSelect, loading = false }: StickHeatmapProps) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  // 纯函数换算：恰 625 格（非 625 属上游合同错误，heatCells 抛错——不补造数据）；不修改 summary.dwellSeconds
+export function StickHeatmap({
+  title,
+  summary,
+  selectedBin,
+  scaleMaxSeconds,
+  onSelect,
+  loading = false,
+}: StickHeatmapProps) {
+  const canvas = useRef<HTMLCanvasElement>(null);
   const cells = useMemo(
     () => heatCells(summary.dwellSeconds, scaleMaxSeconds),
     [summary.dwellSeconds, scaleMaxSeconds],
   );
-  const hasDwell = useMemo(() => cells.some((c) => c.intensity > 0), [cells]);
-
+  const cell = selectedBin !== null ? cells[selectedBin] : undefined;
+  const hasData = cells.some((c) => c.seconds > 0);
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-    const dpr = typeof window !== "undefined" && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
-    canvas.width = DISC_PX * dpr;
-    canvas.height = DISC_PX * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, DISC_PX, DISC_PX);
-
-    const styles = getComputedStyle(document.documentElement);
-    const divider = styles.getPropertyValue("--color-divider").trim() || "#E5E7EB";
-    const dead = styles.getPropertyValue("--color-muted").trim() || "#E8F1F4";
-    const primary = styles.getPropertyValue("--color-primary").trim() || "#0D9488";
-
-    const cell = DISC_PX / GRID;
-    const center = DISC_PX / 2;
-    // 圆盘裁剪：格子被圆边裁齐（不出现方角）
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(center, center, center - 1, 0, Math.PI * 2);
-    ctx.clip();
-
-    // 固定空间核平滑（仅渲染）：对 intensity 做 3×3 加权平均（圆盘内权重归一）
-    for (let row = 0; row < GRID; row++) {
-      for (let col = 0; col < GRID; col++) {
-        if (!insideDisc(row, col)) continue;
-        let acc = 0;
-        let wsum = 0;
-        for (let dr = -1; dr <= 1; dr++) {
-          for (let dc = -1; dc <= 1; dc++) {
-            const r = row + dr;
-            const c = col + dc;
-            if (r < 0 || r >= GRID || c < 0 || c >= GRID || !insideDisc(r, c)) continue;
-            const w = KERNEL[(dr + 1) * 3 + (dc + 1)];
-            acc += w * cells[r * GRID + c].intensity;
-            wsum += w;
-          }
-        }
-        const t = wsum > 0 ? acc / wsum : 0;
-        if (t > 0.004) {
-          ctx.fillStyle = heatCellColor(t);
-          ctx.fillRect(col * cell - 0.5, row * cell - 0.5, cell + 1, cell + 1);
-        }
-      }
-    }
-
-    // 灰色中心死区（半透明标记，不遮死读数；精确值见读出行）
-    ctx.beginPath();
-    ctx.arc(center, center, cell * 2.2, 0, Math.PI * 2);
-    ctx.globalAlpha = 0.6;
-    ctx.fillStyle = dead;
-    ctx.fill();
-    ctx.globalAlpha = 1;
-
-    // 选中格描边（圆盘内才描）
-    if (selectedBin !== null && Number.isInteger(selectedBin) && selectedBin >= 0 && selectedBin < CELLS) {
-      const row = Math.floor(selectedBin / GRID);
-      const col = selectedBin % GRID;
-      if (insideDisc(row, col)) {
-        ctx.strokeStyle = primary;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(col * cell + 1, row * cell + 1, cell - 2, cell - 2);
-      }
-    }
-    ctx.restore();
-
-    // 圆盘外圈
-    ctx.beginPath();
-    ctx.arc(center, center, center - 1, 0, Math.PI * 2);
-    ctx.strokeStyle = divider;
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    if (canvas.current) paintDensity(canvas.current, cells, selectedBin);
   }, [cells, selectedBin, loading]);
-
-  if (loading) {
-    return (
-      <div className="card" role="status" aria-label={`${title}加载中`}>
-        <h2 className="card-title">{title}</h2>
-        <div style={{ marginTop: "var(--space-3)" }}>
-          <Skeleton h="20px" w="60%" />
-          <Skeleton h={`${DISC_PX}px`} style={{ marginTop: "var(--space-3)" }} />
-        </div>
-      </div>
-    );
-  }
-
-  function onDiscClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const cellPx = rect.width / GRID;
-    const x = (e.clientX - rect.left) / rect.width * 2 - 1;
-    const y = (e.clientY - rect.top) / rect.height * 2 - 1;
-    if (Math.hypot(x, y) > 1) {
-      onSelect(null);
-      return;
-    }
-    const col = Math.floor((e.clientX - rect.left) / cellPx);
-    const row = Math.floor((e.clientY - rect.top) / cellPx);
-    if (col < 0 || col >= GRID || row < 0 || row >= GRID || !insideDisc(row, col)) {
-      onSelect(null); // 圆盘外点击 = 清除选择
-      return;
-    }
-    onSelect(row * GRID + col);
-  }
-
-  const selectedCell = selectedBin !== null && selectedBin >= 0 && selectedBin < CELLS ? cells[selectedBin] : undefined;
-
   return (
-    <div className="card">
-      <h2 className="card-title">{title}</h2>
-      <div className="heat-meta">
-        <span>
-          活动时长 <span className="num">{fmtDuration(summary.activeSeconds)}</span>
-        </span>
-        <span>
-          累计行程 <span className="num">{formatTravelR(summary.travelR)}</span>
-        </span>
+    <section className="card heat-card">
+      <div className="heat-heading">
+        <h2 className="card-title">{title}</h2>
+        <IconStick size={20} />
       </div>
-      <div className="heat-disc-wrap">
-        <canvas
-          ref={canvasRef}
-          width={DISC_PX}
-          height={DISC_PX}
-          className="heat-disc"
-          aria-hidden="true"
-          onClick={onDiscClick}
-        />
-        <span className="heat-dir heat-dir-n" aria-hidden="true">上</span>
-        <span className="heat-dir heat-dir-s" aria-hidden="true">下</span>
-        <span className="heat-dir heat-dir-w" aria-hidden="true">左</span>
-        <span className="heat-dir heat-dir-e" aria-hidden="true">右</span>
-      </div>
-      <input
-        type="range"
-        className="heat-slider"
-        min={0}
-        max={CELLS - 1}
-        step={1}
-        value={selectedBin ?? 0}
-        aria-label={`${title}：选择热力格 0–${CELLS - 1}（12＝正上，312＝中心，612＝正下；Enter/方向键选格，Escape 清除）`}
-        aria-valuetext={
-          selectedCell
-            ? `第 ${selectedCell.bin} 格（${binPositionText(selectedCell.bin)}），停留 ${formatCellDwell(selectedCell.seconds)}，占活动 ${dwellShareText(selectedCell.seconds, summary.activeSeconds)}`
-            : "未选择"
-        }
-        onChange={(e) => onSelect(Number(e.currentTarget.value))}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.preventDefault();
-            onSelect(null);
-          }
-        }}
-      />
-      <div className="dev-detail" aria-live="polite">
-        {selectedCell ? (
-          <>
-            <span style={{ fontWeight: 600 }}>第 {selectedCell.bin} 格（{binPositionText(selectedCell.bin)}）</span>
-            <span>停留 <span className="num">{formatCellDwell(selectedCell.seconds)}</span></span>
-            <span>占活动 <span className="num">{dwellShareText(selectedCell.seconds, summary.activeSeconds)}</span></span>
-          </>
-        ) : hasDwell ? (
-          <span className="td-muted">点击圆盘或用滑块选择格子查看精确停留；Escape 清除选择。</span>
-        ) : (
-          <span className="td-muted">暂无摇杆停留数据。</span>
-        )}
-      </div>
-    </div>
+      {loading ? (
+        <Skeleton h="256px" />
+      ) : (
+        <>
+          <div className="heat-disc-wrap">
+            <canvas
+              ref={canvas}
+              className="heat-disc"
+              width={SIZE}
+              height={SIZE}
+              aria-hidden="true"
+              onClick={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect(),
+                  x = (e.clientX - rect.left) / rect.width,
+                  y = (e.clientY - rect.top) / rect.height;
+                const col = Math.floor(x * GRID),
+                  row = Math.floor(y * GRID);
+                if (
+                  Math.hypot(x * 2 - 1, y * 2 - 1) > 1 ||
+                  col < 0 ||
+                  col >= GRID ||
+                  row < 0 ||
+                  row >= GRID
+                ) {
+                  onSelect(null);
+                  return;
+                }
+                onSelect(row * GRID + col);
+              }}
+            />
+            <span className="heat-dir heat-dir-n" aria-hidden="true">
+              上
+            </span>
+            <span className="heat-dir heat-dir-s" aria-hidden="true">
+              下
+            </span>
+            <span className="heat-dir heat-dir-w" aria-hidden="true">
+              左
+            </span>
+            <span className="heat-dir heat-dir-e" aria-hidden="true">
+              右
+            </span>
+          </div>
+          <div
+            className="heat-scale"
+            aria-label={`停留色标：0 到 ${formatCellDwell(scaleMaxSeconds)}`}
+          >
+            <span className="heat-scale-bar" aria-hidden="true" />
+            <div className="heat-scale-values">
+              <span>0 秒</span>
+              <span>{formatCellDwell(scaleMaxSeconds * 0.25)}</span>
+              <span>{formatCellDwell(scaleMaxSeconds)}</span>
+            </div>
+          </div>
+          <div className="heat-stats">
+            <div>
+              <span className="heat-stats-label">活动时长</span>
+              <strong className="heat-stats-value">
+                {fmtDuration(summary.activeSeconds)}
+              </strong>
+            </div>
+            <div>
+              <span
+                className="heat-stats-label"
+                title="1 R 为从摇杆中心到满幅边缘的行程"
+              >
+                累计行程
+              </span>
+              <strong className="heat-stats-value">
+                {formatTravelR(summary.travelR)}
+              </strong>
+            </div>
+          </div>
+          <input
+            type="range"
+            className="heat-slider"
+            min={0}
+            max={COUNT - 1}
+            step={1}
+            value={selectedBin ?? 312}
+            aria-label={`${title}：用方向键选择位置，Escape 清除`}
+            aria-valuetext={
+              cell
+                ? `${positionText(cell.bin)}，停留 ${formatCellDwell(cell.seconds)}`
+                : "未选择"
+            }
+            onChange={(e) => onSelect(Number(e.currentTarget.value))}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                onSelect(null);
+              }
+            }}
+          />
+          <div className="heat-readout" aria-live="polite">
+            {cell ? (
+              <>
+                <strong>{positionText(cell.bin)}</strong>
+                <span>{formatCellDwell(cell.seconds)}</span>
+                <span>
+                  占活动 {dwellShareText(cell.seconds, summary.activeSeconds)}
+                </span>
+              </>
+            ) : (
+              <span>
+                {hasData
+                  ? "点选位置，或用方向键查看停留时间"
+                  : "所选日期没有摇杆停留记录"}
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </section>
   );
 }

@@ -6,7 +6,11 @@
 // 切换来源重置草稿（渲染期对齐，同 DataTable resetKey 惯例），进行中的保存不污染新来源草稿。
 import { useEffect, useId, useRef, useState } from "react";
 import type { DpiOrigin, DpiProbeStatus, MouseSourceRow } from "../api/types";
-import { MANUAL_DPI_MAX, MANUAL_DPI_MIN, parseManualDpi } from "../lib/motionPresentation";
+import {
+  MANUAL_DPI_MAX,
+  MANUAL_DPI_MIN,
+  parseManualDpi,
+} from "../lib/motionPresentation";
 
 export interface MouseDpiEditorProps {
   source: MouseSourceRow;
@@ -35,10 +39,16 @@ function initialText(source: MouseSourceRow): string {
 
 function fmtUntil(iso: string): string {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  return Number.isNaN(d.getTime())
+    ? iso
+    : d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
-export function MouseDpiEditor({ source, pending, onSave }: MouseDpiEditorProps) {
+export function MouseDpiEditor({
+  source,
+  pending,
+  onSave,
+}: MouseDpiEditorProps) {
   const inputId = useId();
   const [text, setText] = useState(() => initialText(source));
   const [error, setError] = useState<string | null>(null);
@@ -63,10 +73,12 @@ export function MouseDpiEditor({ source, pending, onSave }: MouseDpiEditorProps)
     setError(null);
     try {
       await onSave(dpi);
-      if (currentIdRef.current === forId) setText(dpi === null ? "" : String(dpi));
+      if (currentIdRef.current === forId)
+        setText(dpi === null ? "" : String(dpi));
     } catch (e) {
       // 失败保留编辑内容，仅展示错误（§4.6）
-      if (currentIdRef.current === forId) setError(e instanceof Error ? e.message : String(e));
+      if (currentIdRef.current === forId)
+        setError(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -83,77 +95,87 @@ export function MouseDpiEditor({ source, pending, onSave }: MouseDpiEditorProps)
   const displayName = source.nickname ?? source.name;
 
   return (
-    <div className="card">
-      <h2 className="card-title">DPI 设置</h2>
-      <p className="card-sub">
-        {displayName}（来源 #{source.id}）{" "}
-        <span className={`chip${source.connected ? " chip-positive" : ""}`}>{source.connected ? "已连接" : "离线"}</span>
-      </p>
-      <div className="dpi-current" style={{ marginTop: "var(--space-3)" }}>
-        <span className="td-muted">当前换算 DPI</span>
-        {source.effectiveDpi !== null ? (
-          <span className="dpi-value">{source.effectiveDpi}</span>
-        ) : (
-          <span className="td-muted">未配置</span>
-        )}
+    <section className="card dpi-panel">
+      <div className="section-heading">
+        <h2 className="card-title">距离校准</h2>
+        <span className={`chip${source.connected ? " chip-positive" : ""}`}>
+          {source.connected ? "已连接" : "离线"}
+        </span>
+      </div>
+      <p className="card-sub">{displayName}</p>
+      <div className="dpi-current">
+        <span className="td-muted">当前 DPI</span>
+        <strong className="dpi-value">{source.effectiveDpi ?? "—"}</strong>
         <span className="chip">{ORIGIN_LABEL[source.dpiOrigin]}</span>
       </div>
       {!source.physical ? (
-        <p className="chart-hint" role="note" style={{ marginTop: "var(--space-3)" }}>
-          虚拟/未知来源不支持配置或换算 DPI。
-        </p>
+        <p className="chart-hint">虚拟或未知来源无法配置 DPI。</p>
       ) : autoActive ? (
-        <div className="dpi-readonly" role="note" style={{ marginTop: "var(--space-3)" }}>
-          <div>
-            自动 DPI 生效中：<span className="dpi-value">{source.autoDpi}</span>
-            {source.autoValidUntil ? <>（有效期至 {fmtUntil(source.autoValidUntil)}）</> : null}
-            ，只读；失效或断连后可修改手动值。
-          </div>
+        <div className="dpi-readonly" role="note">
+          已读取鼠标当前档位。
+          {source.autoValidUntil && (
+            <>有效至 {fmtUntil(source.autoValidUntil)}。</>
+          )}
           {source.manualDpi !== null ? (
-            <div style={{ marginTop: "var(--space-1)" }}>
-              已保存手动值 <span className="dpi-value">{source.manualDpi}</span>，将在自动值失效后使用。
-            </div>
-          ) : null}
+            <p style={{ margin: "8px 0 0" }}>
+              后备手动 DPI：<strong>{source.manualDpi}</strong>
+              ，自动值失效后使用。
+            </p>
+          ) : (
+            <p style={{ margin: "8px 0 0" }}>自动值失效后可手动填写。</p>
+          )}
         </div>
       ) : (
-        <form className="dpi-editor" style={{ marginTop: "var(--space-3)" }} noValidate onSubmit={onSubmit}>
+        <form className="dpi-editor" noValidate onSubmit={onSubmit}>
           <label className="field-label" htmlFor={inputId}>
-            手动 DPI（{MANUAL_DPI_MIN}–{MANUAL_DPI_MAX}，仅十进制整数）
+            手动 DPI
           </label>
           <input
             id={inputId}
             className="input"
             inputMode="numeric"
             autoComplete="off"
-            placeholder="例如 1600"
+            placeholder="填写驱动中的 DPI，例如 1600"
             value={text}
             disabled={pending}
             onChange={(e) => {
               setText(e.currentTarget.value);
               setError(null);
             }}
+            aria-invalid={error !== null}
+            aria-describedby={error ? `${inputId}-error` : undefined}
           />
-          {error ? (
-            <p className="dpi-error" role="alert">
+          {error && (
+            <p className="dpi-error" id={`${inputId}-error`} role="alert">
               {error}
             </p>
-          ) : null}
+          )}
           <div className="dpi-actions">
-            <button type="submit" className="btn btn-primary" disabled={pending}>
-              {pending ? "保存中…" : "保存"}
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={pending}
+            >
+              {pending ? "保存中…" : "保存 DPI"}
             </button>
             <button
-              type="button"
               className="btn"
+              type="button"
               disabled={pending || source.manualDpi === null}
               onClick={() => void save(null)}
             >
-              清除手动值
+              清除
             </button>
           </div>
-          <p className="chart-hint">仅影响之后的采集，不回算历史。自动探测：{PROBE_LABEL[source.probeStatus]}。</p>
+          <p className="chart-hint">
+            {MANUAL_DPI_MIN}–{MANUAL_DPI_MAX} 的整数 · 自动探测：
+            {PROBE_LABEL[source.probeStatus]}
+          </p>
         </form>
       )}
-    </div>
+      <p className="dpi-guidance">
+        DPI 应与鼠标驱动的当前档位一致。更改只影响之后的采集，历史距离保留。
+      </p>
+    </section>
   );
 }

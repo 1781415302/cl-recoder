@@ -35,6 +35,7 @@ mod keylabel;
 mod state;
 // S3（§4.4）：原生窗口 UI 活动快照——active 的唯一权威，前端经事件 + get_ui_activity 消费。
 mod ui_activity;
+mod webview_recovery;
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
@@ -55,13 +56,7 @@ const ID_QUIT: &str = "quit";
 
 /// 显示并聚焦主窗口（托盘"打开仪表盘"/托盘左键/单实例二次启动共用）。
 fn show_main(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
-    // S3（§4.4）：显式 show 之后发布——读取实际 visible/minimized 状态（统一发布入口）。
-    ui_activity::refresh(app);
+    webview_recovery::show(app);
 }
 
 /// 探测 collector 是否处于暂停（`None` = 管道不可达，即未运行，§5.1）。
@@ -167,6 +162,7 @@ fn toggle_gui_autostart(app: &tauri::AppHandle, item: &CheckMenuItem<tauri::Wry>
 
 fn main() {
     tauri::Builder::default()
+        .manage(webview_recovery::RecoveryState::default())
         // single-instance 必须第一个注册（PLAN §3 main.rs 注释）：
         // 二次启动（新进程即刻退出）聚焦已有主窗口——S12 单实例聚焦。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -192,6 +188,7 @@ fn main() {
             app.manage(state::AppState::new());
             // S3（§4.4）：UI 活动状态（初始 revision=0/inactive），事件 + get_ui_activity 共用。
             app.manage(ui_activity::UiActivityState::new());
+            webview_recovery::create_initial(app.handle())?;
             let st = app.state::<state::AppState>().inner().clone();
 
             // —— S12 首启引导 —— first_run_done=false：自动弹出主窗口（默认无窗口启动，§8-S1）。
@@ -204,12 +201,7 @@ fn main() {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .first_run_done;
             if first_run {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                }
-                // S3（§4.4）：首启 show 之后显式发布（读实际状态 → active）。
-                ui_activity::refresh(app.handle());
+                show_main(app.handle());
                 let mut next = st
                     .settings
                     .read()
@@ -274,8 +266,11 @@ fn main() {
                     ID_TOGGLE_PAUSE => spawn_toggle_pause(app.clone(), pause_for_menu.clone()),
                     ID_AUTOSTART => toggle_gui_autostart(app, &autostart_for_menu),
                     ID_QUIT => {
+                        webview_recovery::stopping(app);
                         commands::diagnostics::record_gui_event(
-                            clrecoder_diagnostics::Level::Info, "service.stopped", "GUI 已退出",
+                            clrecoder_diagnostics::Level::Info,
+                            "service.stopped",
+                            "GUI 已退出",
                         );
                         // 退出仅结束 GUI；采集器是独立进程继续统计（§1 故障隔离）。
                         app.cleanup_before_exit();
@@ -311,6 +306,7 @@ fn main() {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     let _ = window.hide();
+                    webview_recovery::hidden(window.app_handle());
                     ui_activity::refresh(window.app_handle());
                     gui_log!("INFO: 主窗口关闭请求 → 隐藏到托盘");
                 }
@@ -327,15 +323,30 @@ fn main() {
         // false，这里按命令名分发组合，语义不变。
         .invoke_handler({
             let ui_activity_handler: Box<tauri::ipc::InvokeHandler<tauri::Wry>> =
-                Box::new(tauri::generate_handler![ui_activity::get_ui_activity]);
+                Box::new(tauri::generate_handler![
+                    ui_activity::get_ui_activity,
+                    webview_recovery::frontend_ready
+                ]);
             let commands_handler = commands::handler();
             move |invoke| {
-                if invoke.message.command() == ui_activity::COMMAND_GET_UI_ACTIVITY {
+                if invoke.message.command() == ui_activity::COMMAND_GET_UI_ACTIVITY
+                    || invoke.message.command() == "frontend_ready"
+                {
                     return ui_activity_handler(invoke);
                 }
                 commands_handler(invoke)
             }
         })
-        .run(tauri::generate_context!())
-        .expect("CL Recoder GUI 启动失败");
+        .build(tauri::generate_context!())
+        .expect("CL Recoder GUI 启动失败")
+        .run(|_, event| {
+            // 销毁坏窗口与创建替代窗口之间允许短暂没有窗口，托盘和业务状态仍驻留。
+            // 菜单退出使用 exit(0)，其 code=Some(0)，不会被这里阻止。
+            if let tauri::RunEvent::ExitRequested {
+                code: None, api, ..
+            } = event
+            {
+                api.prevent_exit();
+            }
+        });
 }

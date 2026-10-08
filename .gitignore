@@ -31,3 +31,6 @@ Thumbs.db
 
 # Playwright CLI 会话快照
 .playwright-cli/
+
+# 本地界面验收截图
+/output/playwright/

@@ -39,12 +39,20 @@ function goSettings() {
   window.location.hash = "settings";
 }
 
-export function DeviceStatsPage({ kind, title, description }: DeviceStatsPageProps) {
+export function DeviceStatsPage({
+  kind,
+  title,
+  description,
+}: DeviceStatsPageProps) {
   const { range, onChange } = useStatisticsRange();
   const activity = useAppActivity();
   // §4.5：统计 interval 仅范围包含当前 today 时传入（历史固定范围不轮询）
-  const includesToday = range.from <= activity.today && activity.today <= range.to;
-  const statsPolicy = uiQueryPolicy(activity.active, includesToday ? 1_000 : undefined);
+  const includesToday =
+    range.from <= activity.today && activity.today <= range.to;
+  const statsPolicy = uiQueryPolicy(
+    activity.active,
+    includesToday ? 1_000 : undefined,
+  );
   const qc = useQueryClient();
   const devices = useDevices();
   const kindDevices = (devices.data ?? []).filter((d) => d.kind === kind);
@@ -53,11 +61,14 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
   const deviceId =
     picked !== null && kindDevices.some((d) => d.id === picked)
       ? picked
-      : kindDevices[0]?.id ?? null;
+      : (kindDevices[0]?.id ?? null);
   // 设备/范围语义键：变化时清空布局选择并回完整表/逐日表第一页（§4.8 resetKey 语义）
   const deviceRangeKey = `${deviceId ?? "none"}|${range.from}|${range.to}`;
   // selectedCode 受控值：设备/范围语义变化即清（渲染期派生，不用 effect）
-  const [selection, setSelection] = useState<{ key: string; code: number | null }>(() => ({
+  const [selection, setSelection] = useState<{
+    key: string;
+    code: number | null;
+  }>(() => ({
     key: deviceRangeKey,
     code: null,
   }));
@@ -69,7 +80,8 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
 
   const topKeys = useQuery({
     queryKey: ["topKeys", deviceId, range.from, range.to, TOP_KEYS_LIMIT],
-    queryFn: () => client.getTopKeys(deviceId!, range.from, range.to, TOP_KEYS_LIMIT),
+    queryFn: () =>
+      client.getTopKeys(deviceId!, range.from, range.to, TOP_KEYS_LIMIT),
     ...statsPolicy,
     enabled: deviceId !== null && statsPolicy.enabled,
   });
@@ -86,16 +98,57 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
   const noun = kindLabel(kind);
 
   const topColumns: Column<{ code: number; total: number; label: string }>[] = [
-    { key: "label", header: `${noun}按键`, value: (r) => r.label, render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span> },
-    { key: "code", header: "编码", value: (r) => r.code, render: (r) => <span className="mono">{`0x${r.code.toString(16).toUpperCase()}`}</span> },
-    { key: "total", header: "累计次数", value: (r) => r.total, numeric: true, render: (r) => fmtNum(r.total) },
+    {
+      key: "label",
+      header: `${noun}按键`,
+      value: (r) => r.label,
+      render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span>,
+    },
+    {
+      key: "code",
+      header: "编码",
+      value: (r) => r.code,
+      render: (r) => (
+        <span className="mono">{`0x${r.code.toString(16).toUpperCase()}`}</span>
+      ),
+    },
+    {
+      key: "total",
+      header: "累计次数",
+      value: (r) => r.total,
+      numeric: true,
+      render: (r) => fmtNum(r.total),
+    },
   ];
 
-  const dailyColumns: Column<{ day: string; code: number; count: number; label: string }>[] = [
-    { key: "day", header: "日期", value: (r) => r.day, render: (r) => fmtDay(r.day) },
+  const dailyColumns: Column<{
+    day: string;
+    code: number;
+    count: number;
+    label: string;
+  }>[] = [
+    {
+      key: "day",
+      header: "日期",
+      value: (r) => r.day,
+      render: (r) => fmtDay(r.day),
+    },
     { key: "label", header: `${noun}按键`, value: (r) => r.label },
-    { key: "code", header: "编码", value: (r) => r.code, render: (r) => <span className="mono">{`0x${r.code.toString(16).toUpperCase()}`}</span> },
-    { key: "count", header: "次数", value: (r) => r.count, numeric: true, render: (r) => fmtNum(r.count) },
+    {
+      key: "code",
+      header: "编码",
+      value: (r) => r.code,
+      render: (r) => (
+        <span className="mono">{`0x${r.code.toString(16).toUpperCase()}`}</span>
+      ),
+    },
+    {
+      key: "count",
+      header: "次数",
+      value: (r) => r.count,
+      numeric: true,
+      render: (r) => fmtNum(r.count),
+    },
   ];
 
   return (
@@ -123,22 +176,25 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
             devices={kindDevices}
             selectedId={deviceId}
             onSelect={setPicked}
-            onRenamed={() => void qc.invalidateQueries({ queryKey: ["devices"] })}
+            onRenamed={() =>
+              void qc.invalidateQueries({ queryKey: ["devices"] })
+            }
           />
           {/* §4.6：DeviceRow.total 仍为全历史口径，固定说明紧邻设备标签（不改 DeviceTabs） */}
-          <p className="chart-hint">设备标签中的次数为全历史累计，不受日期筛选影响；下方按所选日期统计。</p>
           <DeviceLayoutStats
             kind={kind}
             rows={topKeys.data ?? []}
-            title={`${noun}物理布局与计数`}
+            title="按键使用"
             loading={topKeysLoading}
             selectedCode={selection.code}
-            onSelect={(code) => setSelection((prev) => ({ key: prev.key, code }))}
+            onSelect={(code) =>
+              setSelection((prev) => ({ key: prev.key, code }))
+            }
           />
           {topKeysLoading ? null : (
-            <div className="card">
-              <h2 className="card-title">{noun}完整列表</h2>
-              <p className="card-sub">覆盖该{noun}全部已计数编码（请求覆盖完整值域，无 Top-N 截断）；可排序、分页查看</p>
+            <details className="card overview-details">
+              <summary className="card-title">{noun}完整列表</summary>
+              <p className="card-sub">全部按键记录，可排序查看</p>
               <div style={{ marginTop: "var(--space-3)" }}>
                 <DataTable
                   columns={topColumns}
@@ -148,13 +204,26 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
                   caption={`${noun}按键累计排行（所选范围）`}
                   pageSize={50}
                   resetKey={deviceRangeKey}
-                  empty={<EmptyState title="该设备在所选范围内没有按键记录" description="试试扩大日期范围，或确认采集器已开始统计。" />}
+                  empty={
+                    <EmptyState
+                      title="该设备在所选范围内没有按键记录"
+                      description="试试扩大日期范围，或确认采集器已开始统计。"
+                    />
+                  }
                 />
               </div>
-            </div>
+            </details>
           )}
           <div className="card">
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "var(--space-2)", flexWrap: "wrap" }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "baseline",
+                justifyContent: "space-between",
+                gap: "var(--space-2)",
+                flexWrap: "wrap",
+              }}
+            >
               <h2 className="card-title">{noun} × 逐日明细</h2>
               <button
                 type="button"
@@ -165,7 +234,7 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
                 {dailyOpen ? "收起逐日明细" : "展开逐日明细"}
               </button>
             </div>
-            <p className="card-sub">每个{noun}按键每天的按下次数（物理按下边沿，自动重复不计）；展开后按需查询</p>
+            <p className="card-sub">每日按键使用次数</p>
             {dailyOpen ? (
               keyDaily.isLoading || !activity.ready ? (
                 <SkeletonCard rows={8} />
@@ -179,7 +248,12 @@ export function DeviceStatsPage({ kind, title, description }: DeviceStatsPagePro
                     caption={`${noun}按键逐日明细`}
                     pageSize={50}
                     resetKey={deviceRangeKey}
-                    empty={<EmptyState title="所选范围内没有逐日数据" description="扩大日期范围后再试。" />}
+                    empty={
+                      <EmptyState
+                        title="所选范围内没有逐日数据"
+                        description="扩大日期范围后再试。"
+                      />
+                    }
                   />
                 </div>
               )

@@ -23,3 +23,7 @@ clrecoder-core = { path = "../crates/core" }
 clrecoder-store = { path = "../crates/store" }
 # S1（§4.1）：gui 角色 sink（gui.log）+ 旧 gui_log! 宏的持久化适配入口。
 clrecoder-diagnostics = { path = "../crates/diagnostics" }
+
+[target.'cfg(windows)'.dependencies]
+# 使用 Tauri 已锁定的 WebView2 绑定，监听本窗口的进程故障。
+webview2-com = "=0.39.1"

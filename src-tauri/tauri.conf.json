@@ -1,25 +1,28 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CL Recoder",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.clrecoder.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm --prefix ui run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm --prefix ui run build",
     "frontendDist": "../ui/dist"
   },
   "app": {
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "CL Recoder",
+        "theme": "Light",
         "width": 1080,
         "height": 720,
         "minWidth": 960,
         "minHeight": 600,
         "center": true,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-gpu --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
       }
     ],
     "security": {
@@ -35,7 +38,8 @@
       "../scripts/install-collector-task.ps1": "scripts/install-collector-task.ps1",
       "../scripts/collector-task-policy.ps1": "scripts/collector-task-policy.ps1",
       "../scripts/uninstall-collector-task.ps1": "scripts/uninstall-collector-task.ps1",
-      "../scripts/check-task.ps1": "scripts/check-task.ps1"
+      "../scripts/check-task.ps1": "scripts/check-task.ps1",
+      "../scripts/stop-collector.ps1": "scripts/stop-collector.ps1"
     }
   }
 }

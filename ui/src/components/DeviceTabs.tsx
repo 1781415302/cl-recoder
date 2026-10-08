@@ -2,6 +2,7 @@
 import { useState } from "react";
 import type { DeviceRow } from "../api/types";
 import * as client from "../api/client";
+import { IconEdit } from "./icons";
 import { fmtCompact } from "../lib/format";
 
 interface DeviceTabsProps {
@@ -11,7 +12,12 @@ interface DeviceTabsProps {
   onRenamed?: () => void;
 }
 
-export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceTabsProps) {
+export function DeviceTabs({
+  devices,
+  selectedId,
+  onSelect,
+  onRenamed,
+}: DeviceTabsProps) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -27,13 +33,20 @@ export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceT
   }
 
   return (
-    <div role="tablist" aria-label="设备" style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
+    <div role="tablist" aria-label="设备" className="device-selector">
       {devices.map((d) => {
         const selected = d.id === selectedId;
         const label = d.nickname || d.name;
         if (editingId === d.id) {
           return (
-            <span key={d.id} style={{ display: "inline-flex", gap: "var(--space-1)", alignItems: "center" }}>
+            <span
+              key={d.id}
+              style={{
+                display: "inline-flex",
+                gap: "var(--space-1)",
+                alignItems: "center",
+              }}
+            >
               <input
                 className="input"
                 value={draft}
@@ -47,13 +60,29 @@ export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceT
                 }}
                 style={{ width: 140 }}
               />
-              <button type="button" className="btn btn-sm btn-primary" onClick={() => void saveNickname(d.id)}>存</button>
-              <button type="button" className="btn btn-sm" onClick={() => setEditingId(null)}>取消</button>
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => void saveNickname(d.id)}
+              >
+                保存
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setEditingId(null)}
+              >
+                取消
+              </button>
             </span>
           );
         }
         return (
-          <span key={d.id} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+          <span
+            key={d.id}
+            className="device-tab-group"
+            data-selected={selected}
+          >
             <button
               type="button"
               role="tab"
@@ -67,22 +96,19 @@ export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceT
               }}
             >
               {label}
-              <span className="num" style={{ marginLeft: "var(--space-1)", fontSize: "var(--text-caption)", opacity: 0.85 }}>
-                {fmtCompact(d.total)}
-              </span>
+              <span className="tab-total num">历史 {fmtCompact(d.total)}</span>
             </button>
             <button
               type="button"
-              className="btn btn-sm"
+              className="tab-rename"
               aria-label={`重命名 ${d.name}`}
               title="设置昵称"
               onClick={() => {
                 setEditingId(d.id);
                 setDraft(d.nickname ?? "");
               }}
-              style={{ padding: "0 6px", minWidth: 0 }}
             >
-              ✎
+              <IconEdit size={14} />
             </button>
           </span>
         );

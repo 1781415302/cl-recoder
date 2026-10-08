@@ -19,8 +19,14 @@ import {
 import type { ReactNode } from "react";
 
 export type PageId =
-  | "dashboard" | "keyboard" | "mouse" | "gamepad"
-  | "apps" | "combos" | "whatpulse" | "settings";
+  | "dashboard"
+  | "keyboard"
+  | "mouse"
+  | "gamepad"
+  | "apps"
+  | "combos"
+  | "whatpulse"
+  | "settings";
 
 interface NavItem {
   id: PageId;
@@ -40,15 +46,46 @@ const NAV: NavItem[] = [
 ];
 
 /** §4.2 健康分类 → 徽标文案/配色。unknown/access_denied 不显示"未运行"（无凭据不臆断）。 */
-const HEALTH_CHIP: Record<CollectorHealth, { text: string; cls: string; dot: string }> = {
-  running: { text: "采集中", cls: "chip chip-positive", dot: "var(--color-positive)" },
-  paused: { text: "已暂停", cls: "chip chip-accent", dot: "var(--color-accent)" },
-  not_running: { text: "未运行", cls: "chip", dot: "var(--color-text-placeholder)" },
-  unreachable: { text: "无响应", cls: "chip chip-danger", dot: "var(--color-danger)" },
-  access_denied: { text: "访问受限", cls: "chip chip-danger", dot: "var(--color-danger)" },
-  unknown: { text: "状态未知", cls: "chip", dot: "var(--color-text-placeholder)" },
+const HEALTH_CHIP: Record<
+  CollectorHealth,
+  { text: string; cls: string; dot: string }
+> = {
+  running: {
+    text: "采集中",
+    cls: "chip chip-positive",
+    dot: "var(--color-positive)",
+  },
+  paused: {
+    text: "已暂停",
+    cls: "chip chip-accent",
+    dot: "var(--color-accent)",
+  },
+  not_running: {
+    text: "未运行",
+    cls: "chip",
+    dot: "var(--color-text-placeholder)",
+  },
+  unreachable: {
+    text: "无响应",
+    cls: "chip chip-danger",
+    dot: "var(--color-danger)",
+  },
+  access_denied: {
+    text: "访问受限",
+    cls: "chip chip-danger",
+    dot: "var(--color-danger)",
+  },
+  unknown: {
+    text: "状态未知",
+    cls: "chip",
+    dot: "var(--color-text-placeholder)",
+  },
 };
-const CHIP_PENDING = { text: "检测中…", cls: "chip", dot: "var(--color-text-placeholder)" };
+const CHIP_PENDING = {
+  text: "检测中…",
+  cls: "chip",
+  dot: "var(--color-text-placeholder)",
+};
 
 function CollectorChip() {
   const activity = useAppActivity();
@@ -61,7 +98,10 @@ function CollectorChip() {
   });
   const chip = data ? HEALTH_CHIP[data.health] : CHIP_PENDING;
   return (
-    <div className={chip.cls} title={data?.diagnosticMessage ?? "采集器状态（近实时刷新）"}>
+    <div
+      className={chip.cls}
+      title={data?.diagnosticMessage ?? "采集器状态（近实时刷新）"}
+    >
       <span
         aria-hidden="true"
         style={{
@@ -85,41 +125,48 @@ export function Sidebar({ page, onNavigate }: SidebarProps) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
-        <span
-          aria-hidden="true"
-          style={{
-            width: 28, height: 28, borderRadius: "var(--radius-sm)",
-            background: "var(--color-primary)", color: "var(--color-card)",
-            display: "inline-flex", alignItems: "center", justifyContent: "center",
-            fontWeight: 700, fontSize: "var(--text-caption)",
-          }}
-        >
-          CL
+        <span className="sidebar-mark" aria-hidden="true">
+          <svg width="28" height="32" viewBox="0 0 28 32" fill="none">
+            <path
+              d="M3 22V10l6 4v12M14 6v16l6 4V10M25 3v19"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </span>
         <div>
           <div className="sidebar-brand-name">CL Recoder</div>
-          <div style={{ fontSize: "var(--text-caption)", color: "var(--color-text-muted)" }}>外设输入统计</div>
+          <div className="sidebar-brand-sub">输入与活动记录</div>
         </div>
       </div>
       <nav className="sidebar-nav" aria-label="主导航">
-        {NAV.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            className="nav-item"
-            aria-current={page === item.id ? "page" : undefined}
-            onClick={() => onNavigate(item.id)}
-          >
-            {item.icon}
-            <span>{item.label}</span>
-          </button>
+        {[
+          { label: "统计", items: NAV.slice(0, 6) },
+          { label: "管理", items: NAV.slice(6) },
+        ].map((group) => (
+          <section className="nav-section" key={group.label}>
+            <div className="nav-group-label">{group.label}</div>
+            {group.items.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                className="nav-item"
+                aria-current={page === item.id ? "page" : undefined}
+                onClick={() => onNavigate(item.id)}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </section>
         ))}
       </nav>
       <div className="sidebar-footer">
+        <div className="sidebar-status-label">采集器状态</div>
         <CollectorChip />
-        <div style={{ fontSize: "var(--text-caption)", color: "var(--color-text-placeholder)" }}>
-          本地优先 · 数据不出本机
-        </div>
+        <div className="sidebar-note">数据保存在本机</div>
       </div>
     </aside>
   );

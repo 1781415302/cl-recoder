@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "cl-recoder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clrecoder-core",
@@ -565,12 +565,13 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "webview2-com",
  "windows 0.62.2",
 ]
 
 [[package]]
 name = "clrecoder-collector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clrecoder-core",
@@ -589,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -598,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "log",
@@ -608,14 +609,14 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clrecoder-core",
 ]
 
 [[package]]
 name = "clrecoder-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clrecoder-core",

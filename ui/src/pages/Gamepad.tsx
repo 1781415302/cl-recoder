@@ -50,12 +50,23 @@ function StickSkeleton({ title }: { title: string }) {
 }
 
 /** 折叠明细卡（§4.6：表格默认折叠，不删除访问入口；逐日明细的展开同时是查询门控） */
-function DetailCard(props: { title: string; sub: string; open: boolean; onToggle: () => void; children: ReactNode }) {
+function DetailCard(props: {
+  title: string;
+  sub: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
   return (
-    <div className="card">
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "var(--space-2)", flexWrap: "wrap" }}>
+    <div className="card detail-card">
+      <div className="detail-card-heading">
         <h2 className="card-title">{props.title}</h2>
-        <button type="button" className="btn btn-sm" aria-expanded={props.open} onClick={props.onToggle}>
+        <button
+          type="button"
+          className="btn btn-sm"
+          aria-expanded={props.open}
+          onClick={props.onToggle}
+        >
           {props.open ? "收起" : "展开"}
         </button>
       </div>
@@ -66,16 +77,48 @@ function DetailCard(props: { title: string; sub: string; open: boolean; onToggle
 }
 
 const topColumns: Column<TopKeyRow>[] = [
-  { key: "label", header: "手柄按键", value: (r) => r.label, render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span> },
-  { key: "code", header: "编码", value: (r) => r.code, render: (r) => <span className="mono">{String(r.code)}</span> },
-  { key: "total", header: "累计次数", value: (r) => r.total, numeric: true, render: (r) => fmtNum(r.total) },
+  {
+    key: "label",
+    header: "手柄按键",
+    value: (r) => r.label,
+    render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span>,
+  },
+  {
+    key: "code",
+    header: "编码",
+    value: (r) => r.code,
+    render: (r) => <span className="mono">{String(r.code)}</span>,
+  },
+  {
+    key: "total",
+    header: "累计次数",
+    value: (r) => r.total,
+    numeric: true,
+    render: (r) => fmtNum(r.total),
+  },
 ];
 
 const dailyColumns: Column<KeyDailyRowLabeled>[] = [
-  { key: "day", header: "日期", value: (r) => r.day, render: (r) => fmtDay(r.day) },
+  {
+    key: "day",
+    header: "日期",
+    value: (r) => r.day,
+    render: (r) => fmtDay(r.day),
+  },
   { key: "label", header: "手柄按键", value: (r) => r.label },
-  { key: "code", header: "编码", value: (r) => r.code, render: (r) => <span className="mono">{String(r.code)}</span> },
-  { key: "count", header: "次数", value: (r) => r.count, numeric: true, render: (r) => fmtNum(r.count) },
+  {
+    key: "code",
+    header: "编码",
+    value: (r) => r.code,
+    render: (r) => <span className="mono">{String(r.code)}</span>,
+  },
+  {
+    key: "count",
+    header: "次数",
+    value: (r) => r.count,
+    numeric: true,
+    render: (r) => fmtNum(r.count),
+  },
 ];
 
 export function Gamepad() {
@@ -83,8 +126,12 @@ export function Gamepad() {
   const activity = useAppActivity();
   const qc = useQueryClient();
   // §4.5：按钮 TopKeys 与键盘共享页同构——统计 interval 仅范围含当前 today 时传入（历史不轮询）
-  const includesToday = range.from <= activity.today && activity.today <= range.to;
-  const statsPolicy = uiQueryPolicy(activity.active, includesToday ? 1_000 : undefined);
+  const includesToday =
+    range.from <= activity.today && activity.today <= range.to;
+  const statsPolicy = uiQueryPolicy(
+    activity.active,
+    includesToday ? 1_000 : undefined,
+  );
 
   const devices = useDevices();
   const gamepads = (devices.data ?? []).filter((d) => d.kind === "gamepad");
@@ -93,12 +140,13 @@ export function Gamepad() {
   const deviceId =
     picked !== null && gamepads.some((d) => d.id === picked)
       ? picked
-      : gamepads[0]?.id ?? null;
+      : (gamepads[0]?.id ?? null);
 
   const motion = useGamepadMotion(deviceId, range);
   const topKeys = useQuery({
     queryKey: ["topKeys", deviceId, range.from, range.to, TOP_KEYS_LIMIT],
-    queryFn: () => client.getTopKeys(deviceId!, range.from, range.to, TOP_KEYS_LIMIT),
+    queryFn: () =>
+      client.getTopKeys(deviceId!, range.from, range.to, TOP_KEYS_LIMIT),
     ...statsPolicy,
     enabled: deviceId !== null && statsPolicy.enabled,
   });
@@ -114,12 +162,19 @@ export function Gamepad() {
 
   // 设备/范围语义键：selectedBin/selectedCode 变化即清（渲染期派生，同键盘共享页惯例）
   const deviceRangeKey = `${deviceId ?? "none"}|${range.from}|${range.to}`;
-  const [binState, setBinState] = useState<{ key: string; left: number | null; right: number | null }>(() => ({
+  const [binState, setBinState] = useState<{
+    key: string;
+    left: number | null;
+    right: number | null;
+  }>(() => ({
     key: deviceRangeKey,
     left: null,
     right: null,
   }));
-  const [codeState, setCodeState] = useState<{ key: string; code: number | null }>(() => ({
+  const [codeState, setCodeState] = useState<{
+    key: string;
+    code: number | null;
+  }>(() => ({
     key: deviceRangeKey,
     code: null,
   }));
@@ -147,7 +202,8 @@ export function Gamepad() {
     return max;
   }, [motion.data]);
 
-  const needsUpgrade = motion.data !== undefined && motion.data.availability === "needs_upgrade";
+  const needsUpgrade =
+    motion.data !== undefined && motion.data.availability === "needs_upgrade";
   // 无新运动记录（ready 但活动/行程全零）：如实说明，不把零热度画成采集正常的证据
   const noMotionRecord =
     motion.data !== undefined &&
@@ -159,7 +215,8 @@ export function Gamepad() {
   const topKeysLoading = topKeys.isLoading || !activity.ready;
   const devicesLoading = devices.isLoading || !activity.ready;
 
-  const onSelectCode = (code: number | null) => setCodeState((prev) => ({ key: prev.key, code }));
+  const onSelectCode = (code: number | null) =>
+    setCodeState((prev) => ({ key: prev.key, code }));
 
   return (
     <>
@@ -167,7 +224,7 @@ export function Gamepad() {
         <div>
           <h1 className="page-title">手柄</h1>
           <p className="page-desc">
-            摇杆停留热力与按键计数（XInput/Xbox 系；扳机上穿 0.33 计 1 次；非 XInput 手柄如部分 PS/Switch 暂不统计）
+            摇杆停留分布、运动行程与按键使用 · XInput / Xbox
           </p>
         </div>
         <DateRangePicker value={range} onChange={onChange} />
@@ -188,57 +245,70 @@ export function Gamepad() {
             devices={gamepads}
             selectedId={deviceId}
             onSelect={setPicked}
-            onRenamed={() => void qc.invalidateQueries({ queryKey: ["devices"] })}
+            onRenamed={() =>
+              void qc.invalidateQueries({ queryKey: ["devices"] })
+            }
           />
           {/* DeviceRow.total 仍为全历史口径，固定说明紧邻设备标签（不改 DeviceTabs） */}
-          <p className="chart-hint">设备标签中的次数为全历史累计，不受日期筛选影响；下方按所选日期统计。</p>
 
           {motion.isError ? (
             <div className="card" role="alert">
               <h2 className="card-title">摇杆运动读取失败</h2>
-              <p className="card-sub">{motion.error !== null ? errMsg(motion.error) : "未知错误"}</p>
+              <p className="card-sub">
+                {motion.error !== null ? errMsg(motion.error) : "未知错误"}
+              </p>
             </div>
           ) : needsUpgrade ? (
             <div className="card" role="note">
               <h2 className="card-title">从更新后的采集器开始记录</h2>
               <p className="card-sub">
-                当前数据库仍是旧 schema：启动/更新采集器后，这里将显示左右摇杆停留热力；下方按键统计不受影响。
+                请启动或更新采集器以启用摇杆统计。现有按键统计仍可查看。
               </p>
             </div>
           ) : motion.data === undefined || !activity.ready ? (
-            <div style={{ display: "flex", gap: "var(--space-4)", alignItems: "stretch", flexWrap: "wrap" }}>
-              <div style={{ flex: "1 1 360px", minWidth: 0 }}>
+            <div className="stick-grid">
+              <div style={{ minWidth: 0 }}>
                 <StickSkeleton title="左摇杆停留热力" />
               </div>
-              <div style={{ flex: "1 1 360px", minWidth: 0 }}>
+              <div style={{ minWidth: 0 }}>
                 <StickSkeleton title="右摇杆停留热力" />
               </div>
             </div>
           ) : (
             <>
               {/* 左右摇杆并排卡片（宽度不足时上下排列）；scaleMaxSeconds 为两侧共同色标 */}
-              <div style={{ display: "flex", gap: "var(--space-4)", alignItems: "stretch", flexWrap: "wrap" }}>
-                <div style={{ flex: "1 1 360px", minWidth: 0 }}>
+              <div className="stick-grid">
+                <div style={{ minWidth: 0 }}>
                   <StickHeatmap
                     title="左摇杆停留热力"
                     summary={motion.data.left}
                     selectedBin={binState.left}
                     scaleMaxSeconds={scaleMaxSeconds}
-                    onSelect={(bin) => setBinState((prev) => ({ ...prev, left: bin }))}
+                    onSelect={(bin) =>
+                      setBinState((prev) => ({ ...prev, left: bin }))
+                    }
                   />
                 </div>
-                <div style={{ flex: "1 1 360px", minWidth: 0 }}>
+                <div style={{ minWidth: 0 }}>
                   <StickHeatmap
                     title="右摇杆停留热力"
                     summary={motion.data.right}
                     selectedBin={binState.right}
                     scaleMaxSeconds={scaleMaxSeconds}
-                    onSelect={(bin) => setBinState((prev) => ({ ...prev, right: bin }))}
+                    onSelect={(bin) =>
+                      setBinState((prev) => ({ ...prev, right: bin }))
+                    }
                   />
                 </div>
               </div>
+              <p className="chart-hint">
+                颜色越暖，停留越久；左右使用相同色标。1 R
+                为从中心到满幅边缘的行程。
+              </p>
               {noMotionRecord ? (
-                <p className="chart-hint">暂无摇杆运动记录——从更新后的采集器开始记录；下方按键统计不受影响。</p>
+                <p className="chart-hint">
+                  暂无摇杆运动记录——从更新后的采集器开始记录；下方按键统计不受影响。
+                </p>
               ) : null}
             </>
           )}
@@ -255,7 +325,7 @@ export function Gamepad() {
           {/* 折叠明细：完整列表（无额外查询）+ 逐日明细（展开才查询） */}
           <DetailCard
             title="手柄按键完整列表"
-            sub="覆盖全部已计数编码（请求覆盖完整值域，无 Top-N 截断）；可排序、分页查看"
+            sub="全部按键记录，可排序查看"
             open={listOpen}
             onToggle={() => setListOpen((open) => !open)}
           >
@@ -271,25 +341,43 @@ export function Gamepad() {
                   caption="手柄按键累计排行（所选范围）"
                   pageSize={50}
                   resetKey={deviceRangeKey}
-                  empty={<EmptyState title="该手柄在所选范围内没有按键记录" description="试试扩大日期范围，或确认采集器已开始统计。" />}
+                  empty={
+                    <EmptyState
+                      title="该手柄在所选范围内没有按键记录"
+                      description="试试扩大日期范围，或确认采集器已开始统计。"
+                    />
+                  }
                 />
               </div>
             )}
           </DetailCard>
           <DetailCard
             title="手柄 × 逐日明细"
-            sub="每个手柄按键每天的按下次数（扳机上穿 0.33 计 1 次）；展开后按需查询"
+            sub="每日按键次数 · 扳机超过约三分之一行程计一次"
             open={dailyOpen}
             onToggle={() => setDailyOpen((open) => !open)}
           >
             {keyDaily.isError ? (
-              <p className="card-sub" role="alert" style={{ marginTop: "var(--space-3)" }}>
-                逐日明细读取失败：{keyDaily.error !== null ? errMsg(keyDaily.error) : "未知错误"}
+              <p
+                className="card-sub"
+                role="alert"
+                style={{ marginTop: "var(--space-3)" }}
+              >
+                逐日明细读取失败：
+                {keyDaily.error !== null ? errMsg(keyDaily.error) : "未知错误"}
               </p>
             ) : keyDaily.data === undefined || !activity.ready ? (
-              <div role="status" aria-label="逐日明细加载中" style={{ marginTop: "var(--space-3)" }}>
+              <div
+                role="status"
+                aria-label="逐日明细加载中"
+                style={{ marginTop: "var(--space-3)" }}
+              >
                 <Skeleton h="14px" w="92%" />
-                <Skeleton h="14px" w="83%" style={{ marginTop: "var(--space-3)" }} />
+                <Skeleton
+                  h="14px"
+                  w="83%"
+                  style={{ marginTop: "var(--space-3)" }}
+                />
               </div>
             ) : (
               <div style={{ marginTop: "var(--space-3)" }}>
@@ -301,7 +389,12 @@ export function Gamepad() {
                   caption="手柄按键逐日明细"
                   pageSize={50}
                   resetKey={deviceRangeKey}
-                  empty={<EmptyState title="所选范围内没有逐日数据" description="扩大日期范围后再试。" />}
+                  empty={
+                    <EmptyState
+                      title="所选范围内没有逐日数据"
+                      description="扩大日期范围后再试。"
+                    />
+                  }
                 />
               </div>
             )}

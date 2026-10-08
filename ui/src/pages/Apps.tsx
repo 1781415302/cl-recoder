@@ -17,26 +17,57 @@ import type { AppRowLabeled } from "../api/types";
 
 const columns: Column<AppRowLabeled>[] = [
   {
-    key: "name", header: "应用", value: (r) => r.name,
+    key: "name",
+    header: "应用",
+    value: (r) => r.name,
     render: (r) => (
       <span>
         <span style={{ fontWeight: 600 }}>{r.name}</span>
-        <span className="mono" style={{ marginLeft: "var(--space-2)" }}>{r.exe}</span>
+        <span className="mono" style={{ marginLeft: "var(--space-2)" }}>
+          {r.exe}
+        </span>
       </span>
     ),
   },
-  { key: "exe", header: "进程", value: (r) => r.exe, render: (r) => <span className="mono">{r.exe}</span> },
-  { key: "seconds", header: "前台时长", value: (r) => r.seconds, numeric: true, render: (r) => fmtDuration(r.seconds) },
-  { key: "keys", header: "按键", value: (r) => r.keys, numeric: true, render: (r) => fmtNum(r.keys) },
-  { key: "clicks", header: "点击", value: (r) => r.clicks, numeric: true, render: (r) => fmtNum(r.clicks) },
+  {
+    key: "exe",
+    header: "进程",
+    value: (r) => r.exe,
+    render: (r) => <span className="mono">{r.exe}</span>,
+  },
+  {
+    key: "seconds",
+    header: "前台时长",
+    value: (r) => r.seconds,
+    numeric: true,
+    render: (r) => fmtDuration(r.seconds),
+  },
+  {
+    key: "keys",
+    header: "按键",
+    value: (r) => r.keys,
+    numeric: true,
+    render: (r) => fmtNum(r.keys),
+  },
+  {
+    key: "clicks",
+    header: "点击",
+    value: (r) => r.clicks,
+    numeric: true,
+    render: (r) => fmtNum(r.clicks),
+  },
 ];
 
 export function Apps() {
   const { range, onChange } = useStatisticsRange();
   const activity = useAppActivity();
   // §4.5：interval 仅范围包含当前 today 时传入（历史固定范围不轮询）
-  const includesToday = range.from <= activity.today && activity.today <= range.to;
-  const policy = uiQueryPolicy(activity.active, includesToday ? 1_000 : undefined);
+  const includesToday =
+    range.from <= activity.today && activity.today <= range.to;
+  const policy = uiQueryPolicy(
+    activity.active,
+    includesToday ? 1_000 : undefined,
+  );
   const { data, isLoading } = useQuery({
     queryKey: ["apps", range.from, range.to],
     queryFn: () => client.getApps(range.from, range.to, 200),
@@ -50,7 +81,7 @@ export function Apps() {
       <div className="page-header">
         <div>
           <h1 className="page-title">应用</h1>
-          <p className="page-desc">按 exe 记录的前台时长与该应用内的按键、点击次数</p>
+          <p className="page-desc">时间花在哪里，输入发生在哪里</p>
         </div>
         <DateRangePicker value={range} onChange={onChange} />
       </div>
@@ -60,7 +91,11 @@ export function Apps() {
       ) : (
         <RankedList
           title="应用前台时长排行"
-          rows={(data ?? []).map((r) => ({ id: r.exe, label: r.name || r.exe, value: r.seconds }))}
+          rows={(data ?? []).map((r) => ({
+            id: r.exe,
+            label: r.name || r.exe,
+            value: r.seconds,
+          }))}
           formatValue={fmtDuration}
           labelHeader="应用"
           valueHeader="前台时长"
@@ -78,7 +113,12 @@ export function Apps() {
                 <EmptyState
                   title="还没有应用数据"
                   description="前台应用跟踪在采集器运行时自动记录；切换窗口后稍等片刻再来看。"
-                  action={{ label: "前往设置", onClick: () => { window.location.hash = "settings"; } }}
+                  action={{
+                    label: "前往设置",
+                    onClick: () => {
+                      window.location.hash = "settings";
+                    },
+                  }}
                 />
               }
             />

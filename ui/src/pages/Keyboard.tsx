@@ -6,7 +6,7 @@ export function Keyboard() {
     <DeviceStatsPage
       kind="keyboard"
       title="键盘"
-      description="按设备型号统计每个键的按下次数（物理按下边沿，自动重复不计；跨布局稳定，以 scan code 为准）"
+      description="每个按键的使用次数 · 长按自动重复不计"
       colorVar="--chart-1"
     />
   );

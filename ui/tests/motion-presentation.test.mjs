@@ -361,8 +361,8 @@ const COMPONENTS = [
 ];
 
 test("五个组件模块可加载并导出组件函数；只依赖 react/本地展示层，不查询 API", async () => {
-  // 组件允许的运行时依赖：react hooks、运动展示 lib、格式化 lib、骨架屏
-  const allowed = new Set(["react", "../lib/motionPresentation", "../lib/format", "./Skeleton"]);
+  // 组件允许的运行时依赖：react hooks、运动展示 lib、格式化 lib、骨架屏与本地 SVG 图标
+  const allowed = new Set(["react", "../lib/motionPresentation", "../lib/format", "./Skeleton", "./icons"]);
   for (const [file, exportName] of COMPONENTS) {
     const { exports, required } = await loadComponentModule(`../src/components/${file}`);
     assert.equal(typeof exports[exportName], "function", `${file} 应导出 ${exportName}`);

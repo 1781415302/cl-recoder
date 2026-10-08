@@ -8,7 +8,12 @@ import { EmptyState } from "../components/EmptyState";
 import { SkeletonCard, SkeletonCards } from "../components/Skeleton";
 import { StatCard } from "../components/StatCard";
 import { TrendChart } from "../components/TrendChart";
-import { IconGamepad, IconKeyboard, IconMouse } from "../components/icons";
+import {
+  IconArrowRight,
+  IconGamepad,
+  IconKeyboard,
+  IconMouse,
+} from "../components/icons";
 import { fmtDayShort, fmtNum, kindLabel } from "../lib/format";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { useStatisticsRange } from "../lib/useStatisticsRange";
@@ -22,8 +27,19 @@ interface DeviceSummary {
 
 const deviceColumns: Column<DeviceSummary>[] = [
   { key: "name", header: "设备", value: (r) => r.name },
-  { key: "kind", header: "种类", value: (r) => r.kind, render: (r) => kindLabel(r.kind) },
-  { key: "total", header: "范围内累计", value: (r) => r.total, numeric: true, render: (r) => fmtNum(r.total) },
+  {
+    key: "kind",
+    header: "种类",
+    value: (r) => r.kind,
+    render: (r) => kindLabel(r.kind),
+  },
+  {
+    key: "total",
+    header: "范围内累计",
+    value: (r) => r.total,
+    numeric: true,
+    render: (r) => fmtNum(r.total),
+  },
 ];
 
 export function Dashboard() {
@@ -34,6 +50,9 @@ export function Dashboard() {
   const singleDay = range.from === range.to;
   // 活动初始化完成前查询被 gating（无凭据不臆断"无数据"），按加载态呈现
   const loading = isLoading || !activity.ready;
+  const deviceRows = [...(data?.devices ?? [])].sort(
+    (a, b) => b.total - a.total || a.id - b.id,
+  );
 
   if (isError) {
     return (
@@ -50,7 +69,7 @@ export function Dashboard() {
       <div className="page-header">
         <div>
           <h1 className="page-title">仪表盘</h1>
-          <p className="page-desc">外设输入总览 —— 今日数据近实时自动刷新</p>
+          <p className="page-desc">你的外设输入与设备使用概览</p>
         </div>
         <DateRangePicker value={range} onChange={onChange} />
       </div>
@@ -60,9 +79,36 @@ export function Dashboard() {
       ) : (
         <div className="grid-cards">
           {/* Overview.today 仍为 to 日拆分（§4.6）：卡片文案按 to 日如实标注 */}
-          <StatCard label={range.to === activity.today ? "今日按键" : `${fmtDayShort(range.to)} 按键`} value={fmtNum(data?.today.keys ?? 0)} tone="primary" icon={<IconKeyboard />} />
-          <StatCard label={range.to === activity.today ? "今日点击" : `${fmtDayShort(range.to)} 点击`} value={fmtNum(data?.today.clicks ?? 0)} tone="default" icon={<IconMouse />} />
-          <StatCard label={range.to === activity.today ? "今日手柄" : `${fmtDayShort(range.to)} 手柄`} value={fmtNum(data?.today.gamepad ?? 0)} tone="accent" icon={<IconGamepad />} />
+          <StatCard
+            label={
+              range.to === activity.today
+                ? "今日按键"
+                : `${fmtDayShort(range.to)} 按键`
+            }
+            value={fmtNum(data?.today.keys ?? 0)}
+            tone="primary"
+            icon={<IconKeyboard />}
+          />
+          <StatCard
+            label={
+              range.to === activity.today
+                ? "今日点击"
+                : `${fmtDayShort(range.to)} 点击`
+            }
+            value={fmtNum(data?.today.clicks ?? 0)}
+            tone="default"
+            icon={<IconMouse />}
+          />
+          <StatCard
+            label={
+              range.to === activity.today
+                ? "今日手柄输入"
+                : `${fmtDayShort(range.to)} 手柄`
+            }
+            value={fmtNum(data?.today.gamepad ?? 0)}
+            tone="accent"
+            icon={<IconGamepad />}
+          />
         </div>
       )}
 
@@ -70,7 +116,7 @@ export function Dashboard() {
       {!singleDay && !loading ? (
         <TrendChart
           data={data?.days ?? []}
-          title="每日总事件（所选范围）"
+          title="输入趋势"
           colorVar="--chart-1"
           seriesName="全部设备"
         />
@@ -80,9 +126,59 @@ export function Dashboard() {
         <SkeletonCard rows={4} />
       ) : (
         <div className="card">
-          <h2 className="card-title">设备统计</h2>
-          <p className="card-sub">按设备型号分开统计（同型号合并；XInput 手柄为单行合并）；数值为所选范围累计</p>
-          <div style={{ marginTop: "var(--space-3)" }}>
+          <div className="section-heading">
+            <div>
+              <h2 className="card-title">我的设备</h2>
+              <p className="card-sub">
+                所选范围累计 · 同型号合并，XInput 手柄合并
+              </p>
+            </div>
+            <span className="chip">{deviceRows.length} 组设备</span>
+          </div>
+          {deviceRows.length > 0 ? (
+            <div className="device-tile-grid">
+              {deviceRows.map((device) => (
+                <button
+                  type="button"
+                  className="device-tile"
+                  key={device.id}
+                  onClick={() => {
+                    window.location.hash = device.kind;
+                  }}
+                  aria-label={`打开${kindLabel(device.kind)}统计页面：${device.name}`}
+                >
+                  <div className="device-tile-top">
+                    <span className="device-tile-icon" aria-hidden="true">
+                      {device.kind === "keyboard" ? (
+                        <IconKeyboard />
+                      ) : device.kind === "mouse" ? (
+                        <IconMouse />
+                      ) : (
+                        <IconGamepad />
+                      )}
+                    </span>
+                    <span className="chip">{kindLabel(device.kind)}</span>
+                  </div>
+                  <div className="device-tile-name">{device.name}</div>
+                  <div className="device-tile-footer">
+                    <span className="device-tile-total">
+                      {fmtNum(device.total)}
+                      <span className="device-tile-unit">次</span>
+                    </span>
+                    <span className="device-tile-link">
+                      查看
+                      <IconArrowRight size={13} />
+                    </span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <details
+            className="overview-details"
+            open={(data?.devices.length ?? 0) === 0}
+          >
+            <summary>查看设备明细</summary>
             <DataTable
               columns={deviceColumns}
               rows={data?.devices ?? []}
@@ -93,11 +189,16 @@ export function Dashboard() {
                 <EmptyState
                   title="还没有任何设备记录"
                   description="启动采集器后，接入的键盘/鼠标/手柄会自动出现在这里。"
-                  action={{ label: "前往设置启动采集器", onClick: () => { window.location.hash = "settings"; } }}
+                  action={{
+                    label: "前往设置启动采集器",
+                    onClick: () => {
+                      window.location.hash = "settings";
+                    },
+                  }}
                 />
               }
             />
-          </div>
+          </details>
         </div>
       )}
     </>

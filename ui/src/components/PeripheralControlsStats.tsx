@@ -1,20 +1,12 @@
-// 鼠标/手柄控件图（motion-dpi §4.6 S7）：本地 SVG 参考外观 + 原生 button 点击层。
-//
-// 边界：组件不查询 API；几何来自 lib/motionPresentation（hit ≥44×44、两两不重叠，测试钉死），
-// 组件以固定画布尺寸渲染 + 容器横向滚动（不缩放，保证点击区域不缩水）。计数按 code 直接查找
-// （不 SUM、不靠 label 定位、缺行=0）；9/17 码全部可见，未知 code 在「其它输入」保留入口，
-// 完整集合由页面明细表呈现。所有控件有字母/箭头标记（不只靠颜色）；ABXY 用低饱和 Xbox 语义色
-// （主题令牌 + 低不透明度）。点击/Enter/Space 仅 onSelect(code)，Escape 清除；数据刷新无动画。
 import { useMemo } from "react";
 import type { TopKeyRow } from "../api/types";
 import {
   MOTION_CANVAS,
   motionControlSpecs,
-  type MotionControlSpec,
+  type MotionDirection,
 } from "../lib/motionPresentation";
 import { fmtCompact, fmtNum } from "../lib/format";
 import { Skeleton } from "./Skeleton";
-
 export interface PeripheralControlsStatsProps {
   kind: "mouse" | "gamepad";
   rows: TopKeyRow[];
@@ -22,216 +14,192 @@ export interface PeripheralControlsStatsProps {
   onSelect: (code: number | null) => void;
   loading?: boolean;
 }
-
-/** ABXY 低饱和 Xbox 语义色（主题令牌；所有按钮另有字母，不只靠颜色） */
-const ABXY_FILL: Record<number, string> = {
-  1: "var(--color-positive)", // A
-  2: "var(--color-danger)", // B
-  3: "var(--color-accent)", // Y
-  4: "var(--chart-2)", // X
-};
-
-function arrowPoints(c: MotionControlSpec): string {
-  const { cx, cy, w, h } = c;
-  switch (c.dir ?? "up") {
-    case "down":
-      return `${cx},${cy + h / 2} ${cx - w / 2},${cy - h / 2} ${cx + w / 2},${cy - h / 2}`;
-    case "left":
-      return `${cx - w / 2},${cy} ${cx + w / 2},${cy - h / 2} ${cx + w / 2},${cy + h / 2}`;
-    case "right":
-      return `${cx + w / 2},${cy} ${cx - w / 2},${cy - h / 2} ${cx - w / 2},${cy + h / 2}`;
-    default:
-      return `${cx},${cy - h / 2} ${cx - w / 2},${cy + h / 2} ${cx + w / 2},${cy + h / 2}`;
-  }
-}
-
-/** 单控件形状 + 标记字母（aria-hidden 装饰层；可读名称由按钮 aria-label 提供） */
-function ControlShape({ c }: { c: MotionControlSpec }) {
-  const abxy = ABXY_FILL[c.code];
-  if (c.shape === "circle") {
-    return (
-      <g>
-        <circle
-          cx={c.cx}
-          cy={c.cy}
-          r={c.w / 2}
-          style={abxy ? { fill: abxy, fillOpacity: 0.16, stroke: abxy, strokeOpacity: 0.55 } : undefined}
-          className={abxy ? undefined : "mc-shape"}
-        />
-        <text
-          className="mc-label"
-          x={c.cx}
-          y={c.cy - 2}
-          style={{ fontSize: c.shortLabel.length <= 2 ? 14 : 12, fontWeight: c.shortLabel.length <= 2 ? 600 : 400 }}
-          dominantBaseline="central"
-        >
-          {c.shortLabel}
-        </text>
-      </g>
-    );
-  }
-  if (c.shape === "arrow") {
-    return <polygon points={arrowPoints(c)} style={{ fill: "var(--color-primary)", fillOpacity: 0.85 }} />;
-  }
+function DirectionMark({ direction }: { direction: MotionDirection }) {
+  const rotation = { up: 0, right: 90, down: 180, left: 270 }[direction];
   return (
-    <g>
-      <rect
-        x={c.cx - c.w / 2}
-        y={c.cy - c.h / 2}
-        width={c.w}
-        height={c.h}
-        rx={c.shape === "pill" ? Math.min(c.w, c.h) / 2 : 10}
-        className="mc-shape"
-      />
-      <text
-        className="mc-label"
-        x={c.cx}
-        y={c.cy}
-        style={{ fontSize: c.shortLabel.length <= 2 ? 14 : 11 }}
-        dominantBaseline="central"
-      >
-        {c.shortLabel}
-      </text>
-    </g>
+    <svg
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      aria-hidden="true"
+    >
+      <path d="m3 10 5-5 5 5" transform={`rotate(${rotation} 8 8)`} />
+    </svg>
   );
 }
-
-export function PeripheralControlsStats({ kind, rows, selectedCode, onSelect, loading = false }: PeripheralControlsStatsProps) {
-  const specs = motionControlSpecs(kind);
-  const canvas = MOTION_CANVAS[kind];
-
-  // code → 行（后端行按 code 聚合，正常无重复；重复时取首个，绝不求和）
-  const rowByCode = useMemo(() => {
-    const m = new Map<number, TopKeyRow>();
-    for (const r of rows) if (!m.has(r.code)) m.set(r.code, r);
-    return m;
-  }, [rows]);
-  // 参考图未绘制的输入：在「其它输入」保留入口（完整行仍由页面明细表呈现）
-  const unmapped = useMemo(() => {
-    const mapped = new Set(specs.map((c) => c.code));
-    return rows.filter((r) => !mapped.has(r.code));
-  }, [rows, specs]);
-
-  const title = kind === "mouse" ? "鼠标控件" : "手柄控件";
-
-  function onCardKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      onSelect(null);
-    }
-  }
-
-  const selectedRow = selectedCode !== null ? rowByCode.get(selectedCode) : undefined;
-  const selectedFallback =
-    selectedCode !== null ? specs.find((c) => c.code === selectedCode)?.shortLabel : undefined;
-
+function DeviceShell({ kind }: { kind: "mouse" | "gamepad" }) {
+  const size = MOTION_CANVAS[kind];
   return (
-    <div className="card" onKeyDown={onCardKeyDown}>
-      <h2 className="card-title">{title}</h2>
-      <p className="card-sub">
-        {kind === "mouse" ? "左/右/中键、X1/X2 与四向滚轮" : "Xbox 参考外观：扳机/肩键/摇杆/十字/ABXY"} ·
-        已记录 {fmtNum(rows.length)} 项
-      </p>
+    <svg
+      className="peripheral-svg"
+      width={size.width}
+      height={size.height}
+      viewBox={`0 0 ${size.width} ${size.height}`}
+      aria-hidden="true"
+    >
+      {kind === "mouse" ? (
+        <>
+          <path
+            className="peripheral-shell"
+            d="M160 14C77 14 34 64 34 144v126c0 54 42 76 126 76s126-22 126-76V144C286 64 243 14 160 14Z"
+          />
+          <path className="peripheral-seam" d="M34 184h252M160 14v170" />
+          <rect
+            className="peripheral-inset"
+            x="150"
+            y="70"
+            width="20"
+            height="64"
+            rx="10"
+          />
+          <path className="peripheral-seam" d="M102 315q58 20 116 0" />
+        </>
+      ) : (
+        <>
+          <path
+            className="peripheral-shell"
+            d="M104 65C77 70 63 94 55 131L33 260c-8 43 4 66 27 66 26 0 43-22 68-66l23-31c34 33 91 60 159 60s125-27 159-60l23 31c25 44 42 66 68 66 23 0 35-23 27-66l-22-129c-8-37-22-61-49-66-67-12-131 20-206 20S171 53 104 65Z"
+          />
+          <path
+            className="peripheral-seam"
+            d="M77 270q10 23 21 3M543 270q-10 23-21 3M165 117q145 23 290 0"
+          />
+          <circle className="peripheral-inset" cx="130" cy="178" r="42" />
+          <circle className="peripheral-inset" cx="365" cy="258" r="40" />
+          <path
+            className="peripheral-inset"
+            d="M213 162h44v44h44v44h-44v44h-44v-44h-44v-44h44Z"
+          />
+        </>
+      )}
+    </svg>
+  );
+}
+export function PeripheralControlsStats({
+  kind,
+  rows,
+  selectedCode,
+  onSelect,
+  loading = false,
+}: PeripheralControlsStatsProps) {
+  const specs = motionControlSpecs(kind),
+    size = MOTION_CANVAS[kind];
+  const lookup = useMemo(() => {
+    const entries = new Map<number, TopKeyRow>();
+    for (const row of rows)
+      if (!entries.has(row.code)) entries.set(row.code, row);
+    return entries;
+  }, [rows]);
+  const others = rows.filter(
+    (row) => !specs.some((spec) => spec.code === row.code),
+  );
+  const selected = selectedCode === null ? null : lookup.get(selectedCode);
+  const selectedLabel =
+    selected?.label ??
+    specs.find((spec) => spec.code === selectedCode)?.shortLabel;
+  return (
+    <section
+      className="card peripheral-card"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          onSelect(null);
+        }
+      }}
+    >
+      <div className="section-heading">
+        <div>
+          <h2 className="card-title">按键分布</h2>
+          <p className="card-sub">
+            {kind === "mouse"
+              ? "按下与滚动方向分别记录"
+              : "Xbox 布局 · 肩键、扳机与各按键分别记录"}
+          </p>
+        </div>
+        <span className="chip">{specs.length} 类控件</span>
+      </div>
       {loading ? (
-        <div role="status" aria-label={`${title}加载中`} style={{ marginTop: "var(--space-3)" }}>
-          <Skeleton h="44px" />
-          <Skeleton h={`${Math.round((canvas.height * 320) / canvas.width)}px`} style={{ marginTop: "var(--space-3)" }} />
+        <div role="status" aria-label="按键分布加载中">
+          <Skeleton h={`${size.height}px`} />
         </div>
       ) : (
         <>
-          <div className="mc-stage" style={{ marginTop: "var(--space-3)" }}>
-            <div className="mc-stage-inner" style={{ width: canvas.width, height: canvas.height }}>
-              <svg
-                width={canvas.width}
-                height={canvas.height}
-                viewBox={`0 0 ${canvas.width} ${canvas.height}`}
-                aria-hidden="true"
-                focusable="false"
-                className="mc-svg"
-              >
-                {kind === "mouse" ? (
-                  <g>
-                    <path
-                      className="mc-body"
-                      d="M 160 12 C 78 12 24 66 24 158 L 24 352 C 24 400 82 418 160 418 C 238 418 296 400 296 352 L 296 158 C 296 66 242 12 160 12 Z"
-                    />
-                    <line x1={24} y1={176} x2={296} y2={176} className="mc-line" />
-                    <line x1={160} y1={12} x2={160} y2={176} className="mc-line" />
-                    <rect x={152} y={70} width={16} height={56} rx={8} className="mc-detail" />
-                  </g>
-                ) : (
-                  <g>
-                    <path
-                      className="mc-body"
-                      transform="scale(0.78)"
-                      d="M 122 64 C 80 68 58 106 52 158 C 46 212 44 266 52 318 C 60 372 76 432 116 460 C 148 482 180 462 190 426 C 198 396 206 440 244 444 C 288 448 332 448 380 448 C 428 448 472 448 516 444 C 554 440 562 396 570 426 C 580 462 612 482 644 460 C 684 432 700 372 708 318 C 716 266 714 212 708 158 C 702 106 680 68 638 64 C 556 56 468 84 380 84 C 292 84 204 56 122 64 Z"
-                    />
-                    {/* 十字 D-pad 底座（四臂点击区由控件层提供） */}
-                    <rect x={263} y={217} width={44} height={132} rx={8} className="mc-detail" />
-                    <rect x={219} y={261} width={132} height={44} rx={8} className="mc-detail" />
-                  </g>
-                )}
-                {specs.map((c) => (
-                  <ControlShape key={c.code} c={c} />
-                ))}
-              </svg>
-              {specs.map((c) => {
-                const total = rowByCode.get(c.code)?.total ?? 0;
-                const selected = selectedCode === c.code;
+          <div className="peripheral-stage">
+            <div
+              className="peripheral-board"
+              style={{ width: size.width, height: size.height }}
+            >
+              <DeviceShell kind={kind} />
+              {specs.map((spec) => {
+                const count = lookup.get(spec.code)?.total ?? 0;
                 return (
                   <button
-                    key={c.code}
                     type="button"
-                    className={`mc-hit${c.shape === "circle" ? " mc-hit-round" : ""}`}
-                    style={{ left: c.hit.x, top: c.hit.y, width: c.hit.w, height: c.hit.h }}
-                    aria-pressed={selected}
-                    aria-label={`${c.shortLabel}，编码 ${c.code}，${fmtNum(total)} 次${selected ? "，已选中" : ""}`}
-                    onClick={() => onSelect(c.code)}
+                    key={spec.code}
+                    className={`peripheral-button ${kind === "gamepad" ? "gamepad-button" : "mouse-button"}`}
+                    data-code={spec.code}
+                    data-shape={spec.shape}
+                    style={{
+                      left: spec.hit.x,
+                      top: spec.hit.y,
+                      width: spec.hit.w,
+                      height: spec.hit.h,
+                    }}
+                    aria-pressed={selectedCode === spec.code}
+                    aria-label={`${spec.shortLabel}，${fmtNum(count)} 次`}
+                    onClick={() => onSelect(spec.code)}
                   >
-                    <span className="mc-count" aria-hidden="true">{fmtCompact(total)}</span>
+                    {spec.shape === "arrow" ? (
+                      <DirectionMark direction={spec.dir ?? "up"} />
+                    ) : (
+                      <span className="peripheral-label" aria-hidden="true">
+                        {spec.shortLabel}
+                      </span>
+                    )}
+                    <span className="peripheral-count" aria-hidden="true">
+                      {fmtCompact(count)}
+                    </span>
                   </button>
                 );
               })}
             </div>
           </div>
-          <div className="dev-detail" aria-live="polite">
+          <div className="peripheral-readout" aria-live="polite">
             {selectedCode === null ? (
-              <span className="td-muted">点击控件查看精确数值；Escape 清除选择。未知码见「其它输入」与完整明细表。</span>
-            ) : selectedRow ? (
-              <>
-                <span style={{ fontWeight: 600 }}>{selectedRow.label}</span>
-                <span className="mono">（编码 {selectedRow.code}）</span>
-                <span className="num">{fmtNum(selectedRow.total)} 次</span>
-              </>
+              <span>点击按键查看完整计数</span>
             ) : (
               <>
-                <span style={{ fontWeight: 600 }}>{selectedFallback ?? `编码 ${selectedCode}`}</span>
-                <span className="mono">（编码 {selectedCode}）</span>
-                <span className="td-muted">所选范围内无记录（0 次）</span>
+                <strong>{selectedLabel ?? `其它输入 ${selectedCode}`}</strong>
+                <span className="num">{fmtNum(selected?.total ?? 0)} 次</span>
+                <span>所选日期</span>
               </>
             )}
           </div>
-          {unmapped.length > 0 ? (
-            <div className="dev-other">
-              <p className="dev-other-title">其它输入（参考图未绘制）· {unmapped.length} 项</p>
+          {others.length > 0 && (
+            <div>
+              <p className="dev-other-title">其它输入</p>
               <div className="dev-other-list">
-                {unmapped.map((r) => (
+                {others.map((row) => (
                   <button
-                    key={r.code}
-                    type="button"
                     className="dev-other-chip"
-                    aria-pressed={selectedCode === r.code}
-                    onClick={() => onSelect(r.code)}
+                    key={row.code}
+                    type="button"
+                    aria-pressed={selectedCode === row.code}
+                    onClick={() => onSelect(row.code)}
                   >
-                    <span className="dev-other-label">{r.label}</span>
-                    <span className="mc-count">{fmtNum(r.total)}</span>
+                    <span className="dev-other-label">{row.label}</span>
+                    <span className="num">{fmtNum(row.total)}</span>
                   </button>
                 ))}
               </div>
             </div>
-          ) : null}
+          )}
+          {kind === "gamepad" && (
+            <p className="chart-hint">Guide 键可能被系统接管，无法采集。</p>
+          )}
         </>
       )}
-    </div>
+    </section>
   );
 }
