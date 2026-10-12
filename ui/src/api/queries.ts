@@ -50,6 +50,18 @@ export function useCollectorStatus() {
   });
 }
 
+/** hardening-v4：只读提示轮询间隔（schema 过新 / 旧安装迁移提示变化极少，30 秒足够） */
+export const POLL_NOTICES_MS = 30_000;
+
+export function useAppNotices() {
+  const activity = useAppActivity();
+  return useQuery({
+    queryKey: ["appNotices"],
+    queryFn: () => client.getAppNotices(),
+    ...uiQueryPolicy(activity.active, POLL_NOTICES_MS),
+  });
+}
+
 export function useDevices() {
   const activity = useAppActivity();
   return useQuery({

@@ -1563,3 +1563,16 @@ select {
     padding: 16px 0 0;
   }
 }
+
+/* hardening-v4 §4.5(b)：schema 过新红色横幅 */
+.app-banner {
+  margin: 0 24px 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.app-banner--danger {
+  color: #fff;
+  background: var(--color-danger);
+}

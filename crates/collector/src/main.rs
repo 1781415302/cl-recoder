@@ -103,6 +103,9 @@ fn hide_console_window() {
     }
 }
 
+/// 统计库 schema 高于本程序支持版本时的专用退出码（hardening-v4 §4.5(b)，现用 0/1/2，3 定稿）。
+const EXIT_SCHEMA_TOO_NEW: i32 = 3;
+
 fn real_main() -> i32 {
     // §4.1 先解析 mode：生产 Run 不得先初始化旧 env_logger；selftest 单独初始化
     // 既有 stderr logger；Version/Help 不碰任何日志。
@@ -215,6 +218,18 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
     let writer = match Writer::open(&db_path) {
         Ok(w) => Arc::new(w),
         Err(e) => {
+            // hardening-v4 §4.5(b)：库由更新版本创建 → 专用诊断码 + 退出码 3，不迁移、不写入。
+            if let clrecoder_store::StoreError::SchemaTooNew { .. } = e {
+                if let Some(d) = &diagnostics {
+                    d.record(
+                        Level::Error,
+                        "store.schema_too_new",
+                        &format!("统计库 {} 拒绝写入: {e}", db_path.display()),
+                    );
+                }
+                eprintln!("cl-recoder-collector: 统计库 {} 拒绝写入: {e}", db_path.display());
+                return EXIT_SCHEMA_TOO_NEW;
+            }
             log::error!("打开统计库 {} 失败: {e}", db_path.display());
             eprintln!("cl-recoder-collector: 打开统计库 {} 失败: {e}", db_path.display());
             return 1;

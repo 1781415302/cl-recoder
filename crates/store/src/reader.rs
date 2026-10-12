@@ -1360,4 +1360,26 @@ mod tests {
         assert!(app_daily_rows(&conn, "2020-01-01", "2020-01-31").unwrap().is_empty());
         assert!(combo_daily_rows(&conn, "2020-01-01", "2020-01-31").unwrap().is_empty());
     }
+
+    /// hardening-v4 §4.5(a)：导出单快照的 store 级证明——只读连接开启 DEFERRED 事务并首次读取后，
+    /// 另一连接提交的写入对该事务不可见（两次查询结果一致），提交后新连接才可见。
+    #[test]
+    fn read_transaction_pins_snapshot_across_queries() {
+        let (db, w) = seed("reader-snapshot");
+        let ro = Connection::open_with_flags(
+            db.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tx = ro.unchecked_transaction().unwrap();
+        let first = daily_totals(&tx, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        w.flush(&FlushBatch { input: vec![(1, DAY2.into(), 0x1E, 1000)], ..Default::default() })
+            .unwrap();
+        let second = daily_totals(&tx, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        let dump = |v: &[DayCount]| v.iter().map(|d| (d.day.clone(), d.total)).collect::<Vec<_>>();
+        assert_eq!(dump(&first), dump(&second), "同一读事务内快照固定");
+        tx.commit().unwrap();
+        let after = daily_totals(&ro, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        assert_eq!(after.iter().find(|d| d.day == DAY2).unwrap().total, 12 + 1000);
+    }
 }

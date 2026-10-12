@@ -63,6 +63,8 @@ pub struct AppState {
     pub settings: Arc<RwLock<Settings>>,
     /// 统计库路径：仅 `with_ro` 兜底重连使用；写路径命令继续用 `db::stats_db_path()`（§4.5）。
     stats_path: PathBuf,
+    /// 最近一次 schema 过新检测结果 `(found, supported)`（hardening-v4 §4.5(b)；None = 未过新）。
+    schema_too_new: Arc<Mutex<Option<(i64, i64)>>>,
 }
 
 impl AppState {
@@ -97,12 +99,52 @@ impl AppState {
             crate::gui_log!("WARN: stats.db 不可用（{e}），使用内存兜底连接（引导态空数据）");
             Connection::open_in_memory().expect("内存连接不可能打开失败")
         });
-        Self {
+        let st = Self {
             ro_conn: Arc::new(Mutex::new(conn)),
             settings: Arc::new(RwLock::new(settings)),
             stats_path,
-        }
+            schema_too_new: Arc::new(Mutex::new(None)),
+        };
+        // hardening-v4 §4.5(b)：打开 ro 连接后立即检测一次；过新时继续以该连接只读展示。
+        let _ = st.refresh_schema_status();
+        st
     }
+
+    /// 只读检测统计库 schema 是否高于本程序支持版本，并更新缓存状态（hardening-v4 §4.5(b)）。
+    ///
+    /// 返回 `Some((found, supported))` 表示过新。兜底内存连接（库尚不存在）视为未过新；
+    /// 检测本身的 SQLite 错误（短暂 BUSY 等）保持上次结论，不误报也不误清。
+    pub fn refresh_schema_status(&self) -> Option<(i64, i64)> {
+        let checked = self.with_ro(|c| {
+            if Self::is_fallback_conn(c) {
+                return Ok(None);
+            }
+            match store::schema::check_schema_not_newer(c) {
+                Ok(()) => Ok(None),
+                Err(store::StoreError::SchemaTooNew { found, supported }) => {
+                    Ok(Some((found, supported)))
+                }
+                Err(e) => Err(e),
+            }
+        });
+        let mut cur = self.schema_too_new.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Ok(next) = checked {
+            if *cur != next {
+                match next {
+                    Some((found, supported)) => crate::gui_log!(
+                        "WARN: 统计库 schema v{found} 高于本程序支持的 v{supported}，仅只读展示"
+                    ),
+                    None => crate::gui_log!("INFO: 统计库 schema 版本恢复为受支持范围"),
+                }
+                *cur = next;
+                self.on_schema_status_changed();
+            }
+        }
+        *cur
+    }
+
+    /// schema 过新状态变化时的失效钩子（hardening-v4 §4.3：概览缓存 generation 在 M-B 接入）。
+    fn on_schema_status_changed(&self) {}
 
     /// 取 ro 连接。毒化互斥量恢复为可用——GUI 查询线程 panic 不应让后续查询永久失败。
     fn lock_ro(&self) -> MutexGuard<'_, Connection> {
@@ -234,6 +276,26 @@ mod tests {
         let r: store::Result<usize> =
             st.with_ro(|c| Ok(c.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get::<_, i64>(0))? as usize));
         assert!(r.is_err(), "兜底连接未迁移 schema，查询应失败并由上层映射为空");
+    }
+
+    /// hardening-v4 §4.5(b)：GUI 侧 schema 过新检测——新库/v3 为 None，v99 为 Some((99, 3))，
+    /// 兜底连接为 None。
+    #[test]
+    fn schema_status_detects_too_new() {
+        let missing = testutil::temp_path("state-schema-missing", "db");
+        testutil::remove_all(&missing);
+        assert_eq!(AppState::with_db_path(missing).refresh_schema_status(), None);
+
+        let f = TempFile::new("state-schema", "db");
+        drop(store::writer::Writer::open(f.as_ref()).unwrap());
+        let st = AppState::with_db_path(f.to_path_buf());
+        assert_eq!(st.refresh_schema_status(), None, "v3");
+        let rw = Connection::open(f.as_ref()).unwrap();
+        rw.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'x')", [])
+            .unwrap();
+        assert_eq!(st.refresh_schema_status(), Some((99, store::schema::SCHEMA_VERSION)));
+        rw.execute("DELETE FROM schema_migrations WHERE version = 99", []).unwrap();
+        assert_eq!(st.refresh_schema_status(), None, "恢复后清除");
     }
 
     #[test]
