@@ -15,6 +15,9 @@
 #   - OWNER RIGHTS(S-1-3-4/OW)：其 ACE 只约束 Owner；Owner 非可信主体时已直接判为不可信，
 #     故 OW ACE 一律跳过（不重复判定）。
 #   - Deny ACE 一律忽略（保守：可能误拒，不会因 Deny 而放行）。
+#   - 条件 ACE（XA/XD）及无法可靠分类的 ACE：不求值条件表达式，一律视为不可信；
+#     ACE 列表用嵌套括号感知切分，避免条件表达式内的括号截断后续普通 Allow ACE。
+#   - Windows 上 Get-UntrustedWriteAce 优先走 RawSecurityDescriptor；Linux 单测走 SDDL 字符串路径。
 #   - 只看 Allow ACE；忽略仅作用于新建子项的 InheritOnly（IO）ACE。
 #   - 对象 Owner 不在可信集合 → 不可信（Owner 隐含 WRITE_DAC）。
 #   - exe 文件本身：WriteData/AppendData/WriteEA/WriteAttributes/Delete/WRITE_DAC/WRITE_OWNER/
@@ -122,24 +125,134 @@ function Test-IsTrustedWriteSid([string]$Sid) {
   return $false
 }
 
+# 纯函数：在括号深度 0 处截取直到 $Marker（不含），用于剥离 DACL 后的 SACL（S:）。
+function Get-SddlTextUntilTopLevelMarker([string]$Text, [string]$Marker) {
+  if (-not $Text) { return "" }
+  $mLen = $Marker.Length
+  if ($mLen -le 0) { return $Text }
+  $depth = 0
+  for ($i = 0; $i -le $Text.Length - $mLen; $i++) {
+    $ch = $Text[$i]
+    if ($ch -eq [char]'(') { $depth++ }
+    elseif ($ch -eq [char]')') { if ($depth -gt 0) { $depth-- } }
+    elseif ($depth -eq 0 -and $Text.Substring($i, $mLen) -eq $Marker) {
+      return $Text.Substring(0, $i)
+    }
+  }
+  return $Text
+}
+
+# 纯函数：按嵌套括号切分 ACE 列表。返回 ACE 字符串数组（含外层括号）；
+# 无法平衡或出现括号外杂讯时返回 $null（调用方应保守拒绝）。
+function Split-SddlAceList([string]$AceText) {
+  if ($null -eq $AceText) { return ,@() }
+  $aces = New-Object System.Collections.Generic.List[string]
+  $n = $AceText.Length
+  $i = 0
+  while ($i -lt $n) {
+    while ($i -lt $n -and [char]::IsWhiteSpace($AceText[$i])) { $i++ }
+    if ($i -ge $n) { break }
+    if ($AceText[$i] -ne [char]'(') { return $null }
+    $depth = 0
+    $start = $i
+    for (; $i -lt $n; $i++) {
+      $ch = $AceText[$i]
+      if ($ch -eq [char]'(') { $depth++ }
+      elseif ($ch -eq [char]')') {
+        $depth--
+        if ($depth -eq 0) {
+          $i++
+          [void]$aces.Add($AceText.Substring($start, $i - $start))
+          break
+        }
+      }
+    }
+    if ($depth -ne 0) { return $null }
+  }
+  return ,$aces.ToArray()
+}
+
+# 纯函数：在括号深度 0 处按分号切分 ACE 字段（条件表达式内的分号不切开）。
+function Split-SddlAceFields([string]$AceInner) {
+  $fields = New-Object System.Collections.Generic.List[string]
+  $depth = 0
+  $start = 0
+  for ($i = 0; $i -lt $AceInner.Length; $i++) {
+    $ch = $AceInner[$i]
+    if ($ch -eq [char]'(') { $depth++ }
+    elseif ($ch -eq [char]')') { if ($depth -gt 0) { $depth-- } }
+    elseif ($ch -eq [char]';' -and $depth -eq 0) {
+      [void]$fields.Add($AceInner.Substring($start, $i - $start))
+      $start = $i + 1
+    }
+  }
+  [void]$fields.Add($AceInner.Substring($start))
+  return ,$fields.ToArray()
+}
+
 # 纯函数：解析 SDDL 的 DACL 形态（不依赖 Windows ACL API，可在 Linux pwsh 单测）。
-# 返回 Kind = Null | Empty | Aces | Invalid；Aces 时 Text 为 ACE 括号串。
+# 使用嵌套括号感知切分，不会因条件 ACE 内的括号而截断后续 ACE。
+# 返回 Kind = Null | Empty | Aces | Invalid；Aces 时 Text 为完整 ACE 括号串。
 function Get-SddlDaclInfo([string]$Sddl) {
   if (-not $Sddl -or -not $Sddl.Trim()) { return @{ Kind = "Invalid"; Text = "" } }
   if ($Sddl -match "(?i)D:NO_ACCESS_CONTROL") { return @{ Kind = "Null"; Text = "" } }
-  if ($Sddl -match "D:([^()]*)((\([^()]*\))*)") {
-    $aces = $Matches[2]
-    if ($aces -and $aces.Trim()) { return @{ Kind = "Aces"; Text = $aces } }
-    return @{ Kind = "Empty"; Text = "" }
+  $dm = [regex]::Match($Sddl, "D:")
+  if (-not $dm.Success) {
+    if ($Sddl -match "(?i)(^|:)(O|G|S):") { return @{ Kind = "Null"; Text = "" } }
+    return @{ Kind = "Invalid"; Text = "" }
   }
-  # 有 O:/G:/S: 但无 D: —— 按 Null DACL 保守处理（人人可写风险）
-  if ($Sddl -match "(?i)(^|:)(O|G|S):") { return @{ Kind = "Null"; Text = "" } }
-  return @{ Kind = "Invalid"; Text = "" }
+  $afterD = $Sddl.Substring($dm.Index + 2)
+  $daclBody = Get-SddlTextUntilTopLevelMarker $afterD "S:"
+  $i = 0
+  while ($i -lt $daclBody.Length -and $daclBody[$i] -ne [char]'(') { $i++ }
+  $aceText = if ($i -lt $daclBody.Length) { $daclBody.Substring($i) } else { "" }
+  if (-not $aceText -or -not $aceText.Trim()) { return @{ Kind = "Empty"; Text = "" } }
+  # 若 ACE 列表无法完整切分（括号不平衡），视为无效而非 Empty
+  $split = Split-SddlAceList $aceText
+  if ($null -eq $split) { return @{ Kind = "Invalid"; Text = "" } }
+  return @{ Kind = "Aces"; Text = $aceText }
+}
+
+# Windows 原生解析接缝（仅 Windows；Linux / 不可用时返回 $null 表示未处理）。
+# 返回 @{ Handled = $true; Hit = <不可信条目或 $null> } 或 $null（回退到 SDDL 字符串路径）。
+function Get-UntrustedWriteAceFromRawSd {
+  param([string]$Sddl, [int64]$Mask)
+  try {
+    $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor($Sddl)
+  } catch {
+    return $null
+  }
+  if ($null -eq $sd.DiscretionaryAcl) {
+    return @{ Handled = $true; Hit = @{ Sid = "S-1-1-0"; Reason = "Null DACL" } }
+  }
+  if ($sd.Owner -and -not (Test-IsTrustedWriteSid $sd.Owner.Value)) {
+    return @{ Handled = $true; Hit = @{ Sid = $sd.Owner.Value.ToUpperInvariant(); Reason = "Owner" } }
+  }
+  foreach ($ace in $sd.DiscretionaryAcl) {
+    $aceType = $ace.AceType.ToString()
+    # AccessAllowed = 简单允许；其余（含回调/条件/对象 ACE）保守拒绝
+    if ($aceType -ne "AccessAllowed") {
+      if ($aceType -eq "AccessDenied") { continue }
+      $sid = try { $ace.SecurityIdentifier.Value.ToUpperInvariant() } catch { "" }
+      return @{ Handled = $true; Hit = @{ Sid = $sid; Reason = ("条件/未知 ACE (" + $aceType + ")") } }
+    }
+    $flags = $ace.AceFlags.ToString()
+    if ($flags -match "InheritOnly") { continue }
+    $sid = $ace.SecurityIdentifier.Value.ToUpperInvariant()
+    if ($sid -eq "S-1-3-4") { continue }
+    if (Test-IsTrustedWriteSid $sid) { continue }
+    $rights = [int64]$ace.AccessMask
+    if (($rights -band $Mask) -ne 0) {
+      return @{ Handled = $true; Hit = @{ Sid = $sid; Reason = ("Allow 0x{0:X}" -f $rights) } }
+    }
+  }
+  return @{ Handled = $true; Hit = $null }
 }
 
 # 纯函数：给定对象 SDDL，返回首个不可信条目 @{ Sid; Reason } 或 $null。
 #   -Kind File | ExeDir | Ancestor（决定计入的权限集合）
 #   -ExpectedUserSid / -ExtraSids：保留兼容；判定以“非可信写主体即拒绝”为准。
+#   Windows 上优先走 RawSecurityDescriptor；不可用时用嵌套括号感知的 SDDL 字符串路径（Linux 单测）。
 function Get-UntrustedWriteAce {
   param(
     [Parameter(Mandatory = $true)][string]$Sddl,
@@ -147,8 +260,11 @@ function Get-UntrustedWriteAce {
     [ValidateSet("File", "ExeDir", "Ancestor")][string]$Kind = "File",
     [string[]]$ExtraSids = @()
   )
-  $null = $ExpectedUserSid; $null = $ExtraSids  # 保留参数，避免未使用告警
+  $null = $ExpectedUserSid; $null = $ExtraSids
   $mask = switch ($Kind) { "File" { $script:MaskFile } "ExeDir" { $script:MaskExeDir } default { $script:MaskAncestor } }
+
+  $native = Get-UntrustedWriteAceFromRawSd -Sddl $Sddl -Mask $mask
+  if ($null -ne $native -and $native.Handled) { return $native.Hit }
 
   $dacl = Get-SddlDaclInfo $Sddl
   if ($dacl.Kind -eq "Invalid") { return @{ Sid = ""; Reason = "无法解析 SDDL" } }
@@ -161,23 +277,39 @@ function Get-UntrustedWriteAce {
 
   if ($dacl.Kind -eq "Empty") { return $null }
 
-  foreach ($m in [regex]::Matches($dacl.Text, "\(([^()]*)\)")) {
-    $parts = $m.Groups[1].Value.Split(";")
-    if ($parts.Count -lt 6) { continue }
+  $aceList = Split-SddlAceList $dacl.Text
+  if ($null -eq $aceList) { return @{ Sid = ""; Reason = "无法解析 SDDL" } }
+
+  foreach ($ace in $aceList) {
+    if ($ace.Length -lt 2 -or $ace[0] -ne [char]'(' -or $ace[$ace.Length - 1] -ne [char]')') {
+      return @{ Sid = ""; Reason = "ACE 结构异常" }
+    }
+    $inner = $ace.Substring(1, $ace.Length - 2)
+    $parts = Split-SddlAceFields $inner
+    if ($parts.Count -lt 6) { return @{ Sid = ""; Reason = "ACE 结构异常" } }
     $aceType = $parts[0].Trim().ToUpperInvariant()
     $flags = $parts[1].Trim().ToUpperInvariant()
-    if ($aceType -ne "A") { continue }
-    $isInheritOnly = $false
-    for ($i = 0; $i + 2 -le $flags.Length; $i += 2) { if ($flags.Substring($i, 2) -eq "IO") { $isInheritOnly = $true } }
-    if ($isInheritOnly) { continue }
-    $sid = ConvertTo-CanonicalSid $parts[5]
-    # OWNER RIGHTS 仅约束 Owner：Owner 非可信时上方已返回
-    if ($sid -eq "S-1-3-4") { continue }
-    if (Test-IsTrustedWriteSid $sid) { continue }
-    $rights = ConvertFrom-SddlRights $parts[2]
-    if (($rights -band $mask) -ne 0) {
-      return @{ Sid = $sid; Reason = ("Allow 0x{0:X}" -f $rights) }
+    # 简单 Allow：按写掩码 + 可信白名单检查
+    if ($aceType -eq "A") {
+      $isInheritOnly = $false
+      for ($i = 0; $i + 2 -le $flags.Length; $i += 2) {
+        if ($flags.Substring($i, 2) -eq "IO") { $isInheritOnly = $true }
+      }
+      if ($isInheritOnly) { continue }
+      $sid = ConvertTo-CanonicalSid $parts[5]
+      if ($sid -eq "S-1-3-4") { continue }
+      if (Test-IsTrustedWriteSid $sid) { continue }
+      $rights = ConvertFrom-SddlRights $parts[2]
+      if (($rights -band $mask) -ne 0) {
+        return @{ Sid = $sid; Reason = ("Allow 0x{0:X}" -f $rights) }
+      }
+      continue
     }
+    # 简单 Deny：忽略（保守：可能误拒，不会因 Deny 而放行）
+    if ($aceType -eq "D") { continue }
+    # XA/XD/对象 ACE/未知类型：不求值条件，保守拒绝（避免截断或误判）
+    $sidGuess = ConvertTo-CanonicalSid $parts[5]
+    return @{ Sid = $sidGuess; Reason = ("条件/未知 ACE (" + $aceType + ")") }
   }
   return $null
 }

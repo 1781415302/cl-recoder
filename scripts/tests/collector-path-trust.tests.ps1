@@ -92,6 +92,30 @@ Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $us
 Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $user -Kind "ExeDir")) "A3-7 仅特权写 ACE（ExeDir）可信"
 Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $user -Kind "Ancestor")) "A3-8 仅特权写 ACE（Ancestor）可信"
 
+Write-Host "== A4. 条件 ACE 嵌套括号不得截断后续写 ACE =="
+# 复现 1：条件 ACE 在前，其后有 Everyone 写权限 —— 必须拒绝（不得当成 Empty）
+$condFirst = "O:BAG:SYD:PAI(XA;;FR;;;WD;(Member_of {SID(BU)}))(A;;FW;;;WD)(A;;FA;;;BA)"
+$d1 = Get-SddlDaclInfo $condFirst
+Assert-True ($d1.Kind -eq "Aces") "A4-1a 条件 ACE 在前时 Kind=Aces（非 Empty）" ("" + $d1.Kind)
+$split1 = Split-SddlAceList $d1.Text
+Assert-True ($null -ne $split1 -and $split1.Count -eq 3) "A4-1b 切出 3 条 ACE" ("" + $(if ($split1) { $split1.Count } else { "null" }))
+$h1 = Get-UntrustedWriteAce -Sddl $condFirst -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $h1) "A4-1c 条件 ACE 在前 + Everyone 写 → 不可信" ("" + $h1.Reason)
+# 复现 2：BA Allow 在前，条件 ACE 居中，Everyone 写在后 —— 必须拒绝（不得只看见 BA）
+$condMid = "O:BAG:SYD:PAI(A;;FA;;;BA)(XA;;FR;;;WD;(Member_of {SID(BU)}))(A;;FW;;;WD)"
+$d2 = Get-SddlDaclInfo $condMid
+Assert-True ($d2.Kind -eq "Aces") "A4-2a 条件 ACE 居中时 Kind=Aces" ("" + $d2.Kind)
+$split2 = Split-SddlAceList $d2.Text
+Assert-True ($null -ne $split2 -and $split2.Count -eq 3) "A4-2b 切出 3 条 ACE" ("" + $(if ($split2) { $split2.Count } else { "null" }))
+$h2 = Get-UntrustedWriteAce -Sddl $condMid -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $h2) "A4-2c BA + 条件 ACE + Everyone 写 → 不可信" ("" + $h2.Reason)
+# 仅条件 ACE、无后续写：仍因 XA 保守拒绝
+$xaOnly = "O:BAG:SYD:PAI(A;;FA;;;BA)(XA;;FR;;;WD;(Member_of {SID(BU)}))"
+$h3 = Get-UntrustedWriteAce -Sddl $xaOnly -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $h3 -and $h3.Reason -match "条件/未知 ACE") "A4-3 单独 XA 保守拒绝" ("" + $h3.Reason)
+# 嵌套切分在仅有简单 ACE 时与旧行为一致（Program Files 夹具仍可信）
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $pf -ExpectedUserSid $user -Kind "File")) "A4-4 Program Files 夹具在嵌套切分下仍可信"
+
 Write-Host "== B. Test-TaskExecMatches =="
 $exp = "C:\Program Files\CL Recoder\cl-recoder-collector.exe"
 Assert-True (Test-TaskExecMatches -Command ('"' + $exp + '"') -Arguments "" -ExpectedPath $exp) "B1 带引号一致"
