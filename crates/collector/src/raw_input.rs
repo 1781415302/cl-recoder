@@ -557,6 +557,10 @@ impl RawInputState {
     }
 
     /// WM_TIMER 内的 WTS 注册重试：未注册、未超上限且距上次 ≥5s 时再试一次。
+    ///
+    /// 依赖：本重试搭载在 message_loop 常驻的 25ms 批量发送定时器（SetTimer）上，
+    /// 没有独立定时器。若将来把该定时器改为按需启停（例如空闲时停止），须为 WTS
+    /// 重试另设定时器，否则 WTS 注册失败后将不再重试。
     fn retry_wts_registration(&mut self, hwnd: HWND, now: Instant) {
         if self.session.wts_registered || self.session.wts_retries >= WTS_RETRY_MAX {
             return;

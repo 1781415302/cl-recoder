@@ -38,3 +38,4 @@ H1（会话事件清空键盘状态）属防御性改动：M1 基线尚未复现
 4. schema 过新提示使用独立命令 `get_app_notices`（30 秒轮询），旧安装提示使用设置页专用命令 `get_legacy_install_hints`，未并入 500 ms 轮询的 `collector_status`，以免高频轮询承担注册表与文件查询。
 5. `Win32_System_RemoteDesktop`、`Win32_System_Power` 特性加在 collector crate 而非根 `Cargo.toml`。
 6. 任务策略测试 B3b：`-RepairOnly` 且找不到采集器时由原行为改为退出码 1（与新的统一定位逻辑一致）。
+7. 代码审阅后补充（见 [代码审阅](./DEVPLAN-hardening-v4-code-review.md)“处理结果”）：路径可信检查的受检集合扩展为固定主体 + Power Users + 当前提权令牌的全部非特权组；采集器退出码 3 在启动失败时映射为专门文案；备份总时限包含单次 step 内的忙等待。

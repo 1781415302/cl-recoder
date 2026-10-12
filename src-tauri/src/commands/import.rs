@@ -551,13 +551,20 @@ pub(crate) fn backup_snapshot(source: &Path, dst: &Path, total: Duration) -> Res
     {
         let backup = Backup::new(&src, &mut out).map_err(|e| format!("初始化备份失败: {e}"))?;
         loop {
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(format!("一致快照超过总时限 {}s", total.as_secs()));
             }
+            // 单次 step 内的忙等待受源连接 busy_timeout 约束：每次 step 前将其收紧为
+            // min(5s, 剩余时间)，使总耗时（含忙等待与重试间隔）不超过 total。
+            let remaining = deadline - now;
+            src.busy_timeout(remaining.min(Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
             match backup.step(-1).map_err(|e| format!("备份失败: {e}"))? {
                 StepResult::Done => break,
                 StepResult::Busy | StepResult::Locked | StepResult::More => {
-                    std::thread::sleep(BACKUP_RETRY_INTERVAL);
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(BACKUP_RETRY_INTERVAL.min(left));
                 }
                 _ => return Err("备份返回未知状态".to_string()),
             }

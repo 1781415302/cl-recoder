@@ -7,7 +7,14 @@
 #
 # 判据（以“普通用户能否替换以最高权限运行的 exe 或在其目录植入文件”为准）：
 #   - 受检主体：Users(S-1-5-32-545/BU)、Authenticated Users(S-1-5-11/AU)、Everyone(S-1-1-0/WD)、
-#     INTERACTIVE(S-1-5-4/IU)、以及 -ExpectedUserSid（当前登录用户本人）；
+#     INTERACTIVE(S-1-5-4/IU)、Power Users(S-1-5-32-547)、-ExpectedUserSid（当前登录用户本人），
+#     以及 -ExtraSids（install-collector-task.ps1 传入当前令牌的全部组 SID，见 Get-TokenWatchedSids）；
+#   - 令牌组中的特权主体（Administrators、SYSTEM、LOCAL/NETWORK SERVICE、服务 SID S-1-5-80-*、
+#     TrustedInstaller、本地管理员账户标记 S-1-5-114）不计入：提权令牌必然含 Administrators，
+#     而 Program Files 本就允许管理员写入，计入会使所有路径被误拒；
+#   - OWNER RIGHTS(S-1-3-4/OW)：其 ACE 只作用于对象 Owner；Owner 为受检主体时已直接判为不可信，
+#     故 OW 仅在 Owner 属受检集合时计入（此时结论不变），否则忽略；
+#   - 边界：令牌组只能反映“当前提权令牌”的组成员关系；Deny ACE 一律忽略（保守，可能误拒，不会漏判）；
 #   - 只看 Allow ACE；忽略仅作用于新建子项的 InheritOnly（IO）ACE；
 #   - 对象 Owner 为受检主体 → 不可信（Owner 隐含 WRITE_DAC）；
 #   - exe 文件本身：WriteData/AppendData/WriteEA/WriteAttributes/Delete/WRITE_DAC/WRITE_OWNER/
@@ -20,7 +27,39 @@
 #     Windows 默认卷根 C:\ 对 Authenticated Users 有一条非继承的“创建文件夹”ACE，若按方案原文
 #     对祖先计入 AppendData，所有路径都会被误拒）。
 
+# 令牌组中不计入受检集合的特权主体（精确 SID 或前缀）
+$script:TrustPrivilegedSids = @("S-1-5-32-544", "S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-114")
+$script:TrustPrivilegedPrefixes = @("S-1-5-80-", "S-1-16-")
+
+# 纯函数：过滤令牌 SID 列表，去掉特权主体与空值，大写去重。
+function Select-TrustWatchedSids([string[]]$Sids) {
+  $out = @()
+  foreach ($s in @($Sids)) {
+    if (-not $s) { continue }
+    $u = $s.Trim().ToUpperInvariant()
+    if (-not $u) { continue }
+    if ($script:TrustPrivilegedSids -contains $u) { continue }
+    $skip = $false
+    foreach ($p in $script:TrustPrivilegedPrefixes) { if ($u.StartsWith($p)) { $skip = $true } }
+    if ($skip) { continue }
+    if (-not ($out -contains $u)) { $out += $u }
+  }
+  return ,$out
+}
+
+# 读取当前进程令牌的用户 SID 与组 SID（仅 Windows；非 Windows 或失败返回空数组）。
+function Get-TokenWatchedSids {
+  $raw = @()
+  try {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($id.User) { $raw += $id.User.Value }
+    foreach ($g in $id.Groups) { try { $raw += $g.Value } catch { } }
+  } catch { return ,@() }
+  return (Select-TrustWatchedSids $raw)
+}
+
 $script:TrustWatchedAliases = @{
+  "PU" = "S-1-5-32-547"
   "BU" = "S-1-5-32-545"
   "AU" = "S-1-5-11"
   "WD" = "S-1-1-0"
@@ -67,10 +106,12 @@ function Get-UntrustedWriteAce {
   param(
     [Parameter(Mandatory = $true)][string]$Sddl,
     [string]$ExpectedUserSid = "",
-    [ValidateSet("File", "ExeDir", "Ancestor")][string]$Kind = "File"
+    [ValidateSet("File", "ExeDir", "Ancestor")][string]$Kind = "File",
+    [string[]]$ExtraSids = @()
   )
   $watched = @($script:TrustWatchedAliases.Values)
   if ($ExpectedUserSid) { $watched += $ExpectedUserSid.Trim().ToUpperInvariant() }
+  foreach ($x in (Select-TrustWatchedSids $ExtraSids)) { if (-not ($watched -contains $x)) { $watched += $x } }
   $mask = switch ($Kind) { "File" { $script:MaskFile } "ExeDir" { $script:MaskExeDir } default { $script:MaskAncestor } }
 
   if ($Sddl -match "O:([^:]+?)(?=G:|D:|S:|$)") {
@@ -89,6 +130,8 @@ function Get-UntrustedWriteAce {
     for ($i = 0; $i + 2 -le $flags.Length; $i += 2) { if ($flags.Substring($i, 2) -eq "IO") { $isInheritOnly = $true } }
     if ($isInheritOnly) { continue }
     $sid = ConvertTo-CanonicalSid $parts[5]
+    # OWNER RIGHTS 仅约束 Owner：Owner 属受检集合时上方已返回，此处一律跳过
+    if ($sid -eq "S-1-3-4") { continue }
     if (-not ($watched -contains $sid)) { continue }
     $rights = ConvertFrom-SddlRights $parts[2]
     if (($rights -band $mask) -ne 0) {
@@ -124,7 +167,7 @@ function Test-TaskExecMatches {
 
 # 读取真实 ACL：exe、其目录、逐级祖先直到卷根。返回首个不可信对象 @{ Path; Sid; Reason } 或 $null。
 function Test-CollectorPathTrusted {
-  param([Parameter(Mandatory = $true)][string]$ExePath, [string]$ExpectedUserSid = "")
+  param([Parameter(Mandatory = $true)][string]$ExePath, [string]$ExpectedUserSid = "", [string[]]$ExtraSids = @())
   $items = @(@{ Path = $ExePath; Kind = "File" })
   $dir = Split-Path -Parent $ExePath
   $kind = "ExeDir"
@@ -141,7 +184,7 @@ function Test-CollectorPathTrusted {
     if (-not $sddl) {
       return @{ Path = $it.Path; Sid = ""; Reason = "无法读取 ACL" }
     }
-    $hit = Get-UntrustedWriteAce -Sddl $sddl -ExpectedUserSid $ExpectedUserSid -Kind $it.Kind
+    $hit = Get-UntrustedWriteAce -Sddl $sddl -ExpectedUserSid $ExpectedUserSid -Kind $it.Kind -ExtraSids $ExtraSids
     if ($hit) { return @{ Path = $it.Path; Sid = $hit.Sid; Reason = $hit.Reason } }
   }
   return $null

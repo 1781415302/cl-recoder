@@ -140,7 +140,8 @@ function Assert-CollectorPathTrusted([string]$Path) {
     Write-Warning ("已传入 -AllowUserWritable：跳过采集器路径可写性检查（{0}）。以最高权限自启用户可写目录中的程序存在被替换提权风险，仅限开发调试。" -f $Path)
     return
   }
-  $finding = Test-CollectorPathTrusted -ExePath $Path -ExpectedUserSid $expectedSid
+  # 提权身份 SID 已在上方核对与 ExpectedUserSid 一致，故当前令牌组即该用户（提权后）的组成员关系
+  $finding = Test-CollectorPathTrusted -ExePath $Path -ExpectedUserSid $expectedSid -ExtraSids (Get-TokenWatchedSids)
   if ($finding) {
     Write-Error ("采集器路径普通用户可写：{0}（主体 {1}，{2}）。以最高权限自启存在被替换风险，已拒绝创建/修复，未修改任务。请使用安装版或将程序放到仅管理员可写的目录。" -f $finding.Path, $finding.Sid, $finding.Reason)
     exit 7

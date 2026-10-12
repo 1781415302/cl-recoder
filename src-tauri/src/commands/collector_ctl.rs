@@ -508,6 +508,40 @@ pub(crate) fn script_exit_message(code: Option<i32>, script_path: &str) -> Strin
 }
 
 /// 退出码 7 文案（hardening-v4 §4.2.2 定稿）。
+/// 采集器进程退出码 3（`EXIT_SCHEMA_TOO_NEW`，统计库 schema 高于本程序支持值）的提示文案。
+pub(crate) const COLLECTOR_EXIT_3_MESSAGE: &str =
+    "统计库版本过新（由更新版本的 CL Recoder 创建），采集器已拒绝写入并退出。请升级程序后再启动采集器。";
+
+/// 采集器进程退出码映射（纯函数）：目前仅 3 有专门文案，其余返回 None 沿用泛化提示。
+pub(crate) fn collector_exit_message(code: Option<i32>) -> Option<&'static str> {
+    match code {
+        Some(3) => Some(COLLECTOR_EXIT_3_MESSAGE),
+        _ => None,
+    }
+}
+
+/// 启动失败文案修正（纯函数）：GUI 经最高权限计划任务或 runas 拉起采集器，无法直接取得其
+/// 退出码；采集器在 schema 过新时立即以退出码 3 退出，因此启动失败且 GUI 只读检测到
+/// schema 过新时，改用退出码 3 的专门文案，避免显示泛化的“未能启动”。
+pub(crate) fn start_result_with_schema(
+    result: Result<(), String>,
+    schema_too_new: Option<(i64, i64)>,
+) -> Result<(), String> {
+    match (result, schema_too_new) {
+        (Err(_), Some((found, supported))) => Err(format!(
+            "{}（库版本 {found}，本程序支持 {supported}）",
+            collector_exit_message(Some(3)).unwrap_or(COLLECTOR_EXIT_3_MESSAGE)
+        )),
+        (r, _) => r,
+    }
+}
+
+/// 启动采集器，失败时按 schema 状态修正文案（仅失败时查询 schema；成功路径不触 SQLite）。
+fn start_collector_checked(st: &crate::state::AppState) -> Result<(), String> {
+    start_collector_and_wait()
+        .or_else(|e| start_result_with_schema(Err(e), st.refresh_schema_status()))
+}
+
 pub(crate) const SCRIPT_EXIT_7_MESSAGE: &str = "采集器所在目录普通用户可写，以最高权限自启存在被替换风险，已拒绝创建/修复。请使用安装版或将程序放到仅管理员可写的目录（详见 README）。";
 
 /// 脚本候选路径（纯函数）：主 exe 同目录 `scripts\`（bundle.resources 落盘位，§8-S13）、
@@ -930,7 +964,10 @@ pub async fn set_collector_paused(paused: bool) -> Result<(), String> {
 /// 成功后**自动启动采集器并等待就绪**（PLAN §5.1）；并二次校验计划任务确已落盘——
 /// 只看脚本退出码会在任务未创建时误报成功（用户反馈：显示已启用但实际未启用）。
 #[tauri::command]
-pub async fn collector_autostart_enable() -> Result<(), String> {
+pub async fn collector_autostart_enable(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<(), String> {
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let sid = collector_health::current_user_sid_string()
             .map_err(|e| format!("获取当前用户 SID 失败（无法安全校验任务归属）: {e}"))?;
@@ -943,7 +980,7 @@ pub async fn collector_autostart_enable() -> Result<(), String> {
         super::diagnostics::record_gui_event(
             clrecoder_diagnostics::Level::Info, "task.policy_updated", "采集器自启任务已配置",
         );
-        start_collector_and_wait()
+        start_collector_checked(&st)
     })
     .await
     .map_err(|e| format!("自启任务失败: {e}"))?
@@ -966,8 +1003,11 @@ pub async fn collector_autostart_disable() -> Result<(), String> {
 /// 立即启动采集器（§4.7：先 `schtasks /Run`，失败回退 runas 直接启动；等待就绪；
 /// §4.2 安全启动——不自动杀进程、不重复 runas）。
 #[tauri::command]
-pub async fn collector_start_now() -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(start_collector_and_wait)
+pub async fn collector_start_now(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<(), String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || start_collector_checked(&st))
         .await
         .map_err(|e| format!("启动采集器任务失败: {e}"))?
 }
@@ -1122,6 +1162,19 @@ mod tests {
         assert_eq!(dbg.len(), 4);
         assert!(dbg.iter().any(|p| p.starts_with(cwd)));
         assert!(script_candidates(None, Some(cwd), false, "x.ps1").is_empty());
+    }
+
+    #[test]
+    fn hardening_v4_collector_exit_code_3_message() {
+        assert_eq!(collector_exit_message(Some(3)), Some(COLLECTOR_EXIT_3_MESSAGE));
+        assert!(COLLECTOR_EXIT_3_MESSAGE.contains("统计库版本过新"));
+        assert!(COLLECTOR_EXIT_3_MESSAGE.contains("升级程序"));
+        assert_eq!(collector_exit_message(Some(1)), None);
+        assert_eq!(collector_exit_message(None), None);
+        let e = start_result_with_schema(Err("采集器未能启动".into()), Some((5, 3))).unwrap_err();
+        assert!(e.contains("统计库版本过新") && e.contains("库版本 5") && e.contains("支持 3"), "{e}");
+        assert_eq!(start_result_with_schema(Err("原因".into()), None), Err("原因".to_string()));
+        assert_eq!(start_result_with_schema(Ok(()), Some((5, 3))), Ok(()));
     }
 
     #[test]

@@ -54,6 +54,26 @@ Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;GW;;;BU)" -Ki
 Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl ("O:BAG:SYD:(A;;FA;;;" + $user + ")") -Kind "File")) "A10 未提供 ExpectedUserSid 时不检查该用户"
 
 Write-Host ""
+Write-Host "== A2. 令牌组受检集合（-ExtraSids / Select-TrustWatchedSids）=="
+$grp = "S-1-5-21-100-200-300-5555"
+$grpDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;" + $grp + ")(A;OICI;0x1200a9;;;BU)"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $grpDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-1 自定义组可写但未传令牌组 → 不检出（原边界）"
+$h = Get-UntrustedWriteAce -Sddl $grpDir -ExpectedUserSid $user -Kind "ExeDir" -ExtraSids @($user, $grp.ToLowerInvariant())
+Assert-True ($null -ne $h -and $h.Sid -eq $grp) "A2-2 令牌组含该组 → 不可信" ("" + $h.Sid)
+$puDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;PU)"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $puDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-3 Power Users 可写 → 不可信（固定受检）"
+$adminTok = @($user, "S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", "S-1-5-114", "S-1-16-12288", "S-1-5-32-545", "S-1-5-11")
+foreach ($k in "File", "ExeDir", "Ancestor") {
+  Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $pf -ExpectedUserSid $user -Kind $k -ExtraSids $adminTok)) ("A2-4 提权令牌（含 Administrators 等）下 Program Files 仍可信（" + $k + "）")
+}
+$sel = Select-TrustWatchedSids @(" s-1-5-32-544 ", "S-1-5-21-1-2-3-4", "s-1-5-21-1-2-3-4", "", "S-1-5-80-1-2", "S-1-5-32-545")
+Assert-True ($sel.Count -eq 2 -and $sel[0] -eq "S-1-5-21-1-2-3-4" -and $sel[1] -eq "S-1-5-32-545") "A2-5 过滤特权主体、去空、大写去重" ($sel -join ",")
+$owDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;;FA;;;OW)"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $owDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-6 OWNER RIGHTS 且 Owner 为管理员 → 不计入"
+$owUser = "O:" + $user + "G:SYD:PAI(A;OICI;FA;;;SY)(A;;FA;;;OW)"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $owUser -ExpectedUserSid $user -Kind "ExeDir")) "A2-7 OWNER RIGHTS 且 Owner 为用户 → 不可信（Owner 规则）"
+Assert-True ((Get-TokenWatchedSids) -is [array]) "A2-8 Get-TokenWatchedSids 在任意平台返回数组（非 Windows 为空）"
+
 Write-Host "== B. Test-TaskExecMatches =="
 $exp = "C:\Program Files\CL Recoder\cl-recoder-collector.exe"
 Assert-True (Test-TaskExecMatches -Command ('"' + $exp + '"') -Arguments "" -ExpectedPath $exp) "B1 带引号一致"
