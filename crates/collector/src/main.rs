@@ -45,7 +45,11 @@ mod xinput_motion;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// 进程级诊断 sink 引用（hardening-v4 §4.1：raw_input 记录 `raw_input.session_reset` 等
+/// 显式 Info 代码用；run_service 打开 sink 后设置一次，未设置时记录静默跳过）。
+pub(crate) static DIAGNOSTICS: OnceLock<Arc<DiagnosticLog>> = OnceLock::new();
 use std::time::{Duration, Instant};
 
 use clrecoder_core::event::AggEvent;
@@ -212,6 +216,9 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
     //    sink 失败 → 明确 stderr-only 降级（不装 adapter、不回退 env_logger）；
     //    此后 log::warn!/error! 经 adapter 同步进角色文件（按 target 限频 60s/桶）。
     let diagnostics = init_diagnostics();
+    if let Some(d) = &diagnostics {
+        let _ = DIAGNOSTICS.set(Arc::clone(d));
+    }
 
     // 3) 打开/迁移 DB：失败 → facade error 进文件 + stderr 直写；退出码非 0（§5.3"DB 损坏"行）
     let db_path = db_override.unwrap_or_else(default_db_path);

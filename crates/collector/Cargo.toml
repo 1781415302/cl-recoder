@@ -29,6 +29,11 @@ windows = { workspace = true, features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
     "Win32_UI_Input_XboxController",
+    # hardening-v4 §4.1（H1）：WTSRegisterSessionNotification/WTSUnRegisterSessionNotification
+    # 位于 Win32_System_RemoteDesktop；RegisterSuspendResumeNotification/Unregister… 与
+    # HPOWERNOTIFY 经编译确认位于 Win32_System_Power（不在 WindowsAndMessaging）。
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Power",
 ] }
 # serde_json（白名单内，§9.1）：NDJSON 一行请求/一行响应的编解码（S8 §4.4）。
 serde_json = { workspace = true }

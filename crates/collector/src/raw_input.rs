@@ -38,6 +38,10 @@
 //! - loop 退出（注册失败/WM_QUIT/unwind）经 [`WindowGuard`] 在本线程 `DestroyWindow`，
 //!   旧窗口不再在 1s 重试后继续投递旧来源事件；WM_QUIT（[`RawInputRunner::stop_and_join`]
 //!   停止唤醒，只发本进程自有消息线程）先排出已捕获尾桶再退出；
+//! - hardening-v4 §4.1（H1）：窗口注册会话（WTS）与挂起/恢复通知；锁屏/解锁/控制台或远程
+//!   连接、挂起/恢复时经同一 sender 发 `KeyboardSourcesReset`（安全桌面期间 key-up 不投递
+//!   到 Raw Input，避免修饰键残留）。WTS 登录早期未就绪时在 WM_TIMER 内以 ≥5s 间隔重试
+//!   最多 60 次；两项注册随 [`WindowGuard`] 在 `DestroyWindow` 前逆序注销；
 //! - 注册失败/重试均检查 `producer_stop`（§4.3.1：经 [`MotionRuntime::stop_requested`]）。
 //!
 //! 窗口实现说明：windows 0.62 将 `WNDCLASSW`/`WNDCLASSEXW` gate 在 `Win32_Graphics_Gdi`
@@ -53,9 +57,20 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::motion_runtime::MotionRuntime;
+use windows::Win32::System::Power::{
+    RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
+};
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+};
 use clrecoder_core::codes::{normalize_scancode, DeviceKind, MouseButton};
 use clrecoder_core::day;
 use clrecoder_core::event::{AggEvent, DeviceKey, InputSourceId, RawEvent};
@@ -97,6 +112,52 @@ const BUF_WORDS: usize = 8;
 const TRAVEL_FLUSH_MS: u32 = 25;
 /// 本窗口自建的移动桶批发定时器 ID（WM_TIMER wParam 锚定）。
 const TRAVEL_FLUSH_TIMER_ID: usize = 1;
+
+/// WTS 会话通知注册重试最小间隔（hardening-v4 §4.1：登录早期 WTS 服务可能未就绪）。
+const WTS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// WTS 会话通知注册最多重试次数（不含首次）。
+const WTS_RETRY_MAX: u32 = 60;
+
+/// 会话/电源通知是否应清空键盘按下状态（hardening-v4 §4.1 判定表，纯函数）。
+///
+/// - `WM_WTSSESSION_CHANGE`：`WTS_SESSION_LOCK/UNLOCK`、`WTS_CONSOLE_CONNECT`、`WTS_REMOTE_CONNECT`；
+/// - `WM_POWERBROADCAST`：`PBT_APMSUSPEND`、`PBT_APMRESUMEAUTOMATIC`、`PBT_APMRESUMESUSPEND`；
+/// - 其余组合一律 false。
+pub(crate) fn session_event_resets_keyboard(msg: u32, wparam: usize) -> bool {
+    let Ok(w) = u32::try_from(wparam) else {
+        return false;
+    };
+    match msg {
+        WM_WTSSESSION_CHANGE => matches!(
+            w,
+            WTS_SESSION_LOCK | WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT
+        ),
+        WM_POWERBROADCAST => {
+            matches!(w, PBT_APMSUSPEND | PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND)
+        }
+        _ => false,
+    }
+}
+
+/// 会话/电源通知注册状态（每个 message-only 窗口一份，随 [`RawInputState`] 存放）。
+#[derive(Default)]
+struct SessionNotify {
+    /// WTS 会话通知是否已注册成功
+    wts_registered: bool,
+    /// WTS 注册已重试次数（不含首次）
+    wts_retries: u32,
+    /// 上次 WTS 注册尝试时刻
+    wts_last_attempt: Option<Instant>,
+    /// 挂起/恢复通知句柄（注册失败为 None）
+    power: Option<HPOWERNOTIFY>,
+}
+
+/// 记录 collector 显式诊断代码（限频由 DiagnosticLog 按代码执行；sink 未就绪时静默）。
+fn record_diag(level: clrecoder_diagnostics::Level, code: &str, message: &str) {
+    if let Some(d) = crate::DIAGNOSTICS.get() {
+        let _ = d.record(level, code, message);
+    }
+}
 
 /// raw_input 采集线程句柄（motion-dpi §4.3：线程及本线程消息唤醒信息）。
 ///
@@ -204,8 +265,10 @@ fn message_loop(tx: &Sender<AggEvent>, motion: &Arc<MotionRuntime>) -> Result<()
         .map_err(|e| format!("创建 message-only 窗口失败：{e}"))?;
     // 窗口退出清理守卫（§4.3）：注册失败 / WM_QUIT 正常退出 / unwind 三条路径都经 Drop
     // 在本线程 DestroyWindow——旧窗口在 1s 重试重建后不再继续投递旧来源事件。
-    let _window_guard = WindowGuard(hwnd);
+    let _window_guard = WindowGuard { hwnd, state };
     unsafe { register_devices(hwnd) }.map_err(|e| format!("注册 Raw Input 设备失败：{e}"))?;
+    // hardening-v4 §4.1：设备注册成功后注册会话/电源通知；失败不致命（降级为旧行为）。
+    unsafe { &mut *state }.register_session_notifications(hwnd);
     // motion-dpi §4.3：注册后枚举当前鼠标预注册运动来源（无需移动即出现 DPI 入口）；
     // 枚举/解析失败仅跳过——首条 WM_INPUT 懒注册兜底。
     enumerate_current_mice(unsafe { &mut *state });
@@ -274,15 +337,24 @@ fn enumerate_current_mice(state: &mut RawInputState) {
 /// WM_QUIT 正常返回还是 panic unwind 收场，Drop 都在本线程调用 `DestroyWindow`，
 /// 确保 1s 重试重建后旧窗口彻底停止投递（`DestroyWindow` 只能销毁调用线程的窗口，
 /// 而本守卫只会在创建线程内被 Drop）。
-struct WindowGuard(HWND);
+struct WindowGuard {
+    hwnd: HWND,
+    /// 本窗口的状态盒（有意泄漏，见 [`message_loop`]）；用于在销毁前注销会话/电源通知。
+    state: *mut RawInputState,
+}
 
 impl Drop for WindowGuard {
     fn drop(&mut self) {
+        // hardening-v4 §4.1：DestroyWindow 之前逆序注销挂起/恢复与 WTS 会话通知，
+        // 1s 重建的新窗口重新注册，避免泄漏与重复投递。
+        // SAFETY: state 由 message_loop 以 Box::into_raw 产生且永不回收；Drop 在创建线程内
+        // 执行，窗口过程不会并发访问（同线程）。
+        unsafe { (*self.state).unregister_session_notifications(self.hwnd) };
         // SAFETY: hwnd 由本线程 create_message_only_window 创建；Drop（正常结束或 unwind）
         // 都发生在创建线程内，满足 DestroyWindow 的线程归属约束。失败仅丢弃（重试路径
         // 自会再建新窗口）。
         unsafe {
-            let _ = DestroyWindow(self.0);
+            let _ = DestroyWindow(self.hwnd);
         }
     }
 }
@@ -359,11 +431,34 @@ unsafe extern "system" fn raw_input_wndproc(
         if !ptr.is_null() {
             // Safety: 指针由 message_loop 以 Box::into_raw 存入且不回收，本线程独占访问
             let state = &mut *ptr;
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.on_flush_tick()))
-                .is_err()
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.on_flush_tick();
+                // hardening-v4 §4.1：WTS 注册失败时在本分支内以 ≥5s 间隔重试
+                state.retry_wts_registration(hwnd, Instant::now());
+            }))
+            .is_err()
             {
                 log::error!("WM_TIMER 批发 panic，本轮批发跳过");
             }
+        }
+    } else if msg == WM_WTSSESSION_CHANGE || msg == WM_POWERBROADCAST {
+        // hardening-v4 §4.1：锁屏/解锁/连接、挂起/恢复 → 清空键盘按下状态。
+        // 复位经本线程同一 tx 发送，与 WM_INPUT 保持 FIFO 顺序。
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RawInputState;
+        if !ptr.is_null() {
+            // Safety: 指针由 message_loop 以 Box::into_raw 存入且不回收，本线程独占访问
+            let state = &mut *ptr;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.on_session_event(msg, wparam.0)
+            }))
+            .is_err()
+            {
+                log::error!("会话/电源通知处理 panic，丢弃本条通知");
+            }
+        }
+        if msg == WM_POWERBROADCAST {
+            // WM_POWERBROADCAST 约定返回 TRUE。
+            return LRESULT(1);
         }
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -410,6 +505,8 @@ struct RawInputState {
     /// 原生句柄 → 鼠标运动来源（描述/连接代际/当前移动桶）
     motion_sources: HashMap<isize, MouseMotionSource>,
     buf: Vec<u64>,
+    /// 会话/电源通知注册状态（hardening-v4 §4.1）
+    session: SessionNotify,
 }
 
 impl RawInputState {
@@ -422,6 +519,79 @@ impl RawInputState {
             motion,
             motion_sources: HashMap::new(),
             buf: Vec::new(),
+            session: SessionNotify::default(),
+        }
+    }
+
+    /// 注册 WTS 会话通知与挂起/恢复通知（hardening-v4 §4.1）。失败不致命，仅限频告警。
+    fn register_session_notifications(&mut self, hwnd: HWND) {
+        self.try_register_wts(hwnd, Instant::now());
+        // SAFETY: hwnd 为本线程创建的合法窗口；DEVICE_NOTIFY_WINDOW_HANDLE 指示 HANDLE 实为
+        // HWND，系统把 WM_POWERBROADCAST 直接发往该窗口（message-only 窗口不收顶层广播）。
+        match unsafe { RegisterSuspendResumeNotification(HANDLE(hwnd.0), DEVICE_NOTIFY_WINDOW_HANDLE) } {
+            Ok(h) => self.session.power = Some(h),
+            Err(e) => log::warn!("注册挂起/恢复通知失败（降级为无电源复位）：{e}"),
+        }
+    }
+
+    fn try_register_wts(&mut self, hwnd: HWND, now: Instant) {
+        self.session.wts_last_attempt = Some(now);
+        // SAFETY: hwnd 为本线程创建的合法窗口；通知直接发往该窗口，与广播无关。
+        match unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+            Ok(()) => {
+                self.session.wts_registered = true;
+                if self.session.wts_retries > 0 {
+                    log::warn!("WTS 会话通知在第 {} 次重试后注册成功", self.session.wts_retries);
+                }
+                record_diag(
+                    clrecoder_diagnostics::Level::Info,
+                    "raw_input.session_registered",
+                    &format!("WTS 会话通知已注册（重试 {} 次）", self.session.wts_retries),
+                );
+            }
+            Err(e) => log::warn!(
+                "注册 WTS 会话通知失败（第 {} 次重试，≥5s 后再试，最多 {WTS_RETRY_MAX} 次）：{e}",
+                self.session.wts_retries
+            ),
+        }
+    }
+
+    /// WM_TIMER 内的 WTS 注册重试：未注册、未超上限且距上次 ≥5s 时再试一次。
+    fn retry_wts_registration(&mut self, hwnd: HWND, now: Instant) {
+        if self.session.wts_registered || self.session.wts_retries >= WTS_RETRY_MAX {
+            return;
+        }
+        let due = self
+            .session
+            .wts_last_attempt
+            .is_none_or(|t| now.saturating_duration_since(t) >= WTS_RETRY_INTERVAL);
+        if due {
+            self.session.wts_retries += 1;
+            self.try_register_wts(hwnd, now);
+        }
+    }
+
+    /// 窗口销毁前逆序注销（先电源、后 WTS）；未注册的项跳过。
+    fn unregister_session_notifications(&mut self, hwnd: HWND) {
+        if let Some(h) = self.session.power.take() {
+            // SAFETY: h 为本窗口 RegisterSuspendResumeNotification 返回的有效句柄，仅注销一次。
+            let _ = unsafe { UnregisterSuspendResumeNotification(h) };
+        }
+        if std::mem::take(&mut self.session.wts_registered) {
+            // SAFETY: hwnd 为本线程窗口且此前注册成功；在 DestroyWindow 之前调用。
+            let _ = unsafe { WTSUnRegisterSessionNotification(hwnd) };
+        }
+    }
+
+    /// 会话/电源通知：判定为复位事件时发 `KeyboardSourcesReset`（暂停态同样执行）。
+    fn on_session_event(&mut self, msg: u32, wparam: usize) {
+        if session_event_resets_keyboard(msg, wparam) {
+            let _ = self.tx.send(AggEvent::KeyboardSourcesReset);
+            record_diag(
+                clrecoder_diagnostics::Level::Info,
+                "raw_input.session_reset",
+                &format!("会话/电源事件（msg=0x{msg:X}, wParam={wparam}）已清空键盘按下状态"),
+            );
         }
     }
 
@@ -949,6 +1119,28 @@ fn normalize_keyboard_event(
 
 #[cfg(test)]
 mod tests {
+    /// hardening-v4 §4.1：会话/电源复位判定真值表。
+    #[test]
+    fn session_event_reset_truth_table() {
+        for w in [WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT] {
+            assert!(super::session_event_resets_keyboard(WM_WTSSESSION_CHANGE, w as usize), "WTS {w}");
+        }
+        for w in [PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND] {
+            assert!(super::session_event_resets_keyboard(WM_POWERBROADCAST, w as usize), "PBT {w}");
+        }
+        use windows::Win32::UI::WindowsAndMessaging::{PBT_POWERSETTINGCHANGE, WTS_SESSION_LOGON};
+        assert!(!super::session_event_resets_keyboard(WM_WTSSESSION_CHANGE, WTS_SESSION_LOGON as usize));
+        assert!(!super::session_event_resets_keyboard(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE as usize));
+        assert!(!super::session_event_resets_keyboard(WM_WTSSESSION_CHANGE, 0xDEAD));
+        assert!(!super::session_event_resets_keyboard(WM_POWERBROADCAST, usize::MAX));
+        // 消息不匹配时即便 wParam 命中也不复位
+        assert!(!super::session_event_resets_keyboard(WM_TIMER, WTS_SESSION_LOCK as usize));
+        // 与 SDK 数值逐字对齐
+        assert_eq!((WM_WTSSESSION_CHANGE, WM_POWERBROADCAST), (0x02B1, 0x0218));
+        assert_eq!((WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT), (7, 8, 1, 3));
+        assert_eq!((PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND), (4, 18, 7));
+    }
+
     use super::*;
 
     #[test]
