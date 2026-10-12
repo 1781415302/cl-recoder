@@ -32,11 +32,13 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "windows": { "nsis": { "installMode": "perMachine" } },
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "resources": {
       "../target/release/cl-recoder-collector.exe": "cl-recoder-collector.exe",
       "../scripts/install-collector-task.ps1": "scripts/install-collector-task.ps1",
       "../scripts/collector-task-policy.ps1": "scripts/collector-task-policy.ps1",
+      "../scripts/collector-path-trust.ps1": "scripts/collector-path-trust.ps1",
       "../scripts/uninstall-collector-task.ps1": "scripts/uninstall-collector-task.ps1",
       "../scripts/check-task.ps1": "scripts/check-task.ps1",
       "../scripts/stop-collector.ps1": "scripts/stop-collector.ps1"

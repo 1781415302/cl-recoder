@@ -29,7 +29,7 @@
 //! 不使用 ShellExecute runas API（Win32_UI_Shell 不在 §9.1 依赖白名单内），
 //! 提权统一走 PowerShell `Start-Process -Verb RunAs`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -476,7 +476,14 @@ fn run_powershell(command: &str, script_path: &str) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(match status.code() {
+        Err(script_exit_message(status.code(), script_path))
+    }
+}
+
+/// 提权脚本退出码 → 用户可见文案（纯函数，便于单测）。
+pub(crate) fn script_exit_message(code: Option<i32>, script_path: &str) -> String {
+    {
+        match code {
             Some(4) => "UAC 被取消——未做任何更改，可再次点击重试".to_string(),
             Some(-196608) => format!(
                 "提权 PowerShell 找不到脚本文件（程序安装可能不完整）：{script_path}"
@@ -490,31 +497,189 @@ fn run_powershell(command: &str, script_path: &str) -> Result<(), String> {
             Some(6) => format!(
                 "脚本已执行但回读校验未通过（策略三项或安全描述符与预期不符）：{script_path}"
             ),
+            // hardening-v4 §4.2.2：采集器路径普通用户可写，脚本只读拒绝
+            Some(7) => SCRIPT_EXIT_7_MESSAGE.to_string(),
             Some(code) => format!(
                 "PowerShell 退出码 {code}（脚本报错；可手动以管理员 PowerShell 运行 {script_path} 复现详情）"
             ),
             None => "PowerShell 被中断".to_string(),
-        })
+        }
     }
 }
 
-/// 定位脚本：优先主 exe 同目录 `scripts\`（bundle.resources 落盘位，§8-S13），
-/// 再 exe 同目录、当前目录 `scripts\` 及其父目录 `scripts\`（开发态）。
-fn find_script(name: &str) -> Option<PathBuf> {
+/// 退出码 7 文案（hardening-v4 §4.2.2 定稿）。
+pub(crate) const SCRIPT_EXIT_7_MESSAGE: &str = "采集器所在目录普通用户可写，以最高权限自启存在被替换风险，已拒绝创建/修复。请使用安装版或将程序放到仅管理员可写的目录（详见 README）。";
+
+/// 脚本候选路径（纯函数）：主 exe 同目录 `scripts\`（bundle.resources 落盘位，§8-S13）、
+/// exe 同目录；`include_cwd` 时再加当前目录 `scripts\` 及其父目录 `scripts\`（开发态）。
+pub(crate) fn script_candidates(
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    include_cwd: bool,
+    name: &str,
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("scripts").join(name));
-            candidates.push(dir.join(name));
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("scripts").join(name));
+        candidates.push(dir.join(name));
+    }
+    if include_cwd {
+        if let Some(cwd) = cwd {
+            candidates.push(cwd.join("scripts").join(name));
+            if let Some(parent) = cwd.parent() {
+                candidates.push(parent.join("scripts").join(name));
+            }
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("scripts").join(name));
-        if let Some(parent) = cwd.parent() {
-            candidates.push(parent.join("scripts").join(name));
+    candidates
+}
+
+/// 定位脚本。hardening-v4 §4.2.4：发布版不搜索 CWD（提权脚本不得来自可被替换的当前目录），
+/// 仅调试构建保留 CWD 候选；用 `cfg!` 保持两种构建都编译同一代码路径。
+fn find_script(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    script_candidates(
+        exe.as_deref().and_then(Path::parent),
+        cwd.as_deref(),
+        cfg!(debug_assertions),
+        name,
+    )
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+// ---------------------------------------------------------------------------
+// 旧按用户安装位置的只读迁移提示（hardening-v4 §4.2.1-2）
+// ---------------------------------------------------------------------------
+
+/// 迁移提示（稳定短码 + 文案；camelCase 线形状 `{code, message}`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyInstallHint {
+    /// 稳定短码：`collector_task_legacy_path` | `gui_autostart_legacy_path`
+    pub code: &'static str,
+    /// 展示文案
+    pub message: &'static str,
+}
+
+const HINT_TASK: LegacyInstallHint = LegacyInstallHint {
+    code: "collector_task_legacy_path",
+    message: "采集器自启任务仍指向旧的按用户安装位置，请先停用再重新启用",
+};
+const HINT_RUN: LegacyInstallHint = LegacyInstallHint {
+    code: "gui_autostart_legacy_path",
+    message: "开机自启指向旧位置，请在托盘关闭再开启开机自启",
+};
+
+/// 路径文本规范化：去首尾空白与成对引号、`/` → `\\`、去尾部分隔符、ASCII 小写。
+fn normalize_win_path(p: &str) -> String {
+    let mut t = p.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t = &t[1..t.len() - 1];
+    }
+    t.trim().replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
+}
+
+/// `path` 是否位于 `dir` 之下（按分隔符边界，大小写不敏感）。
+fn win_path_is_under(path: &str, dir: &str) -> bool {
+    let (p, d) = (normalize_win_path(path), normalize_win_path(dir));
+    !d.is_empty() && p.len() > d.len() && p.starts_with(&d) && p.as_bytes()[d.len()] == b'\\'
+}
+
+/// 迁移提示判定（纯函数）。仅当当前 GUI 为安装版（`current_exe` 位于 `program_files` 下）
+/// 时给出提示；开发/便携/自定义布局返回空（调用方只记日志）。
+/// - `task_exec`：计划任务 Exec Command 原文（可带引号）；位于 `local_appdata` 下 → 任务提示；
+/// - `run_value`：HKCU Run 中 GUI 自启值原文（插件写入 `路径 参数`，路径不加引号）；
+///   存在且不等于当前 exe → 自启提示。
+pub(crate) fn legacy_install_hints(
+    current_exe: &str,
+    task_exec: Option<&str>,
+    run_value: Option<&str>,
+    program_files: &str,
+    local_appdata: &str,
+) -> Vec<LegacyInstallHint> {
+    let mut hints = Vec::new();
+    if !win_path_is_under(current_exe, program_files) {
+        return hints;
+    }
+    if let Some(exec) = task_exec {
+        if win_path_is_under(exec, local_appdata) {
+            hints.push(HINT_TASK);
         }
     }
-    candidates.into_iter().find(|p| p.is_file())
+    if let Some(run) = run_value {
+        let run_norm = normalize_win_path(run);
+        if !run_norm.is_empty() && run_norm != normalize_win_path(current_exe) {
+            hints.push(HINT_RUN);
+        }
+    }
+    hints
+}
+
+/// 读取 HKCU Run 中指定值名（只读；不存在/非字符串 → None）。
+fn read_hkcu_run_value(value_name: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
+    let name: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut size: u32 = 0;
+    // SAFETY: 只读查询；第一次传空缓冲探测字节数，key/name 为以 NUL 结尾的 UTF-16 缓冲，调用期间存活。
+    let st = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, Some(&mut size))
+    };
+    if st.is_err() || size < 2 {
+        return None;
+    }
+    let mut buf = vec![0u16; (size as usize).div_ceil(2)];
+    // SAFETY: buf 按上一步返回的字节数分配，size 为其字节容量；调用期间 buf 不移动。
+    let st = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if st.is_err() {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// 生产装配：当前 exe、计划任务 Exec（schtasks /XML 只读）、HKCU Run 值（值名 = 插件使用的
+/// `package_info().name`），交给纯判定。非安装版布局只记日志不提示。
+pub(crate) fn query_legacy_install_hints(app_name: &str) -> Vec<LegacyInstallHint> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let exe = exe.to_string_lossy().into_owned();
+    let program_files = std::env::var("ProgramFiles").unwrap_or_default();
+    let local_appdata = dirs::data_local_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let task_exec = query_task_xml(COLLECTOR_TASK_NAME).and_then(|x| leaf_text(&x, "Command"));
+    let run_value = read_hkcu_run_value(app_name);
+    if !win_path_is_under(&exe, &program_files) {
+        crate::gui_log!(
+            "INFO: 非安装版布局（{exe}），不显示旧安装迁移提示（任务 Exec={task_exec:?}，Run={run_value:?}）"
+        );
+        return Vec::new();
+    }
+    legacy_install_hints(&exe, task_exec.as_deref(), run_value.as_deref(), &program_files, &local_appdata)
+}
+
+/// 旧安装迁移提示（只读，hardening-v4 §4.2.1-2）：仅 Settings 页活动时调用；前端无参数。
+#[tauri::command]
+pub async fn get_legacy_install_hints(app: tauri::AppHandle) -> Result<Vec<LegacyInstallHint>, String> {
+    let app_name = app.package_info().name.clone();
+    tauri::async_runtime::spawn_blocking(move || query_legacy_install_hints(&app_name))
+        .await
+        .map_err(|e| format!("迁移提示查询任务失败: {e}"))
 }
 
 /// 提权运行 scripts\ 下的指定脚本（一次 UAC）。
@@ -943,6 +1108,91 @@ fn query_task_policy(task_name: &str) -> TaskPolicyDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- hardening-v4 §4.2.4 / §4.2.1 -----
+
+    #[test]
+    fn hardening_v4_script_candidates_exclude_cwd_when_release() {
+        let exe = Path::new(r"C:\Program Files\CL Recoder");
+        let cwd = Path::new(r"C:\Users\u\Downloads\evil");
+        let rel = script_candidates(Some(exe), Some(cwd), false, "install-collector-task.ps1");
+        assert_eq!(rel.len(), 2);
+        assert!(rel.iter().all(|p| p.starts_with(exe)), "{rel:?}");
+        let dbg = script_candidates(Some(exe), Some(cwd), true, "install-collector-task.ps1");
+        assert_eq!(dbg.len(), 4);
+        assert!(dbg.iter().any(|p| p.starts_with(cwd)));
+        assert!(script_candidates(None, Some(cwd), false, "x.ps1").is_empty());
+    }
+
+    #[test]
+    fn hardening_v4_exit_code_7_message() {
+        assert_eq!(script_exit_message(Some(7), "s.ps1"), SCRIPT_EXIT_7_MESSAGE);
+        assert!(SCRIPT_EXIT_7_MESSAGE.contains("普通用户可写"));
+        assert!(script_exit_message(Some(5), "s.ps1").contains("冲突"));
+        assert!(script_exit_message(Some(4), "s.ps1").contains("UAC"));
+    }
+
+    const PF: &str = r"C:\Program Files";
+    const LAD: &str = r"C:\Users\u\AppData\Local";
+    const INSTALLED: &str = r"C:\Program Files\CL Recoder\cl-recoder.exe";
+
+    fn codes(v: &[LegacyInstallHint]) -> Vec<&'static str> {
+        v.iter().map(|h| h.code).collect()
+    }
+
+    #[test]
+    fn hardening_v4_legacy_hints_installed_layout() {
+        let old_task = r#""C:\Users\u\AppData\Local\CL Recoder\cl-recoder-collector.exe""#;
+        let old_run = r"C:\Users\u\AppData\Local\CL Recoder\cl-recoder.exe ";
+        assert_eq!(
+            codes(&legacy_install_hints(INSTALLED, Some(old_task), Some(old_run), PF, LAD)),
+            vec!["collector_task_legacy_path", "gui_autostart_legacy_path"]
+        );
+        // 任务与 Run 均已指向新位置（含大小写差异、引号、尾随空格）→ 无提示
+        let new_task = r#""c:\program files\CL Recoder\cl-recoder-collector.exe""#;
+        let new_run = r"C:\PROGRAM FILES\CL Recoder\cl-recoder.exe ";
+        assert!(legacy_install_hints(INSTALLED, Some(new_task), Some(new_run), PF, LAD).is_empty());
+        // 无任务 / 无 Run 项
+        assert!(legacy_install_hints(INSTALLED, None, None, PF, LAD).is_empty());
+        assert_eq!(
+            codes(&legacy_install_hints(INSTALLED, None, Some(old_run), PF, LAD)),
+            vec!["gui_autostart_legacy_path"]
+        );
+        assert_eq!(
+            codes(&legacy_install_hints(INSTALLED, Some(old_task), None, PF, LAD)),
+            vec!["collector_task_legacy_path"]
+        );
+        // 带引号的 Run 值同样识别为当前 exe
+        let quoted_run = format!("\"{INSTALLED}\"");
+        assert!(legacy_install_hints(INSTALLED, None, Some(&quoted_run), PF, LAD).is_empty());
+    }
+
+    #[test]
+    fn hardening_v4_legacy_hints_non_installed_layouts_are_silent() {
+        let old_task = r"C:\Users\u\AppData\Local\CL Recoder\cl-recoder-collector.exe";
+        let other_run = r"C:\Somewhere\cl-recoder.exe";
+        for exe in [
+            r"C:\dev\cl-recoder\target\debug\cl-recoder.exe",
+            r"C:\dev\cl-recoder\target\release\cl-recoder.exe",
+            r"D:\Portable\CL Recoder\cl-recoder.exe",
+            r"C:\Users\u\AppData\Local\CL Recoder\cl-recoder.exe",
+            r"C:\Program FilesX\CL Recoder\cl-recoder.exe", // 前缀相同但非子目录
+        ] {
+            assert!(
+                legacy_install_hints(exe, Some(old_task), Some(other_run), PF, LAD).is_empty(),
+                "{exe}"
+            );
+        }
+        // program_files 未知（空）→ 不提示
+        assert!(legacy_install_hints(INSTALLED, Some(old_task), Some(other_run), "", LAD).is_empty());
+    }
+
+    #[test]
+    fn hardening_v4_legacy_hint_dto_shape() {
+        let v = serde_json::to_value(HINT_TASK).unwrap();
+        assert_eq!(v["code"], "collector_task_legacy_path");
+        assert!(v["message"].as_str().unwrap().contains("停用再重新启用"));
+    }
 
     #[test]
     fn usability_v3_health_events_only_on_change_and_recovery() {

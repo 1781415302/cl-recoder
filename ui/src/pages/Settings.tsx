@@ -302,6 +302,12 @@ export function Settings() {
     queryFn: () => client.getCollectorTaskPolicy(),
     ...uiQueryPolicy(activity.active),
   });
+  // hardening-v4 §4.2.1：旧安装迁移提示（只读；仅 Settings 活动时查询，不加 interval）
+  const legacyHints = useQuery({
+    queryKey: ["legacyInstallHints"],
+    queryFn: () => client.getLegacyInstallHints(),
+    ...uiQueryPolicy(activity.active),
+  });
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [wpPathDraft, setWpPathDraft] = useState<string | null>(null);
@@ -384,7 +390,7 @@ export function Settings() {
     // 不进入启动流程。成功仅表示定义校验通过，当前实例不重启。
     after(client.collectorAutostartRepair(), REPAIR_OK, {
       pending: PENDING_REPAIR,
-      invalidate: [["collectorTaskPolicy"], ["collectorStatus"]],
+      invalidate: [["collectorTaskPolicy"], ["collectorStatus"], ["legacyInstallHints"]],
     });
   }
 
@@ -653,6 +659,11 @@ export function Settings() {
           <div className="settings-grid">
             <div className="card settings-section" id="settings-autostart">
               <h2 className="card-title">启动与运行</h2>
+              {(legacyHints.data ?? []).map((h) => (
+                <div key={h.code} className="app-banner app-banner--warning" role="status">
+                  {h.message}
+                </div>
+              ))}
               <div style={{ marginTop: "var(--space-2)" }}>
                 <Row
                   label="采集器自启（计划任务）"

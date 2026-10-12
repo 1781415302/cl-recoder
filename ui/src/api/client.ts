@@ -9,6 +9,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppNotices,
+  LegacyInstallHint,
   AppRowLabeled,
   CollectorStatus,
   ComboRowLabeled,
@@ -201,6 +202,11 @@ export function openDiagnosticsDirectory(): Promise<void> {
 /** get_app_notices() -> AppNotices（hardening-v4：schema 过新横幅 / 旧安装迁移提示，只读） */
 export function getAppNotices(): Promise<AppNotices> {
   return call("get_app_notices", undefined, () => mock.mockAppNotices());
+}
+
+/** get_legacy_install_hints() -> LegacyInstallHint[]（hardening-v4：只读迁移提示，仅 Settings 活动时查询） */
+export function getLegacyInstallHints(): Promise<LegacyInstallHint[]> {
+  return call("get_legacy_install_hints", undefined, () => mock.mockLegacyInstallHints());
 }
 
 /** get_settings() -> Settings */

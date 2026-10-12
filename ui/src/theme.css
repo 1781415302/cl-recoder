@@ -1576,3 +1576,9 @@ select {
   color: #fff;
   background: var(--color-danger);
 }
+.app-banner--warning {
+  margin: var(--space-2, 8px) 0 0;
+  color: #7a4b00;
+  background: #fff4dc;
+  border: 1px solid #f1d39a;
+}

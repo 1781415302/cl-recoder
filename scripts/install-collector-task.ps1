@@ -8,7 +8,7 @@
 #       应用纯 XML 后 RegisterTask 更新（flags = 0x34：TASK_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE
 #       | TASK_IGNORE_REGISTRATION_TRIGGERS），传原 principal/logonType 及原 SDDL，回读确认
 #       三项与 owner/group/DACL 等价——不 /Create /F 重建；
-#   - -RepairOnly：任务必须存在；不要求重新定位采集器文件；只更新策略，不 /Run，
+#   - -RepairOnly：任务必须存在；须定位期望采集器以核对 Exec（hardening-v4）；只更新策略，不 /Run，
 #       不结束任何进程（修复由用户点击发起，无静默提权）。
 #
 # 安全约束（§4.3）：
@@ -30,8 +30,15 @@
 #      落盘在主程序 exe 同目录的 scripts\ 下（§8-S13）；
 #   3. <脚本目录>\..\target\release\cl-recoder-collector.exe —— 开发布局：仓库 scripts\。
 #
+# hardening-v4（§4.2.2/§4.2.3）：
+#   - 期望采集器路径对创建与已有任务（含 -RepairOnly）共用上述定位顺序；找不到 → exit 1；
+#   - 已有任务：Actions 必须恰好一个 Exec，Command（去引号、展开环境变量、规范化）与期望路径
+#     OrdinalIgnoreCase 相等且 Arguments 为空，否则 exit 5（冲突，只读未修改）；
+#   - 创建前与 Exec 核对通过后，检查 exe/所在目录/祖先目录 ACL（scripts\collector-path-trust.ps1），
+#     普通用户可写 → exit 7（只读，未修改）；开发者可手动传 -AllowUserWritable 跳过（GUI 永不传）。
+#
 # 退出码：0 成功；1 采集器未找到 / 权限不足 / 预期 SID 不符；5 定义冲突（只读，未修改）；
-#         6 更新后回读校验失败；其它非 0 为 schtasks 错误码。
+#         6 更新后回读校验失败；7 采集器路径普通用户可写（只读，未修改）；其它非 0 为 schtasks 错误码。
 
 param(
   [string]$CollectorPath = "",
@@ -40,7 +47,9 @@ param(
   # 修复既有任务：只更新三项策略并回读，不 /Run、不 /Create、不结束任何进程
   [switch]$RepairOnly,
   # GUI 后端可信获取的预期用户 SID；手动缺省取当前身份
-  [string]$ExpectedUserSid = ""
+  [string]$ExpectedUserSid = "",
+  # hardening-v4 §4.2.2：仅供开发者手动命令行使用，跳过“普通用户可写”检查（GUI 永不传入）
+  [switch]$AllowUserWritable
 )
 
 # 注意：用 Continue——PS 5.1 中 schtasks 失败时 stderr 会变成 ErrorRecord，
@@ -118,6 +127,26 @@ if (-not (Test-Path -LiteralPath $policyHelper -PathType Leaf)) {
 }
 . $policyHelper
 
+$trustHelper = Join-Path $PSScriptRoot "collector-path-trust.ps1"
+if (-not (Test-Path -LiteralPath $trustHelper -PathType Leaf)) {
+  Write-Error ("未找到路径可信性 helper {0}（程序安装可能不完整）" -f $trustHelper)
+  exit 1
+}
+. $trustHelper
+
+# 路径可信性检查（§4.2.2）：不可信 → exit 7，只读不修改；-AllowUserWritable 仅输出醒目警告。
+function Assert-CollectorPathTrusted([string]$Path) {
+  if ($AllowUserWritable) {
+    Write-Warning ("已传入 -AllowUserWritable：跳过采集器路径可写性检查（{0}）。以最高权限自启用户可写目录中的程序存在被替换提权风险，仅限开发调试。" -f $Path)
+    return
+  }
+  $finding = Test-CollectorPathTrusted -ExePath $Path -ExpectedUserSid $expectedSid
+  if ($finding) {
+    Write-Error ("采集器路径普通用户可写：{0}（主体 {1}，{2}）。以最高权限自启存在被替换风险，已拒绝创建/修复，未修改任务。请使用安装版或将程序放到仅管理员可写的目录。" -f $finding.Path, $finding.Sid, $finding.Reason)
+    exit 7
+  }
+}
+
 $service = New-Object -ComObject Schedule.Service
 $service.Connect()
 $rootFolder = $service.GetFolder("\")
@@ -144,25 +173,35 @@ if ($RepairOnly -and -not $existingTask) {
 $exe = $null
 
 # ---------------------------------------------------------------------------
+# 3b. 定位期望采集器路径（hardening-v4 §4.2.3：创建、已有任务与 -RepairOnly 共用）
+# ---------------------------------------------------------------------------
+$candidates = @()
+if ($CollectorPath -ne "") { $candidates += $CollectorPath }
+if ($PSScriptRoot) {
+  $candidates += (Join-Path $PSScriptRoot (Join-Path ".." $ExeName))
+  $candidates += (Join-Path $PSScriptRoot (Join-Path ".." (Join-Path "target" (Join-Path "release" $ExeName))))
+}
+foreach ($c in $candidates) {
+  if (Test-Path -LiteralPath $c -PathType Leaf) {
+    $exe = (Resolve-Path -LiteralPath $c).Path
+    break
+  }
+}
+if (-not $exe) {
+  if ($RepairOnly) {
+    Write-Error ("未找到采集器 {0}（查找过：{1}）——修复需要核对任务实际执行目标，无法确定期望路径，未修改任务" -f $ExeName, ($candidates -join "；"))
+  } else {
+    Write-Error ("未找到采集器 {0}（查找过：{1}）" -f $ExeName, ($candidates -join "；"))
+  }
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
 # 4. 创建路径（仅任务不存在时；沿用既有 schtasks 方式；RepairOnly 永不进入）
 # ---------------------------------------------------------------------------
 if (-not $existingTask) {
-  $candidates = @()
-  if ($CollectorPath -ne "") { $candidates += $CollectorPath }
-  if ($PSScriptRoot) {
-    $candidates += (Join-Path $PSScriptRoot (Join-Path ".." $ExeName))
-    $candidates += (Join-Path $PSScriptRoot (Join-Path ".." (Join-Path "target" (Join-Path "release" $ExeName))))
-  }
-  foreach ($c in $candidates) {
-    if (Test-Path -LiteralPath $c -PathType Leaf) {
-      $exe = (Resolve-Path -LiteralPath $c).Path
-      break
-    }
-  }
-  if (-not $exe) {
-    Write-Error ("未找到采集器 {0}（查找过：{1}）" -f $ExeName, ($candidates -join "；"))
-    exit 1
-  }
+  # §4.2.2：创建前检查路径可信性
+  Assert-CollectorPathTrusted $exe
 
   # /TR 的值必须以"内嵌引号"到达 schtasks（微软官方文档配方 /TR "\"C:\...\""）：
   # 含空格的路径若值内不含引号，会被 schtasks 拆成 Command + Arguments（§8-S13 实测）。
@@ -242,6 +281,31 @@ if (-not $originalSddl) {
 }
 
 # ---------------------------------------------------------------------------
+# 5b. Exec 核对（hardening-v4 §4.2.3）：恰好一个 Exec；Command 与期望路径一致；Arguments 为空
+# ---------------------------------------------------------------------------
+$actionsEl = $defDoc.GetElementsByTagName("Actions", $TaskNs) | Select-Object -First 1
+$actionNodes = @()
+if ($actionsEl) { $actionNodes = @($actionsEl.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element }) }
+$execCommand = $null
+$execArguments = $null
+if ($actionNodes.Count -eq 1 -and $actionNodes[0].LocalName -eq "Exec") {
+  foreach ($child in $actionNodes[0].ChildNodes) {
+    if ($child.LocalName -eq "Command") { $execCommand = $child.InnerText }
+    if ($child.LocalName -eq "Arguments") { $execArguments = $child.InnerText }
+  }
+}
+if ($null -eq $execCommand -or -not (Test-TaskExecMatches -Command $execCommand -Arguments $execArguments -ExpectedPath $exe)) {
+  $shownCmd = $execCommand
+  if ($null -eq $shownCmd) { $shownCmd = ("<{0} 个动作，非单一 Exec>" -f $actionNodes.Count) }
+  $shownArgs = ""
+  if ($execArguments) { $shownArgs = " 参数：" + $execArguments }
+  Write-Error ("任务 {0} 的执行目标与期望不一致——实际：{1}{2}；期望：{3}。只读报冲突，未修改" -f $TaskName, $shownCmd, $shownArgs, $exe)
+  exit 5
+}
+# Exec 核对通过后检查路径可信性（§4.2.2）
+Assert-CollectorPathTrusted $exe
+
+# ---------------------------------------------------------------------------
 # 6. 应用纯 XML 三项策略 → RegisterTask（0x34 + 原 SDDL）→ 回读
 # ---------------------------------------------------------------------------
 $policyDoc = Get-CollectorTaskPolicyXml $defDoc
@@ -295,6 +359,6 @@ if ($RepairOnly) {
   Write-Host ("已修复计划任务 {0} 的三项策略（无执行时限、允许电池启动、切换电池不停止）——对后续启动生效，当前实例未重启" -f $TaskName)
 } else {
   Write-Host ("计划任务 {0} 就绪（用户登录时自启，最高权限，无执行时限，允许电池启动）" -f $TaskName)
-  if ($exe) { Write-Host ("  采集器：{0}" -f $exe) }
+  Write-Host ("  采集器：{0}" -f $exe)
 }
 exit 0
