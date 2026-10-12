@@ -24,7 +24,10 @@
 #     GENERIC_WRITE/GENERIC_ALL 任一 → 不可信；
 #   - exe 所在目录：上述权限 + DeleteChild，且 WriteData(AddFile)/AppendData(AddSubdirectory) 亦计入；
 #   - 更上层祖先目录：只计 DeleteChild、Delete、WRITE_DAC、WRITE_OWNER、GENERIC_ALL
-#     （不计 AddFile/AddSubdirectory；见 docs/ACCEPTANCE-hardening-v4.md 关于 C:\ 默认 ACE）。
+#     （不计 AddFile/AddSubdirectory；见 docs/ACCEPTANCE-hardening-v4.md 关于 C:\ 默认 ACE）；
+#   - 卷根（如 C:\）：与普通祖先分开，不计对象自身 DELETE（0x10000）。机器上 C:\ 常给
+#     Authenticated Users Allow 0x1301BF，与祖先掩码交集仅 DELETE，不能据此证明可替换
+#     Program Files 下的安装路径；仍检查 DELETE_CHILD、WRITE_DAC、WRITE_OWNER、GENERIC_ALL。
 #   - -ExpectedUserSid / -ExtraSids：保留参数兼容；写 ACE 判定已改为“非可信即拒绝”，
 #     不再依赖令牌组成员列表（Select-TrustWatchedSids / Get-TokenWatchedSids 仍供安装脚本与测试使用）。
 
@@ -97,6 +100,8 @@ $script:SddlRightCodes = @{
 $script:MaskFile     = 0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x40000000 -bor 0x10000000
 $script:MaskExeDir   = $script:MaskFile -bor 0x40
 $script:MaskAncestor = 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000
+# 卷根：与 MaskAncestor 相同但不含对象自身 DELETE（0x10000）
+$script:MaskVolumeRoot = 0x40 -bor 0x40000 -bor 0x80000 -bor 0x10000000
 
 function ConvertFrom-SddlRights([string]$Rights) {
   $r = $Rights.Trim()
@@ -250,18 +255,23 @@ function Get-UntrustedWriteAceFromRawSd {
 }
 
 # 纯函数：给定对象 SDDL，返回首个不可信条目 @{ Sid; Reason } 或 $null。
-#   -Kind File | ExeDir | Ancestor（决定计入的权限集合）
+#   -Kind File | ExeDir | Ancestor | VolumeRoot（决定计入的权限集合）
 #   -ExpectedUserSid / -ExtraSids：保留兼容；判定以“非可信写主体即拒绝”为准。
 #   Windows 上优先走 RawSecurityDescriptor；不可用时用嵌套括号感知的 SDDL 字符串路径（Linux 单测）。
 function Get-UntrustedWriteAce {
   param(
     [Parameter(Mandatory = $true)][string]$Sddl,
     [string]$ExpectedUserSid = "",
-    [ValidateSet("File", "ExeDir", "Ancestor")][string]$Kind = "File",
+    [ValidateSet("File", "ExeDir", "Ancestor", "VolumeRoot")][string]$Kind = "File",
     [string[]]$ExtraSids = @()
   )
   $null = $ExpectedUserSid; $null = $ExtraSids
-  $mask = switch ($Kind) { "File" { $script:MaskFile } "ExeDir" { $script:MaskExeDir } default { $script:MaskAncestor } }
+  $mask = switch ($Kind) {
+    "File" { $script:MaskFile }
+    "ExeDir" { $script:MaskExeDir }
+    "VolumeRoot" { $script:MaskVolumeRoot }
+    default { $script:MaskAncestor }
+  }
 
   $native = Get-UntrustedWriteAceFromRawSd -Sddl $Sddl -Mask $mask
   if ($null -ne $native -and $native.Handled) { return $native.Hit }
@@ -345,10 +355,15 @@ function Test-CollectorPathTrusted {
   $dir = Split-Path -Parent $ExePath
   $kind = "ExeDir"
   while ($dir) {
-    $items += @{ Path = $dir; Kind = $kind }
-    $kind = "Ancestor"
     $parent = Split-Path -Parent $dir
-    if (-not $parent -or $parent -eq $dir) { break }
+    $isVolumeRoot = (-not $parent -or $parent -eq $dir)
+    # 卷根用 VolumeRoot 掩码（不含自身 DELETE）；ExeDir 若恰为卷根仍按 ExeDir（含写文件等更严规则）
+    if ($kind -eq "ExeDir") { $itemKind = "ExeDir" }
+    elseif ($isVolumeRoot) { $itemKind = "VolumeRoot" }
+    else { $itemKind = "Ancestor" }
+    $items += @{ Path = $dir; Kind = $itemKind }
+    if ($isVolumeRoot) { break }
+    $kind = "Ancestor"
     $dir = $parent
   }
   foreach ($it in $items) {

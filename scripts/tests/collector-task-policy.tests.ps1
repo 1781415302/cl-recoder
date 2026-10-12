@@ -225,6 +225,28 @@ $global:FAKE = @{
   TaskLookupFails = [bool]$cfg.TaskLookupFails
   PostTaskXml    = $cfg.PostTaskXml
   RegisterCount  = 0
+  MockTrustedAcl = [bool]$cfg.MockTrustedAcl
+  TrustedSddl    = [string]$cfg.TrustedSddl
+  VolumeRootSddl = [string]$cfg.VolumeRootSddl
+}
+
+# 受保护路径场景：用函数覆盖 Get-Acl，卷根返回含 AU 0x1301BF 的 SDDL，其余返回 Program Files 形 ACL。
+# 用于验证不传 -AllowUserWritable 时卷根自身 DELETE 不再误拒（hardening-v4 P2）。
+if ($global:FAKE.MockTrustedAcl) {
+  function Get-Acl {
+    [CmdletBinding()]
+    param(
+      [Parameter(ValueFromPipeline = $true)][string]$Path,
+      [string]$LiteralPath
+    )
+    $p = $null
+    if ($PSBoundParameters.ContainsKey("LiteralPath") -and $LiteralPath) { $p = $LiteralPath }
+    elseif ($Path) { $p = $Path }
+    $parent = Split-Path -Parent $p
+    $isRoot = (-not $parent -or $parent -eq $p)
+    $sddl = if ($isRoot) { [string]$global:FAKE.VolumeRootSddl } else { [string]$global:FAKE.TrustedSddl }
+    return [pscustomobject]@{ Sddl = $sddl }
+  }
 }
 
 function Write-FakeCall([string]$Line) {
@@ -689,6 +711,49 @@ $r17 = Invoke-Scenario "S17-create-user-writable" @{
 }
 Assert-True ($r17.Code -eq 7) "B17 用户可写路径创建 → 7" ("实际 " + $r17.Code)
 Assert-True (-not (Test-HasCall $r17.Calls "/Create")) "B17 拒绝时无 /Create"
+
+# B18（hardening-v4 P2）受保护路径：夹具 ACL 模拟 Program Files + 卷根 AU 0x1301BF，
+# 不传 -AllowUserWritable → 创建/修复应成功（卷根自身 DELETE 不得误拒）。
+$pfSddl = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)(A;OICIIO;GA;;;CO)(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;BA)(A;OICIIO;GA;;;BA)(A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;AC)"
+$volRootSddl = "O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;;0x1301bf;;;AU)"
+$protDir = Join-Path (Join-Path $script:WorkDir "ProgramFilesLike") "CL Recoder"
+New-Item -ItemType Directory -Path $protDir -Force | Out-Null
+$protExe = Join-Path $protDir "cl-recoder-collector.exe"
+[System.IO.File]::WriteAllBytes($protExe, [byte[]]@(0x4d, 0x5a))
+$protCommand = '"' + $protExe + '"'
+$protCreatedXml = New-TaskXml -Sid $realSid -Etl "" -Command $protCommand
+$protExistsXml = New-TaskXml -Sid $realSid -Command $protCommand
+$r18 = Invoke-Scenario "S18-create-protected" @{
+  FakeAdmin      = $true
+  TaskExists     = $false
+  TaskXml        = ""
+  CreatedTaskXml = $protCreatedXml
+  Sddl           = (New-TaskSddl $realSid)
+  TaskName       = $testTaskName
+  CollectorPath  = $protExe
+  MockTrustedAcl = $true
+  TrustedSddl    = $pfSddl
+  VolumeRootSddl = $volRootSddl
+}
+Assert-True ($r18.Code -eq 0) "B18 受保护路径创建（无 AllowUserWritable，卷根 0x1301BF）→ 0" ("实际 " + $r18.Code)
+Assert-True (Test-HasCall $r18.Calls "/Create") "B18 有 /Create"
+Assert-HasPolicyValues $r18 "B18"
+$r18b = Invoke-Scenario "S18b-repair-protected" @{
+  FakeAdmin  = $true
+  TaskExists = $true
+  TaskXml    = $protExistsXml
+  Sddl       = (New-TaskSddl $realSid)
+  TaskName   = $testTaskName
+  RepairOnly = $true
+  CollectorPath = $protExe
+  MockTrustedAcl = $true
+  TrustedSddl    = $pfSddl
+  VolumeRootSddl = $volRootSddl
+}
+Assert-True ($r18b.Code -eq 0) "B18b 受保护路径 RepairOnly（无 AllowUserWritable）→ 0" ("实际 " + $r18b.Code)
+Assert-True ($null -ne $r18b.RegisteredXml) "B18b 修复已 RegisterTask"
+Assert-True (-not (Test-HasCall $r18b.Calls "/Create")) "B18b RepairOnly 无 /Create"
+Assert-True (-not (Test-HasCall $r18b.Calls "/Run")) "B18b RepairOnly 无 /Run"
 
 # ---------------------------------------------------------------------------
 # 收尾

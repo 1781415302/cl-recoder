@@ -23,7 +23,7 @@ $user = "S-1-5-21-100-200-300-1001"
 Write-Host "== A. Get-UntrustedWriteAce（SDDL 夹具）=="
 # Program Files 下安装目录典型 ACL（TrustedInstaller/SYSTEM/Administrators 完全控制，Users 读取执行）
 $pf = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)(A;OICIIO;GA;;;CO)(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;BA)(A;OICIIO;GA;;;BA)(A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;AC)"
-foreach ($k in "File", "ExeDir", "Ancestor") {
+foreach ($k in "File", "ExeDir", "Ancestor", "VolumeRoot") {
   Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $pf -ExpectedUserSid $user -Kind $k)) ("A1 Program Files 默认 ACL 可信（" + $k + "）")
 }
 # %LOCALAPPDATA% 典型 ACL：用户本人完全控制、Owner 为用户
@@ -65,7 +65,7 @@ Assert-True ($null -ne $h -and $h.Sid -eq $grp) "A2-2 ExtraSids 不影响：仍�
 $puDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;PU)"
 Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $puDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-3 Power Users 可写 → 不可信（固定受检）"
 $adminTok = @($user, "S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", "S-1-5-114", "S-1-16-12288", "S-1-5-32-545", "S-1-5-11")
-foreach ($k in "File", "ExeDir", "Ancestor") {
+foreach ($k in "File", "ExeDir", "Ancestor", "VolumeRoot") {
   Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $pf -ExpectedUserSid $user -Kind $k -ExtraSids $adminTok)) ("A2-4 提权令牌（含 Administrators 等）下 Program Files 仍可信（" + $k + "）")
 }
 $sel = Select-TrustWatchedSids @(" s-1-5-32-544 ", "S-1-5-21-1-2-3-4", "s-1-5-21-1-2-3-4", "", "S-1-5-80-1-2", "S-1-5-32-545")
@@ -115,6 +115,19 @@ $h3 = Get-UntrustedWriteAce -Sddl $xaOnly -ExpectedUserSid $user -Kind "File"
 Assert-True ($null -ne $h3 -and $h3.Reason -match "条件/未知 ACE") "A4-3 单独 XA 保守拒绝" ("" + $h3.Reason)
 # 嵌套切分在仅有简单 ACE 时与旧行为一致（Program Files 夹具仍可信）
 Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $pf -ExpectedUserSid $user -Kind "File")) "A4-4 Program Files 夹具在嵌套切分下仍可信"
+
+Write-Host "== A5. 卷根 VolumeRoot 与普通祖先掩码分离 =="
+# 复现：卷根 AU Allow 0x1301BF（含自身 DELETE，不含 DELETE_CHILD/WRITE_DAC/WRITE_OWNER）
+$volAu = "O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;;0x1301bf;;;AU)"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $volAu -ExpectedUserSid $user -Kind "VolumeRoot")) "A5-1 卷根仅 AU 0x1301BF → VolumeRoot 可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $volAu -ExpectedUserSid $user -Kind "Ancestor")) "A5-2 同一 SDDL 作为普通祖先仍因 DELETE 不可信"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x10000;;;AU)(A;;FA;;;BA)" -Kind "VolumeRoot")) "A5-3 卷根仅自身 DELETE → 可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x10000;;;AU)" -Kind "Ancestor")) "A5-4 普通祖先 DELETE → 不可信（回归）"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x40;;;AU)(A;;FA;;;BA)" -Kind "VolumeRoot")) "A5-5 卷根 DELETE_CHILD → 不可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x40000;;;AU)(A;;FA;;;BA)" -Kind "VolumeRoot")) "A5-6 卷根 WRITE_DAC → 不可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x80000;;;AU)(A;;FA;;;BA)" -Kind "VolumeRoot")) "A5-7 卷根 WRITE_OWNER → 不可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;GA;;;AU)(A;;FA;;;BA)" -Kind "VolumeRoot")) "A5-8 卷根 GENERIC_ALL → 不可信"
+Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;FA;;;AU)" -Kind "VolumeRoot")) "A5-9 卷根 FA（含危险位）→ 不可信"
 
 Write-Host "== B. Test-TaskExecMatches =="
 $exp = "C:\Program Files\CL Recoder\cl-recoder-collector.exe"
