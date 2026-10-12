@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -525,6 +525,49 @@ fn sidecar_path(db: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Online Backup 总时限（hardening-v4 §4.4，审阅 I11）。
+const BACKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 源 Busy/Locked 时的重试间隔。
+const BACKUP_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 以 SQLite Online Backup API 把 `source` 一致快照写入 `dst`（hardening-v4 §4.4）。
+///
+/// - 源以 `SQLITE_OPEN_READ_ONLY | NO_MUTEX` 打开，`busy_timeout(5s)`；不写主库（打开 WAL 库时
+///   SQLite 可能创建/更新 `-shm`，与 WhatPulse 自身行为相同）。不使用 `immutable=1`（会忽略 WAL）。
+/// - 单次 `step(-1)`：一个读事务内复制全部页，源的并发写入不会导致重启；`Busy`/`Locked` 以
+///   200ms 间隔重试，总时限 `total`（测试注入 0 验证超时回退）。不使用 `run_to_completion`。
+/// - 失败返回 Err 文案，由调用方退回文件复制。
+pub(crate) fn backup_snapshot(source: &Path, dst: &Path, total: Duration) -> Result<(), String> {
+    use rusqlite::backup::{Backup, StepResult};
+    use rusqlite::{Connection, OpenFlags};
+    let deadline = Instant::now() + total;
+    let src = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("只读打开源库失败: {e}"))?;
+    src.busy_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    let mut out = Connection::open(dst).map_err(|e| format!("创建快照副本失败: {e}"))?;
+    {
+        let backup = Backup::new(&src, &mut out).map_err(|e| format!("初始化备份失败: {e}"))?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(format!("一致快照超过总时限 {}s", total.as_secs()));
+            }
+            match backup.step(-1).map_err(|e| format!("备份失败: {e}"))? {
+                StepResult::Done => break,
+                StepResult::Busy | StepResult::Locked | StepResult::More => {
+                    std::thread::sleep(BACKUP_RETRY_INTERVAL);
+                }
+                _ => return Err("备份返回未知状态".to_string()),
+            }
+        }
+    }
+    drop(src);
+    out.close().map_err(|(_, e)| format!("关闭快照副本失败: {e}"))?;
+    Ok(())
+}
+
 /// 导入主入口（command 与单测共用）：`source` = WhatPulse 库，`stats_db` = 本软件统计库。
 pub fn run_import(source: &Path, stats_db: &Path) -> ImportReport {
     let started = Instant::now();
@@ -549,16 +592,24 @@ pub fn run_import(source: &Path, stats_db: &Path) -> ImportReport {
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&tmp_wal);
     let _ = std::fs::remove_file(&tmp_shm);
-    if let Err(e) = std::fs::copy(source, &tmp) {
+    // hardening-v4 §4.4：优先以 Online Backup API 在源的单个读事务内取一致快照（含已提交 WAL 内容）；
+    // 任一失败（WAL 缺 -shm 且目录只读、独占锁、超时等）→ 退回原文件复制路径，不比现状更差。
+    if let Err(e) = backup_snapshot(source, &tmp, BACKUP_TOTAL_TIMEOUT) {
+        crate::gui_log!("WARN: 一致快照不可用，退回文件复制: {e}");
         let _ = std::fs::remove_file(&tmp);
-        return failed_report(started, warnings, format!("复制源库失败: {e}"));
-    }
+        let _ = std::fs::remove_file(&tmp_wal);
+        let _ = std::fs::remove_file(&tmp_shm);
+        if let Err(e) = std::fs::copy(source, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return failed_report(started, warnings, format!("复制源库失败: {e}"));
+        }
 
-    // {src}-wal 存在则 best-effort 复制（失败静默——WhatPulse 写入期间锁竞争/checkpoint 竞态属预期，
-    // 缺 wal 只是得到更旧快照）。**不复制 -shm**：RW 打开副本时 SQLite 自动重建。
-    let src_wal = sidecar_path(source, "-wal");
-    if src_wal.is_file() {
-        let _ = std::fs::copy(&src_wal, &tmp_wal);
+        // {src}-wal 存在则 best-effort 复制（失败静默——WhatPulse 写入期间锁竞争/checkpoint 竞态属预期，
+        // 缺 wal 只是得到更旧快照）。**不复制 -shm**：RW 打开副本时 SQLite 自动重建。
+        let src_wal = sidecar_path(source, "-wal");
+        if src_wal.is_file() {
+            let _ = std::fs::copy(&src_wal, &tmp_wal);
+        }
     }
 
     // 2. RW 打开副本 + preflight 校验/聚合（损坏/不相关/畸形来源硬失败，
@@ -1466,5 +1517,73 @@ mod tests {
             .unwrap();
         assert_eq!(name, "editor.exe", "应用名必须回退 basename");
         assert_eq!(keys, 7, "统计数据本身照常导入");
+    }
+
+    /// hardening-v4 §4.4：源连接持有未提交写事务时，一致快照成功且得到提交前状态。
+    #[test]
+    fn backup_snapshot_ignores_uncommitted_writer() {
+        let src = TempFile::new("imp-bk-src", "db");
+        let dst = TempFile::new("imp-bk-dst", "db");
+        let conn = Connection::open(&src).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE keypress_frequency(profile_id INTEGER, day TEXT, hour INTEGER, key INTEGER, count INTEGER);
+             INSERT INTO keypress_frequency VALUES (1,'2026-05-01',0,65,10);",
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO keypress_frequency VALUES (1,'2026-05-01',1,65,5);")
+            .unwrap();
+        backup_snapshot(src.as_ref(), dst.as_ref(), BACKUP_TOTAL_TIMEOUT).unwrap();
+        let snap = Connection::open(&dst).unwrap();
+        let n: i64 = snap
+            .query_row("SELECT COUNT(*) FROM keypress_frequency", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "快照不含未提交行");
+        drop(snap);
+        conn.execute_batch("ROLLBACK;").unwrap();
+        // 完整导入路径同样成功
+        let stats = TempFile::new("imp-bk-stats", "db");
+        conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO keypress_frequency VALUES (1,'2026-05-02',1,65,5);")
+            .unwrap();
+        let report = run_import(src.as_ref(), stats.as_ref());
+        assert!(report.ok, "{:?}", report.warnings);
+        conn.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    /// 源为目录/不存在：快照失败；run_import 按原合同失败。
+    #[test]
+    fn backup_snapshot_fails_for_missing_or_directory_source() {
+        let dst = TempFile::new("imp-bk-missing-dst", "db");
+        let missing = crate::state::testutil::temp_path("imp-bk-missing", "db");
+        assert!(backup_snapshot(&missing, dst.as_ref(), BACKUP_TOTAL_TIMEOUT).is_err());
+        let dir = std::env::temp_dir();
+        assert!(backup_snapshot(&dir, dst.as_ref(), BACKUP_TOTAL_TIMEOUT).is_err());
+        let stats = TempFile::new("imp-bk-missing-stats", "db");
+        assert!(!run_import(&missing, stats.as_ref()).ok);
+        assert!(!run_import(&dir, stats.as_ref()).ok);
+        assert!(!stats.is_file(), "失败路径不得创建目标库");
+    }
+
+    /// 快照失败注入（非 SQLite 文件）→ 退回复制路径，仍按原校验合同失败、不创建目标。
+    #[test]
+    fn backup_failure_falls_back_to_copy_contract() {
+        let src = TempFile::new("imp-bk-garbage", "db");
+        std::fs::write(&src, b"this is not a sqlite database at all, just garbage bytes").unwrap();
+        let dst = TempFile::new("imp-bk-garbage-dst", "db");
+        assert!(backup_snapshot(src.as_ref(), dst.as_ref(), BACKUP_TOTAL_TIMEOUT).is_err());
+        let stats = TempFile::new("imp-bk-garbage-stats", "db");
+        let report = run_import(src.as_ref(), stats.as_ref());
+        assert!(!report.ok);
+        assert!(!stats.is_file(), "失败路径不得创建目标库");
+    }
+
+    /// 总时限注入 0：立即超时返回 Err（调用方据此走回退）。
+    #[test]
+    fn backup_timeout_zero_returns_err() {
+        let src = TempFile::new("imp-bk-timeout-src", "db");
+        let dst = TempFile::new("imp-bk-timeout-dst", "db");
+        Connection::open(&src).unwrap().execute_batch("CREATE TABLE t(x);").unwrap();
+        let e = backup_snapshot(src.as_ref(), dst.as_ref(), Duration::ZERO).unwrap_err();
+        assert!(e.contains("时限"), "{e}");
     }
 }

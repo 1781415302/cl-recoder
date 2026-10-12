@@ -32,7 +32,8 @@ chrono = "0.4"
 crossbeam-channel = "0.5"
 regex = "1"
 dirs = "6"
-rusqlite = { version = "0.40", features = ["bundled"] }
+# hardening-v4 §4.4：开启 backup（纯特性开关，bundled SQLite 自带 sqlite3_backup_*，不引入新 crate）。
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
