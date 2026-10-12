@@ -731,7 +731,7 @@ fn import_from_copy(
 
     // 此时才打开/迁移目标并单事务整体重建
     // （wp_* 的 SQL 唯一归属 store；GUI 临时 rw 连接 busy_timeout=10s，§5.4）
-    let stats = db::open_rw(stats_db).map_err(|e| format!("打开统计库失败: {e}"))?;
+    let stats = db::open_rw(stats_db)?;
     clrecoder_store::schema::migrate(&stats)
         .map_err(|e| format!("统计库迁移失败: {e}"))?;
     clrecoder_store::writer::rebuild_wp_tables_with(&stats, &batch)

@@ -347,7 +347,7 @@ fn set_manual_dpi_at(
     if !path.is_file() {
         return Err("统计库不存在，请先启动采集器后再配置 DPI".to_string());
     }
-    let conn = db::open_rw(path).map_err(|e| format!("打开统计库失败: {e}"))?;
+    let conn = db::open_rw(path)?;
     let now_unix_us = chrono::Utc::now().timestamp_micros();
     authorized_source_row(&conn, source_id, now_unix_us)?;
     motion::set_manual_dpi(&conn, source_id, dpi)
@@ -837,6 +837,36 @@ mod tests {
         let err = set_manual_dpi_at(&missing, id_a, Some(800)).unwrap_err();
         assert!(err.contains("统计库不存在"), "{err}");
         assert!(!missing.is_file(), "set 失败不得凭空建库");
+    }
+
+    /// hardening-v4：schema 过新时 `open_rw` 统一拒绝，`set_manual_dpi_at` 不得改写 manual_dpi。
+    #[test]
+    fn set_manual_dpi_rejects_schema_too_new_without_changes() {
+        let (f, w) = seeded_v3("mouse-dpi-schema-too-new");
+        let desc = source_desc("path-schema99", g102_key(), true);
+        let id = w.register_mouse_source(&desc).unwrap();
+        drop(w);
+        set_manual_dpi_at(f.as_ref(), id, Some(800)).expect("schema 正常时应可写");
+
+        {
+            let rw = rusqlite::Connection::open(f.as_ref()).unwrap();
+            rw.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = set_manual_dpi_at(f.as_ref(), id, Some(1600)).unwrap_err();
+        assert!(
+            err.contains("统计库版本过新") && err.contains("99"),
+            "应拒绝写入：{err}"
+        );
+
+        let conn = ro_conn(&f);
+        let rows = motion::read_manual_dpi(&conn, std::slice::from_ref(&desc.source_key)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].manual_dpi, Some(800), "失败后 manual_dpi 不得被改写");
     }
 
     /// get_mouse_legacy（§4.5）：×80 口径、quality 常量、camelCase、kind/存在性校验、

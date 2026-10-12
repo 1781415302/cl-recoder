@@ -39,3 +39,4 @@ H1（会话事件清空键盘状态）属防御性改动：M1 基线尚未复现
 5. `Win32_System_RemoteDesktop`、`Win32_System_Power` 特性加在 collector crate 而非根 `Cargo.toml`。
 6. 任务策略测试 B3b：`-RepairOnly` 且找不到采集器时由原行为改为退出码 1（与新的统一定位逻辑一致）。
 7. 代码审阅后补充（见 [代码审阅](./DEVPLAN-hardening-v4-code-review.md)“处理结果”）：路径可信检查的受检集合扩展为固定主体 + Power Users + 当前提权令牌的全部非特权组；采集器退出码 3 在启动失败时映射为专门文案；备份总时限包含单次 step 内的忙等待。
+8. PR 审阅修复（commit 针对 Null DACL / 跨账户写 ACE / DPI 绕过）：路径可信检查改为“非显式可信主体的写 ACE 一律拒绝”，并拒绝 Null DACL；`db::open_rw` 统一执行 schema 过新检查，覆盖手动 DPI 等全部 GUI 写路径。

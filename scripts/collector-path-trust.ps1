@@ -5,29 +5,37 @@
 # （scripts/tests/collector-path-trust.tests.ps1）。Test-CollectorPathTrusted 读取真实 ACL（Get-Acl），
 # 仅在 Windows 上有意义。
 #
-# 判据（以“普通用户能否替换以最高权限运行的 exe 或在其目录植入文件”为准）：
-#   - 受检主体：Users(S-1-5-32-545/BU)、Authenticated Users(S-1-5-11/AU)、Everyone(S-1-1-0/WD)、
-#     INTERACTIVE(S-1-5-4/IU)、Power Users(S-1-5-32-547)、-ExpectedUserSid（当前登录用户本人），
-#     以及 -ExtraSids（install-collector-task.ps1 传入当前令牌的全部组 SID，见 Get-TokenWatchedSids）；
-#   - 令牌组中的特权主体（Administrators、SYSTEM、LOCAL/NETWORK SERVICE、服务 SID S-1-5-80-*、
-#     TrustedInstaller、本地管理员账户标记 S-1-5-114）不计入：提权令牌必然含 Administrators，
-#     而 Program Files 本就允许管理员写入，计入会使所有路径被误拒；
-#   - OWNER RIGHTS(S-1-3-4/OW)：其 ACE 只作用于对象 Owner；Owner 为受检主体时已直接判为不可信，
-#     故 OW 仅在 Owner 属受检集合时计入（此时结论不变），否则忽略；
-#   - 边界：令牌组只能反映“当前提权令牌”的组成员关系；Deny ACE 一律忽略（保守，可能误拒，不会漏判）；
-#   - 只看 Allow ACE；忽略仅作用于新建子项的 InheritOnly（IO）ACE；
-#   - 对象 Owner 为受检主体 → 不可信（Owner 隐含 WRITE_DAC）；
+# 判据（以“非特权主体能否替换以最高权限运行的 exe 或在其目录植入文件”为准）：
+#   - 写权限 Allow ACE：主体不在显式可信集合中 → 不可信。可信集合仅为
+#     Administrators(S-1-5-32-544/BA)、SYSTEM(S-1-5-18/SY)、LOCAL SERVICE(S-1-5-19/LS)、
+#     NETWORK SERVICE(S-1-5-20/NS)、以及 NT SERVICE 前缀 S-1-5-80-*（含 TrustedInstaller）。
+#     不要求 ACE 主体属于当前令牌；其他用户/自定义组的写权限一律拒绝。
+#   - Null DACL（SDDL 含 D:NO_ACCESS_CONTROL，或解析后无 DACL 段）= 人人完全控制 → 不可信；
+#     空 DACL（D: 仅有控制标志、无 ACE）= 拒绝所有人 → 可信；无法解析的 SDDL → 不可信。
+#   - OWNER RIGHTS(S-1-3-4/OW)：其 ACE 只约束 Owner；Owner 非可信主体时已直接判为不可信，
+#     故 OW ACE 一律跳过（不重复判定）。
+#   - Deny ACE 一律忽略（保守：可能误拒，不会因 Deny 而放行）。
+#   - 只看 Allow ACE；忽略仅作用于新建子项的 InheritOnly（IO）ACE。
+#   - 对象 Owner 不在可信集合 → 不可信（Owner 隐含 WRITE_DAC）。
 #   - exe 文件本身：WriteData/AppendData/WriteEA/WriteAttributes/Delete/WRITE_DAC/WRITE_OWNER/
 #     GENERIC_WRITE/GENERIC_ALL 任一 → 不可信；
-#   - exe 所在目录：上述权限 + DeleteChild（可删除替换子项），且 WriteData(AddFile)/
-#     AppendData(AddSubdirectory) 亦计入（可植入同目录 DLL）；
-#   - 更上层祖先目录（直到卷根）：只计“可删除/重命名既有子项或改写自身 ACL”的权限——
-#     DeleteChild、Delete、WRITE_DAC、WRITE_OWNER、GENERIC_ALL。仅能“新建”子项的
-#     AddFile/AddSubdirectory 不能替换既有子目录，不计入（实施偏差说明见 docs/ACCEPTANCE-hardening-v4.md：
-#     Windows 默认卷根 C:\ 对 Authenticated Users 有一条非继承的“创建文件夹”ACE，若按方案原文
-#     对祖先计入 AppendData，所有路径都会被误拒）。
+#   - exe 所在目录：上述权限 + DeleteChild，且 WriteData(AddFile)/AppendData(AddSubdirectory) 亦计入；
+#   - 更上层祖先目录：只计 DeleteChild、Delete、WRITE_DAC、WRITE_OWNER、GENERIC_ALL
+#     （不计 AddFile/AddSubdirectory；见 docs/ACCEPTANCE-hardening-v4.md 关于 C:\ 默认 ACE）。
+#   - -ExpectedUserSid / -ExtraSids：保留参数兼容；写 ACE 判定已改为“非可信即拒绝”，
+#     不再依赖令牌组成员列表（Select-TrustWatchedSids / Get-TokenWatchedSids 仍供安装脚本与测试使用）。
 
-# 令牌组中不计入受检集合的特权主体（精确 SID 或前缀）
+# 写 ACE / Owner 的显式可信主体（精确 SID）与前缀
+$script:TrustTrustedSids = @(
+  "S-1-5-32-544",  # Administrators
+  "S-1-5-18",      # SYSTEM
+  "S-1-5-19",      # LOCAL SERVICE
+  "S-1-5-20",      # NETWORK SERVICE
+  "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"  # TrustedInstaller
+)
+$script:TrustTrustedPrefixes = @("S-1-5-80-")  # NT SERVICE\*
+
+# 兼容：过滤令牌 SID 时去掉特权主体（供 Get-TokenWatchedSids / 旧测试）
 $script:TrustPrivilegedSids = @("S-1-5-32-544", "S-1-5-18", "S-1-5-19", "S-1-5-20", "S-1-5-114")
 $script:TrustPrivilegedPrefixes = @("S-1-5-80-", "S-1-16-")
 
@@ -59,11 +67,17 @@ function Get-TokenWatchedSids {
 }
 
 $script:TrustWatchedAliases = @{
+  "BA" = "S-1-5-32-544"
+  "SY" = "S-1-5-18"
+  "LS" = "S-1-5-19"
+  "NS" = "S-1-5-20"
+  "TI" = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
   "PU" = "S-1-5-32-547"
   "BU" = "S-1-5-32-545"
   "AU" = "S-1-5-11"
   "WD" = "S-1-1-0"
   "IU" = "S-1-5-4"
+  "OW" = "S-1-3-4"
 }
 
 # SDDL 访问权限字符串代码 → 掩码（文件/目录与通用权限）
@@ -100,8 +114,32 @@ function ConvertTo-CanonicalSid([string]$Sid) {
   return $up
 }
 
+# 写 ACE / Owner 是否属于显式可信集合。
+function Test-IsTrustedWriteSid([string]$Sid) {
+  $u = ConvertTo-CanonicalSid $Sid
+  if ($script:TrustTrustedSids -contains $u) { return $true }
+  foreach ($p in $script:TrustTrustedPrefixes) { if ($u.StartsWith($p)) { return $true } }
+  return $false
+}
+
+# 纯函数：解析 SDDL 的 DACL 形态（不依赖 Windows ACL API，可在 Linux pwsh 单测）。
+# 返回 Kind = Null | Empty | Aces | Invalid；Aces 时 Text 为 ACE 括号串。
+function Get-SddlDaclInfo([string]$Sddl) {
+  if (-not $Sddl -or -not $Sddl.Trim()) { return @{ Kind = "Invalid"; Text = "" } }
+  if ($Sddl -match "(?i)D:NO_ACCESS_CONTROL") { return @{ Kind = "Null"; Text = "" } }
+  if ($Sddl -match "D:([^()]*)((\([^()]*\))*)") {
+    $aces = $Matches[2]
+    if ($aces -and $aces.Trim()) { return @{ Kind = "Aces"; Text = $aces } }
+    return @{ Kind = "Empty"; Text = "" }
+  }
+  # 有 O:/G:/S: 但无 D: —— 按 Null DACL 保守处理（人人可写风险）
+  if ($Sddl -match "(?i)(^|:)(O|G|S):") { return @{ Kind = "Null"; Text = "" } }
+  return @{ Kind = "Invalid"; Text = "" }
+}
+
 # 纯函数：给定对象 SDDL，返回首个不可信条目 @{ Sid; Reason } 或 $null。
 #   -Kind File | ExeDir | Ancestor（决定计入的权限集合）
+#   -ExpectedUserSid / -ExtraSids：保留兼容；判定以“非可信写主体即拒绝”为准。
 function Get-UntrustedWriteAce {
   param(
     [Parameter(Mandatory = $true)][string]$Sddl,
@@ -109,18 +147,21 @@ function Get-UntrustedWriteAce {
     [ValidateSet("File", "ExeDir", "Ancestor")][string]$Kind = "File",
     [string[]]$ExtraSids = @()
   )
-  $watched = @($script:TrustWatchedAliases.Values)
-  if ($ExpectedUserSid) { $watched += $ExpectedUserSid.Trim().ToUpperInvariant() }
-  foreach ($x in (Select-TrustWatchedSids $ExtraSids)) { if (-not ($watched -contains $x)) { $watched += $x } }
+  $null = $ExpectedUserSid; $null = $ExtraSids  # 保留参数，避免未使用告警
   $mask = switch ($Kind) { "File" { $script:MaskFile } "ExeDir" { $script:MaskExeDir } default { $script:MaskAncestor } }
+
+  $dacl = Get-SddlDaclInfo $Sddl
+  if ($dacl.Kind -eq "Invalid") { return @{ Sid = ""; Reason = "无法解析 SDDL" } }
+  if ($dacl.Kind -eq "Null") { return @{ Sid = "S-1-1-0"; Reason = "Null DACL" } }
 
   if ($Sddl -match "O:([^:]+?)(?=G:|D:|S:|$)") {
     $owner = ConvertTo-CanonicalSid $Matches[1]
-    if ($watched -contains $owner) { return @{ Sid = $owner; Reason = "Owner" } }
+    if (-not (Test-IsTrustedWriteSid $owner)) { return @{ Sid = $owner; Reason = "Owner" } }
   }
-  $dacl = ""
-  if ($Sddl -match "D:([^()]*)((\([^()]*\))*)") { $dacl = $Matches[2] }
-  foreach ($m in [regex]::Matches($dacl, "\(([^()]*)\)")) {
+
+  if ($dacl.Kind -eq "Empty") { return $null }
+
+  foreach ($m in [regex]::Matches($dacl.Text, "\(([^()]*)\)")) {
     $parts = $m.Groups[1].Value.Split(";")
     if ($parts.Count -lt 6) { continue }
     $aceType = $parts[0].Trim().ToUpperInvariant()
@@ -130,9 +171,9 @@ function Get-UntrustedWriteAce {
     for ($i = 0; $i + 2 -le $flags.Length; $i += 2) { if ($flags.Substring($i, 2) -eq "IO") { $isInheritOnly = $true } }
     if ($isInheritOnly) { continue }
     $sid = ConvertTo-CanonicalSid $parts[5]
-    # OWNER RIGHTS 仅约束 Owner：Owner 属受检集合时上方已返回，此处一律跳过
+    # OWNER RIGHTS 仅约束 Owner：Owner 非可信时上方已返回
     if ($sid -eq "S-1-3-4") { continue }
-    if (-not ($watched -contains $sid)) { continue }
+    if (Test-IsTrustedWriteSid $sid) { continue }
     $rights = ConvertFrom-SddlRights $parts[2]
     if (($rights -band $mask) -ne 0) {
       return @{ Sid = $sid; Reason = ("Allow 0x{0:X}" -f $rights) }

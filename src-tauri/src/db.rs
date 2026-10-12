@@ -5,8 +5,8 @@
 //!   WAL 容错：若采集进程崩溃留下未恢复的 WAL（只读连接无法执行恢复，报
 //!   `SQLITE_READONLY_RECOVERY/CANTINIT` 类错误），降级为**不建库**的读写方式重开一次，
 //!   让 SQLite 完成崩溃恢复后按只读语义继续使用（不做任何统计表写入）；
-//! - rw 连接（仅 WhatPulse 导入用，§5.4"GUI 临时 rw 连接"）：`busy_timeout(10s)`，与
-//!   collector 的 Writer 同参数，导入期间采集端同时 flush 也不会互锁死。
+//! - rw 连接（WhatPulse 导入、手动 DPI 等写入口，§5.4"GUI 临时 rw 连接"）：`busy_timeout(10s)`，与
+//!   collector 的 Writer 同参数；打开后统一检查 schema 不过新（hardening-v4）。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -73,16 +73,26 @@ pub fn open_ro(path: &std::path::Path) -> Result<Connection, rusqlite::Error> {
     }
 }
 
-/// 打开读写连接（**仅 WhatPulse 导入使用**，PLAN §5.4；建库语义交给调用方的 migrate）。
+/// 打开读写连接（WhatPulse 导入、手动 DPI 等 GUI 写入口；建库语义交给调用方的 migrate）。
 ///
 /// busy_timeout 与 store::Writer::open 一致（10s）：导入重建 wp_* 的单事务可能与
 /// 采集端的 flush 事务短暂互斥，等待即可。
-pub fn open_rw(path: &std::path::Path) -> Result<Connection, rusqlite::Error> {
+///
+/// hardening-v4：所有经本函数的写路径在返回前执行 [`clrecoder_store::schema::check_schema_not_newer`]；
+/// schema 过新时拒绝写入（与采集器退出码 3 / GUI 横幅一致），避免绕过只读状态检查。
+pub fn open_rw(path: &std::path::Path) -> Result<Connection, String> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(RW_BUSY_TIMEOUT)?;
-    Ok(conn)
+    let conn = Connection::open_with_flags(path, flags).map_err(|e| format!("打开统计库失败: {e}"))?;
+    conn.busy_timeout(RW_BUSY_TIMEOUT)
+        .map_err(|e| format!("设置 busy_timeout 失败: {e}"))?;
+    match clrecoder_store::schema::check_schema_not_newer(&conn) {
+        Ok(()) => Ok(conn),
+        Err(clrecoder_store::StoreError::SchemaTooNew { found, supported }) => Err(format!(
+            "统计库版本过新（库版本 {found}，本程序支持 {supported}），请升级程序后再写入"
+        )),
+        Err(e) => Err(format!("检查统计库版本失败: {e}")),
+    }
 }
 
 #[cfg(test)]

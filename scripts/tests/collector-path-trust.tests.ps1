@@ -51,15 +51,17 @@ Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x40;;;IU)" -
 Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x10000;;;AU)" -Kind "Ancestor")) "A8 祖先 Delete → 不可信"
 Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;0x6;;;AU)" -Kind "Ancestor")) "A8b 祖先仅 AddFile/AddSubdirectory → 不计入"
 Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:(A;;GW;;;BU)" -Kind "File")) "A9 GENERIC_WRITE → 不可信"
-Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl ("O:BAG:SYD:(A;;FA;;;" + $user + ")") -Kind "File")) "A10 未提供 ExpectedUserSid 时不检查该用户"
+$a10 = Get-UntrustedWriteAce -Sddl ("O:BAG:SYD:(A;;FA;;;" + $user + ")") -Kind "File"
+Assert-True ($null -ne $a10 -and $a10.Sid -eq $user) "A10 未提供 ExpectedUserSid 时普通用户写 ACE 仍不可信（非可信集合）" ("" + $a10.Sid)
 
 Write-Host ""
 Write-Host "== A2. 令牌组受检集合（-ExtraSids / Select-TrustWatchedSids）=="
 $grp = "S-1-5-21-100-200-300-5555"
 $grpDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;" + $grp + ")(A;OICI;0x1200a9;;;BU)"
-Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $grpDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-1 自定义组可写但未传令牌组 → 不检出（原边界）"
+$h0 = Get-UntrustedWriteAce -Sddl $grpDir -ExpectedUserSid $user -Kind "ExeDir"
+Assert-True ($null -ne $h0 -and $h0.Sid -eq $grp) "A2-1 自定义组可写（不在可信集合）→ 不可信" ("" + $h0.Sid)
 $h = Get-UntrustedWriteAce -Sddl $grpDir -ExpectedUserSid $user -Kind "ExeDir" -ExtraSids @($user, $grp.ToLowerInvariant())
-Assert-True ($null -ne $h -and $h.Sid -eq $grp) "A2-2 令牌组含该组 → 不可信" ("" + $h.Sid)
+Assert-True ($null -ne $h -and $h.Sid -eq $grp) "A2-2 ExtraSids 不影响：仍不可信" ("" + $h.Sid)
 $puDir = "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;PU)"
 Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $puDir -ExpectedUserSid $user -Kind "ExeDir")) "A2-3 Power Users 可写 → 不可信（固定受检）"
 $adminTok = @($user, "S-1-5-32-544", "S-1-5-18", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", "S-1-5-114", "S-1-16-12288", "S-1-5-32-545", "S-1-5-11")
@@ -73,6 +75,22 @@ Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $owDir -ExpectedUserSid $use
 $owUser = "O:" + $user + "G:SYD:PAI(A;OICI;FA;;;SY)(A;;FA;;;OW)"
 Assert-True ($null -ne (Get-UntrustedWriteAce -Sddl $owUser -ExpectedUserSid $user -Kind "ExeDir")) "A2-7 OWNER RIGHTS 且 Owner 为用户 → 不可信（Owner 规则）"
 Assert-True ((Get-TokenWatchedSids) -is [array]) "A2-8 Get-TokenWatchedSids 在任意平台返回数组（非 Windows 为空）"
+
+Write-Host "== A3. Null/空 DACL 与跨账户写 ACE =="
+$nullHit = Get-UntrustedWriteAce -Sddl "O:BAG:SYD:NO_ACCESS_CONTROL" -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $nullHit -and $nullHit.Reason -eq "Null DACL") "A3-1 Null DACL 不可信" ("" + $nullHit.Reason)
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:" -ExpectedUserSid $user -Kind "File")) "A3-2 空 DACL 可信（拒绝所有人）"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl "O:BAG:SYD:P" -ExpectedUserSid $user -Kind "ExeDir")) "A3-3 空 DACL (D:P) 可信"
+$bad = Get-UntrustedWriteAce -Sddl "not-a-valid-sddl" -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $bad -and $bad.Reason -eq "无法解析 SDDL") "A3-4 无法解析 SDDL 不可信" ("" + $bad.Reason)
+$other = "S-1-5-21-100-200-300-1002"
+$cross = "O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;" + $other + ")"
+$cx = Get-UntrustedWriteAce -Sddl $cross -ExpectedUserSid $user -Kind "File"
+Assert-True ($null -ne $cx -and $cx.Sid -eq $other) "A3-5 其他用户写 ACE 不可信" ("" + $cx.Sid)
+$privOk = "O:BAG:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;TI)"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $user -Kind "File")) "A3-6 仅 BA/SY/TI 写 ACE 可信"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $user -Kind "ExeDir")) "A3-7 仅特权写 ACE（ExeDir）可信"
+Assert-True ($null -eq (Get-UntrustedWriteAce -Sddl $privOk -ExpectedUserSid $user -Kind "Ancestor")) "A3-8 仅特权写 ACE（Ancestor）可信"
 
 Write-Host "== B. Test-TaskExecMatches =="
 $exp = "C:\Program Files\CL Recoder\cl-recoder-collector.exe"
