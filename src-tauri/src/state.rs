@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use rusqlite::Connection;
 
 use crate::db;
+use crate::overview_cache::OverviewCache;
 use clrecoder_store as store;
 
 /// settings.json 的持久化形状（PLAN §6 逐字：`{ "gui_autostart": bool, "wp_db_path": string|null, "first_run_done": bool }`）。
@@ -65,6 +66,8 @@ pub struct AppState {
     stats_path: PathBuf,
     /// 最近一次 schema 过新检测结果 `(found, supported)`（hardening-v4 §4.5(b)；None = 未过新）。
     schema_too_new: Arc<Mutex<Option<(i64, i64)>>>,
+    /// 概览冻结区缓存（hardening-v4 §4.3；锁独立于 `ro_conn`）。
+    pub overview_cache: Arc<Mutex<OverviewCache>>,
 }
 
 impl AppState {
@@ -104,6 +107,7 @@ impl AppState {
             settings: Arc::new(RwLock::new(settings)),
             stats_path,
             schema_too_new: Arc::new(Mutex::new(None)),
+            overview_cache: Arc::new(Mutex::new(OverviewCache::default())),
         };
         // hardening-v4 §4.5(b)：打开 ro 连接后立即检测一次；过新时继续以该连接只读展示。
         let _ = st.refresh_schema_status();
@@ -144,7 +148,15 @@ impl AppState {
     }
 
     /// schema 过新状态变化时的失效钩子（hardening-v4 §4.3：概览缓存 generation 在 M-B 接入）。
-    fn on_schema_status_changed(&self) {}
+    fn on_schema_status_changed(&self) {
+        self.invalidate_overview_cache();
+    }
+
+    /// 概览缓存代际 +1（等价清空）。调用点：ro 连接从兜底切到真实库、WhatPulse 导入完成、
+    /// schema 过新状态变化；未来任何写 `input_daily` 历史日期的功能也必须调用（§9-2）。
+    pub(crate) fn invalidate_overview_cache(&self) {
+        self.overview_cache.lock().unwrap_or_else(PoisonError::into_inner).bump();
+    }
 
     /// 取 ro 连接。毒化互斥量恢复为可用——GUI 查询线程 panic 不应让后续查询永久失败。
     fn lock_ro(&self) -> MutexGuard<'_, Connection> {
@@ -153,7 +165,7 @@ impl AppState {
 
     /// 当前连接是否为内存兜底（stats.db 尚不可用的引导态）。
     /// `sqlite3_db_filename` 对 `:memory:` 连接可能返回空串而非 ":memory:"，两者都视为兜底。
-    fn is_fallback_conn(conn: &Connection) -> bool {
+    pub(crate) fn is_fallback_conn(conn: &Connection) -> bool {
         match conn.path() {
             None => true,
             Some(p) => p.is_empty() || p == ":memory:",
@@ -173,6 +185,8 @@ impl AppState {
             if let Ok(real) = db::open_ro(&self.stats_path) {
                 crate::gui_log!("INFO: stats.db 已出现，从内存兜底连接切换到真实只读连接");
                 *guard = real;
+                // hardening-v4 §4.3（审阅 I7）：在切换的同一处使概览缓存失效。
+                self.invalidate_overview_cache();
             }
         }
         f(&guard)

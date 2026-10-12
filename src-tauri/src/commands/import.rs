@@ -710,6 +710,9 @@ pub async fn import_whatpulse(
             Ok(source) => run_import(&source, &db::stats_db_path()),
             Err(msg) => failed_report(started, Vec::new(), msg),
         };
+        // hardening-v4 §4.3：导入完成（不论成败）统一使概览缓存失效——导入不写 input_daily，
+        // 此处为安全起见清空，代价为下一次概览一次全扫。
+        st.invalidate_overview_cache();
         crate::gui_log!(
             "INFO: WhatPulse 导入完成: ok={} keys={} 耗时 {}ms",
             report.ok,

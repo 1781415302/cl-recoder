@@ -98,7 +98,27 @@ pub async fn get_overview(
     to: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<OverviewDto, String> {
-    super::blocking_query(&state, move |c| query_overview(c, &from, &to)).await
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        super::swallow(st.with_ro(|c| {
+            // 兜底内存连接（库尚不存在）不读不写缓存（hardening-v4 §4.3，审阅 I7）。
+            if AppState::is_fallback_conn(c) {
+                return query_overview(c, &from, &to);
+            }
+            let today = chrono::Local::now().date_naive();
+            Ok(crate::overview_cache::cached_overview(
+                c,
+                &st.overview_cache,
+                &from,
+                &to,
+                today,
+                std::time::Instant::now(),
+            )?
+            .into())
+        }))
+    })
+    .await
+    .map_err(|e| format!("后台查询任务失败: {e}"))
 }
 
 #[cfg(test)]
