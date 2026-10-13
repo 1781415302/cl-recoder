@@ -291,3 +291,15 @@ export interface GamepadMotionSummary {
   left: StickMotionSummary;
   right: StickMotionSummary;
 }
+
+/** hardening-v4：只读提示（get_app_notices）。schemaTooNew 非空时显示红色横幅。 */
+export interface AppNotices {
+  schemaTooNew: { found: number; supported: number } | null;
+}
+
+/** hardening-v4 §4.2.1：旧按用户安装位置的只读迁移提示（get_legacy_install_hints；
+ *  仅安装版出现，设置页展示；code 为稳定短码，message 为展示文案） */
+export interface LegacyInstallHint {
+  code: "collector_task_legacy_path" | "gui_autostart_legacy_path";
+  message: string;
+}

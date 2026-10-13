@@ -32,6 +32,7 @@ macro_rules! gui_log {
 mod commands;
 mod db;
 mod keylabel;
+mod overview_cache;
 mod state;
 // S3（§4.4）：原生窗口 UI 活动快照——active 的唯一权威，前端经事件 + get_ui_activity 消费。
 mod ui_activity;

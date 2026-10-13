@@ -45,6 +45,10 @@ pub enum StoreError {
     /// 查询/配置引用了不存在的鼠标运动来源 id（motion-dpi §4.5"未知 sourceId 返回错误"）。
     #[error("未知鼠标运动来源 id: {0}")]
     UnknownMouseSource(i64),
+    /// 数据库 schema 版本高于本程序支持的版本（由更新版本程序创建；hardening-v4 §4.5(b)）。
+    /// 旧程序不得写入或迁移该库，调用方据此给出“请升级程序”的明确提示。
+    #[error("数据库由更新版本创建（schema v{found}），当前程序仅支持 v{supported}，请升级程序")]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 /// store 统一 Result 别名。

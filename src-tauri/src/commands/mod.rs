@@ -10,6 +10,7 @@
 //! 例外（motion-dpi §4.5）：新增运动查询（mouse_motion/gamepad_motion）**不 swallow**
 //! ——SQL 真实错误原样返回，仅无 schema 走 availability=needs_upgrade 引导态。
 
+pub mod app_notices;
 pub mod apps;
 pub mod collector_ctl;
 pub mod collector_health;
@@ -86,6 +87,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         // 采集器任务修复与只读策略（S2 §4.3：前端均无参数）
         collector_ctl::collector_autostart_repair,
         collector_ctl::get_collector_task_policy,
+        // hardening-v4 §4.2.1：旧按用户安装位置的只读迁移提示（仅 Settings 活动时查询）
+        collector_ctl::get_legacy_install_hints,
         // 设置
         settings::get_settings,
         settings::set_settings,
@@ -100,6 +103,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         // 诊断日志（S1 §4.1：GUI sink 状态 + 打开日志目录；前端均无参数）
         diagnostics::get_diagnostics_info,
         diagnostics::open_diagnostics_directory,
+        // hardening-v4：只读提示（schema 过新横幅 / 旧安装迁移提示；前端无参数）
+        app_notices::get_app_notices,
     ]
 }
 

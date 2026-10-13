@@ -68,8 +68,13 @@ function New-TaskXml {
     [string]$Etl = "PT72H",          # "" = 节点缺失（真机 /Create 产物形状）
     [string]$Disallow = "true",
     [string]$Stop = "true",
-    [switch]$WithoutSettings
+    [switch]$WithoutSettings,
+    # hardening-v4：Exec Command 原文（默认沿用旧夹具值；B 段场景按需指向 dummy 采集器）
+    [string]$Command = '"C:\temp\x\cl-recoder-collector.exe"',
+    [string]$Arguments = ""
   )
+  $argXml = ""
+  if ($Arguments -ne "") { $argXml = "<Arguments>$Arguments</Arguments>" }
   $triggerXml = ($Triggers | ForEach-Object { "    <$_><Enabled>true</Enabled></$_>" }) -join "`r`n"
   $settingsXml = ""
   if (-not $WithoutSettings) {
@@ -102,7 +107,7 @@ $($settingsXml)  <Triggers>
 $($triggerXml)
   </Triggers>
   <Actions Context="Author">
-    <Exec><Command>"C:\temp\x\cl-recoder-collector.exe"</Command></Exec>
+    <Exec><Command>$Command</Command>$argXml</Exec>
   </Actions>
 </Task>
 "@
@@ -220,6 +225,28 @@ $global:FAKE = @{
   TaskLookupFails = [bool]$cfg.TaskLookupFails
   PostTaskXml    = $cfg.PostTaskXml
   RegisterCount  = 0
+  MockTrustedAcl = [bool]$cfg.MockTrustedAcl
+  TrustedSddl    = [string]$cfg.TrustedSddl
+  VolumeRootSddl = [string]$cfg.VolumeRootSddl
+}
+
+# 受保护路径场景：用函数覆盖 Get-Acl，卷根返回含 AU 0x1301BF 的 SDDL，其余返回 Program Files 形 ACL。
+# 用于验证不传 -AllowUserWritable 时卷根自身 DELETE 不再误拒（hardening-v4 P2）。
+if ($global:FAKE.MockTrustedAcl) {
+  function Get-Acl {
+    [CmdletBinding()]
+    param(
+      [Parameter(ValueFromPipeline = $true)][string]$Path,
+      [string]$LiteralPath
+    )
+    $p = $null
+    if ($PSBoundParameters.ContainsKey("LiteralPath") -and $LiteralPath) { $p = $LiteralPath }
+    elseif ($Path) { $p = $Path }
+    $parent = Split-Path -Parent $p
+    $isRoot = (-not $parent -or $parent -eq $p)
+    $sddl = if ($isRoot) { [string]$global:FAKE.VolumeRootSddl } else { [string]$global:FAKE.TrustedSddl }
+    return [pscustomobject]@{ Sddl = $sddl }
+  }
 }
 
 function Write-FakeCall([string]$Line) {
@@ -318,6 +345,7 @@ $invokeSplat = @{ TaskName = $cfg.TaskName }
 if ($cfg.CollectorPath) { $invokeSplat.CollectorPath = $cfg.CollectorPath }
 if ($cfg.RepairOnly) { $invokeSplat.RepairOnly = $true }
 if ($cfg.ExpectedUserSid) { $invokeSplat.ExpectedUserSid = $cfg.ExpectedUserSid }
+if ($cfg.AllowUserWritable) { $invokeSplat.AllowUserWritable = $true }
 
 $out = & $ScriptPath @invokeSplat 2>&1
 $code = $LASTEXITCODE
@@ -378,7 +406,10 @@ Assert-True (-not $installSrc.Contains("Stop-ScheduledTask")) "B0 install 脚本
 # B1 创建路径：/Create（内嵌引号配方）→ 三项设置回读 → /Run
 $dummyExe = Join-Path $script:WorkDir "dummy-collector.exe"
 [System.IO.File]::WriteAllBytes($dummyExe, [byte[]]@(0x4d, 0x5a))
-$createdXml = New-TaskXml -Sid $realSid -Etl ""
+# hardening-v4：夹具 exe 位于用户临时目录（普通用户可写），既有场景显式传 -AllowUserWritable，
+# 且任务 Exec 指向该 exe；可写性拒绝与 Exec 不符另见 B15–B17。
+$dummyCommand = '"' + $dummyExe + '"'
+$createdXml = New-TaskXml -Sid $realSid -Etl "" -Command $dummyCommand
 $r1 = Invoke-Scenario "S1-create" @{
   FakeAdmin      = $true
   TaskExists     = $false
@@ -387,6 +418,7 @@ $r1 = Invoke-Scenario "S1-create" @{
   Sddl           = (New-TaskSddl $realSid)
   TaskName       = $testTaskName
   CollectorPath  = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r1.Code -eq 0) "B1 创建路径退出码 0" ("实际 " + $r1.Code)
 $createLine = @($r1.Calls | Where-Object { $_.Contains("/Create") })
@@ -410,13 +442,15 @@ Assert-True ($r1.SddlPassed -eq (New-TaskSddl $realSid)) "B1 传给 RegisterTask
 Assert-True (Test-HasCall $r1.Calls "/Run") "B1 创建后 /Run"
 
 # B2 已存在（非 RepairOnly）：COM 更新不 /Create 重建；回读通过；/Run
-$existsXml = New-TaskXml -Sid $realSid
+$existsXml = New-TaskXml -Sid $realSid -Command $dummyCommand
 $r2 = Invoke-Scenario "S2-update" @{
   FakeAdmin  = $true
   TaskExists = $true
   TaskXml    = $existsXml
   Sddl       = (New-TaskSddl $realSid)
   TaskName   = $testTaskName
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r2.Code -eq 0) "B2 已存在更新退出码 0" ("实际 " + $r2.Code)
 Assert-True (-not (Test-HasCall $r2.Calls "/Create")) "B2 已存在绝不 /Create /F 重建"
@@ -432,6 +466,8 @@ $r2b = Invoke-Scenario "S2b-reorder" @{
   Sddl        = (New-TaskSddl $realSid)
   SddlReadback = (New-ReorderedSddl $realSid)
   TaskName    = $testTaskName
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r2b.Code -eq 0) "B2b ACE 重排后 owner/group/DACL 判等 → 0" ("实际 " + $r2b.Code)
 
@@ -443,6 +479,8 @@ $r3 = Invoke-Scenario "S3-repair" @{
   Sddl       = (New-TaskSddl $realSid)
   TaskName   = $testTaskName
   RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r3.Code -eq 0) "B3 RepairOnly 退出码 0" ("实际 " + $r3.Code)
 Assert-HasPolicyValues $r3 "B3"
@@ -451,11 +489,13 @@ Assert-True ($registerLine3.Count -eq 1 -and $registerLine3[0].Contains("flags=5
 Assert-True (-not (Test-HasCall $r3.Calls "/Create")) "B3 RepairOnly 无 /Create"
 Assert-True (-not (Test-HasCall $r3.Calls "/Run")) "B3 RepairOnly 无 /Run"
 
-# B3b RepairOnly 不要求重新定位采集器：脚本+helper 拷贝到无采集器的临时目录
+# B3b（hardening-v4 §4.2.3 语义变更）RepairOnly 须定位期望采集器以核对 Exec：
+#     脚本+helper 拷贝到无采集器的临时目录 → exit 1，且不修改任务
 $copyDir = Join-Path $script:WorkDir "S3b-copy"
 New-Item -ItemType Directory -Path $copyDir -Force | Out-Null
 Copy-Item -LiteralPath $script:InstallScriptPath -Destination (Join-Path $copyDir "install-collector-task.ps1")
 Copy-Item -LiteralPath $script:PolicyHelperPath -Destination (Join-Path $copyDir "collector-task-policy.ps1")
+Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $script:PolicyHelperPath) "collector-path-trust.ps1") -Destination (Join-Path $copyDir "collector-path-trust.ps1")
 $r3b = Invoke-Scenario "S3b-repair-noexe" @{
   FakeAdmin  = $true
   TaskExists = $true
@@ -464,7 +504,8 @@ $r3b = Invoke-Scenario "S3b-repair-noexe" @{
   TaskName   = $testTaskName
   RepairOnly = $true
 } -ScriptPath (Join-Path $copyDir "install-collector-task.ps1")
-Assert-True ($r3b.Code -eq 0) "B3b RepairOnly 不定位采集器文件 → 0" ("实际 " + $r3b.Code)
+Assert-True ($r3b.Code -eq 1) "B3b RepairOnly 找不到期望采集器 → 1" ("实际 " + $r3b.Code)
+Assert-True ($null -eq $r3b.RegisteredXml) "B3b 找不到期望采集器时不修改任务"
 Assert-True (-not (Test-HasCall $r3b.Calls "/Run")) "B3b 无 /Run"
 
 # B4 RepairOnly 但任务不存在：失败且绝不创建
@@ -488,6 +529,8 @@ $r5 = Invoke-Scenario "S5-extra-trigger" @{
   Sddl       = (New-TaskSddl $realSid)
   TaskName   = $testTaskName
   RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r5.Code -eq 5) "B5 额外触发器 → 明确冲突退出码 5" ("实际 " + $r5.Code)
 Assert-True ($null -eq $r5.RegisteredXml) "B5 冲突不修改（无 RegisterTask）"
@@ -501,6 +544,8 @@ $r6 = Invoke-Scenario "S6-principal-mismatch" @{
   Sddl       = (New-TaskSddl $fakeOtherSid)
   TaskName   = $testTaskName
   RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r6.Code -eq 5) "B6 principal 非当前用户 → 冲突 5" ("实际 " + $r6.Code)
 Assert-True ($null -eq $r6.RegisteredXml) "B6 不覆盖其他账户定义"
@@ -513,6 +558,8 @@ $r7 = Invoke-Scenario "S7-logon-type" @{
   Sddl       = (New-TaskSddl $realSid)
   TaskName   = $testTaskName
   RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r7.Code -eq 5) "B7 LogonType=Password → 冲突 5" ("实际 " + $r7.Code)
 Assert-True ($null -eq $r7.RegisteredXml) "B7 冲突不修改"
@@ -539,12 +586,14 @@ $r9 = Invoke-Scenario "S9-sddl-fails" @{
   GetSddlFails = $true
   TaskName    = $testTaskName
   RepairOnly  = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r9.Code -eq 5) "B9 SDDL 不可得 → 冲突 5" ("实际 " + $r9.Code)
 Assert-True ($null -eq $r9.RegisteredXml) "B9 无空 SDDL 冒充保全"
 
 # B10 回读三项不符（模拟系统丢弃 ExecutionTimeLimit）：不宣称安装成功
-$droppedEtl = New-TaskXml -Sid $realSid -Etl ""
+$droppedEtl = New-TaskXml -Sid $realSid -Etl "" -Command $dummyCommand
 $r10 = Invoke-Scenario "S10-readback-fail" @{
   FakeAdmin  = $true
   TaskExists = $true
@@ -552,6 +601,8 @@ $r10 = Invoke-Scenario "S10-readback-fail" @{
   Sddl       = (New-TaskSddl $realSid)
   PostTaskXml = $droppedEtl
   TaskName   = $testTaskName
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r10.Code -eq 6) "B10 回读三项不符 → 6（不宣称成功）" ("实际 " + $r10.Code)
 
@@ -563,6 +614,8 @@ $r11 = Invoke-Scenario "S11-sddl-drift" @{
   Sddl        = (New-TaskSddl $realSid)
   SddlReadback = (New-TaskSddl $realSid -ExtraAce)
   TaskName    = $testTaskName
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
 }
 Assert-True ($r11.Code -eq 6) "B11 回读 DACL 不等价 → 6" ("实际 " + $r11.Code)
 
@@ -587,6 +640,7 @@ $r13 = Invoke-Scenario "S13-create-fail" @{
   TaskName       = $testTaskName
   CollectorPath  = $dummyExe
   CreateExit     = 267009
+  AllowUserWritable = $true
 }
 Assert-True ($r13.Code -eq 267009) "B13 /Create 失败按其退出码失败" ("实际 " + $r13.Code)
 Assert-True (Test-HasCall $r13.Calls "/Create") "B13 有 /Create 尝试"
@@ -606,6 +660,100 @@ Assert-True ($r14.Code -eq 5) "B14 查询访问拒绝不当作不存在" ("实�
 Assert-True (-not (Test-HasCall $r14.Calls "/Create")) "B14 不覆盖未知任务"
 Assert-True ($null -eq $r14.RegisteredXml) "B14 不更新策略"
 Assert-True (-not (Test-HasCall $r14.Calls "/Run")) "B14 不启动任务"
+
+# B15（hardening-v4 §4.2.3 / M9）任务 Exec 被改为其他程序：修复报冲突 5，任务未改
+$r15 = Invoke-Scenario "S15-exec-mismatch" @{
+  FakeAdmin  = $true
+  TaskExists = $true
+  TaskXml    = (New-TaskXml -Sid $realSid -Command "C:\Windows\notepad.exe")
+  Sddl       = (New-TaskSddl $realSid)
+  TaskName   = $testTaskName
+  RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
+}
+Assert-True ($r15.Code -eq 5) "B15 Exec 与期望不符 → 冲突 5" ("实际 " + $r15.Code)
+Assert-True ($null -eq $r15.RegisteredXml) "B15 冲突不修改（无 RegisterTask）"
+$r15b = Invoke-Scenario "S15b-exec-args" @{
+  FakeAdmin  = $true
+  TaskExists = $true
+  TaskXml    = (New-TaskXml -Sid $realSid -Command $dummyCommand -Arguments "--x")
+  Sddl       = (New-TaskSddl $realSid)
+  TaskName   = $testTaskName
+  RepairOnly = $true
+  CollectorPath = $dummyExe
+  AllowUserWritable = $true
+}
+Assert-True ($r15b.Code -eq 5) "B15b Exec 带参数 → 冲突 5" ("实际 " + $r15b.Code)
+
+# B16（§4.2.2 / M5）已有任务 Exec 一致但 exe 位于普通用户可写目录、未传 -AllowUserWritable → 7，任务未改
+$r16 = Invoke-Scenario "S16-repair-user-writable" @{
+  FakeAdmin  = $true
+  TaskExists = $true
+  TaskXml    = $existsXml
+  Sddl       = (New-TaskSddl $realSid)
+  TaskName   = $testTaskName
+  RepairOnly = $true
+  CollectorPath = $dummyExe
+}
+Assert-True ($r16.Code -eq 7) "B16 用户可写路径修复 → 7" ("实际 " + $r16.Code)
+Assert-True ($null -eq $r16.RegisteredXml) "B16 拒绝时不修改任务"
+
+# B17 创建路径：exe 用户可写、未传 -AllowUserWritable → 7，且无 /Create
+$r17 = Invoke-Scenario "S17-create-user-writable" @{
+  FakeAdmin      = $true
+  TaskExists     = $false
+  TaskXml        = ""
+  CreatedTaskXml = $createdXml
+  Sddl           = (New-TaskSddl $realSid)
+  TaskName       = $testTaskName
+  CollectorPath  = $dummyExe
+}
+Assert-True ($r17.Code -eq 7) "B17 用户可写路径创建 → 7" ("实际 " + $r17.Code)
+Assert-True (-not (Test-HasCall $r17.Calls "/Create")) "B17 拒绝时无 /Create"
+
+# B18（hardening-v4 P2）受保护路径：夹具 ACL 模拟 Program Files + 卷根 AU 0x1301BF，
+# 不传 -AllowUserWritable → 创建/修复应成功（卷根自身 DELETE 不得误拒）。
+$pfSddl = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)(A;OICIIO;GA;;;CO)(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;BA)(A;OICIIO;GA;;;BA)(A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;AC)"
+$volRootSddl = "O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;;0x1301bf;;;AU)"
+$protDir = Join-Path (Join-Path $script:WorkDir "ProgramFilesLike") "CL Recoder"
+New-Item -ItemType Directory -Path $protDir -Force | Out-Null
+$protExe = Join-Path $protDir "cl-recoder-collector.exe"
+[System.IO.File]::WriteAllBytes($protExe, [byte[]]@(0x4d, 0x5a))
+$protCommand = '"' + $protExe + '"'
+$protCreatedXml = New-TaskXml -Sid $realSid -Etl "" -Command $protCommand
+$protExistsXml = New-TaskXml -Sid $realSid -Command $protCommand
+$r18 = Invoke-Scenario "S18-create-protected" @{
+  FakeAdmin      = $true
+  TaskExists     = $false
+  TaskXml        = ""
+  CreatedTaskXml = $protCreatedXml
+  Sddl           = (New-TaskSddl $realSid)
+  TaskName       = $testTaskName
+  CollectorPath  = $protExe
+  MockTrustedAcl = $true
+  TrustedSddl    = $pfSddl
+  VolumeRootSddl = $volRootSddl
+}
+Assert-True ($r18.Code -eq 0) "B18 受保护路径创建（无 AllowUserWritable，卷根 0x1301BF）→ 0" ("实际 " + $r18.Code)
+Assert-True (Test-HasCall $r18.Calls "/Create") "B18 有 /Create"
+Assert-HasPolicyValues $r18 "B18"
+$r18b = Invoke-Scenario "S18b-repair-protected" @{
+  FakeAdmin  = $true
+  TaskExists = $true
+  TaskXml    = $protExistsXml
+  Sddl       = (New-TaskSddl $realSid)
+  TaskName   = $testTaskName
+  RepairOnly = $true
+  CollectorPath = $protExe
+  MockTrustedAcl = $true
+  TrustedSddl    = $pfSddl
+  VolumeRootSddl = $volRootSddl
+}
+Assert-True ($r18b.Code -eq 0) "B18b 受保护路径 RepairOnly（无 AllowUserWritable）→ 0" ("实际 " + $r18b.Code)
+Assert-True ($null -ne $r18b.RegisteredXml) "B18b 修复已 RegisterTask"
+Assert-True (-not (Test-HasCall $r18b.Calls "/Create")) "B18b RepairOnly 无 /Create"
+Assert-True (-not (Test-HasCall $r18b.Calls "/Run")) "B18b RepairOnly 无 /Run"
 
 # ---------------------------------------------------------------------------
 # 收尾

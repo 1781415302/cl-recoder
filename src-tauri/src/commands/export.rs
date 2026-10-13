@@ -123,6 +123,17 @@ pub(crate) fn csv_field(s: &str) -> String {
     }
 }
 
+/// CSV 公式注入防护（hardening-v4 §4.5(c)）：首字符属于 `= + - @ \t \r` 时前置单引号 `'`，
+/// 否则原样返回。**只做前缀、不做转义**——RFC 4180 转义仍由 [`write_csv_file`] 统一完成，
+/// 避免双重转义。仅用于外部来源的自由文本列（设备名、应用 exe/名称、来源名、WhatPulse 文本），
+/// 内部键名/组合标签列不调用（`-`、`=`、`+` 等键名须原样输出）。JSON 导出不加前缀。
+pub(crate) fn csv_text_field(s: &str) -> String {
+    match s.chars().next() {
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{s}"),
+        _ => s.to_string(),
+    }
+}
+
 /// 写一个 CSV 文件：BOM + 表头行 + 数据行；返回 (路径, 数据行数)。
 fn write_csv_file(
     path: &Path,
@@ -168,7 +179,7 @@ pub fn export_csv(
                         serde_json::to_string(&d.kind).unwrap().trim_matches('"').to_string(),
                         d.vid.to_string(),
                         d.pid.to_string(),
-                        d.name.clone(),
+                        csv_text_field(&d.name),
                         d.first_seen.clone(),
                         d.last_seen.clone(),
                         d.total.to_string(),
@@ -212,8 +223,8 @@ pub fn export_csv(
                 .map(|r| {
                     vec![
                         r.day.clone(),
-                        r.exe.clone(),
-                        r.exe.clone(),
+                        csv_text_field(&r.exe),
+                        csv_text_field(&r.exe),
                         r.seconds.to_string(),
                         r.keys.to_string(),
                         r.clicks.to_string(),
@@ -259,7 +270,7 @@ pub fn export_csv(
                     vec![
                         m.source_id.to_string(),
                         m.device_id.to_string(),
-                        m.name.clone(),
+                        csv_text_field(&m.name),
                         m.manual_dpi.map_or_else(String::new, |d| d.to_string()),
                     ]
                 })
@@ -367,7 +378,14 @@ pub fn export_csv(
             let rows = combos
                 .iter()
                 .map(|r| {
-                    vec![r.day.clone(), r.combo.clone(), r.label.clone(), r.count.to_string()]
+                    // combo 为 WhatPulse 源库原文；label 解析失败时回退为原文（import.rs
+                    // `parse_combo_label`），两列均属外部文本，加前缀（hardening-v4 §4.5(c) 逐表核对）。
+                    vec![
+                        r.day.clone(),
+                        csv_text_field(&r.combo),
+                        csv_text_field(&r.label),
+                        r.count.to_string(),
+                    ]
                 })
                 .collect();
             files.push(write_csv_file(
@@ -382,7 +400,7 @@ pub fn export_csv(
                 .map(|r| {
                     vec![
                         r.day.clone(),
-                        r.name.clone(),
+                        csv_text_field(&r.name),
                         r.seconds.to_string(),
                         r.keys.to_string(),
                         r.clicks.to_string(),
@@ -799,6 +817,10 @@ fn run_export(
     path: &str,
 ) -> Result<ExportReport, String> {
     let target = PathBuf::from(path);
+    // hardening-v4 §4.5(a)：全部查询在同一读事务（BEGIN DEFERRED）内执行，WAL 下首次读取
+    // 即固定快照，各导出文件出自同一时刻；collector 写入不受阻塞。出错时 drop 自动回滚。
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let conn: &rusqlite::Connection = &tx;
     let (files, rows) = match fmt {
         Format::Csv => {
             let dir = csv_dir(&target);
@@ -813,6 +835,8 @@ fn run_export(
             (vec![p], n)
         }
     };
+    // 只读事务提交即释放快照。
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(ExportReport {
         ok: true,
         files: files.into_iter().map(|p| p.to_string_lossy().into_owned()).collect(),
@@ -1667,6 +1691,151 @@ mod tests {
         motion["mice"]
             .as_array()
             .is_some_and(|mice| mice.iter().any(|m| m["sourceId"].as_i64() == Some(source_id)))
+    }
+
+    /// hardening-v4 §4.5(c)：`csv_text_field` 仅前缀、不转义。
+    #[test]
+    fn csv_text_field_prefix_rules() {
+        assert_eq!(csv_text_field("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0");
+        for p in ["=", "+", "-", "@", "\t", "\r"] {
+            let v = format!("{p}x");
+            assert_eq!(csv_text_field(&v), format!("'{v}"), "首字符 {p:?}");
+        }
+        assert_eq!(csv_text_field("plain"), "plain");
+        assert_eq!(csv_text_field(""), "");
+        assert_eq!(csv_text_field("a=b"), "a=b", "仅检查首字符");
+        // 前缀后再经 RFC 4180 转义（由 write_csv_file 统一完成，不双重转义）
+        assert_eq!(csv_field(&csv_text_field("=a,b")), "\"'=a,b\"");
+    }
+
+    /// 读取 CSV 文件（去 BOM）后按行切分的单元格原文（测试夹具不含换行单元格）。
+    fn csv_lines(path: &Path) -> Vec<String> {
+        let bytes = std::fs::read(path).unwrap();
+        let text = String::from_utf8(bytes[CSV_BOM.len()..].to_vec()).unwrap();
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// hardening-v4 §4.5(c) 逐表：含前缀列的表注入 `=cmd…`/`@x`/`\tx` 时输出加 `'`；
+    /// 内部键名列（keys_*/combos_*/wp_keys_*）的 `-`/`=`/`+` 原样输出。
+    #[test]
+    fn csv_formula_prefix_per_table() {
+        const EVIL: &str = "=cmd|' /C calc'!A0";
+        let f = TempFile::new("export-csv-prefix", "db");
+        let w = Writer::open(f.as_ref()).unwrap();
+        let kb = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 1,
+                pid: 1,
+                name: EVIL.into(),
+            })
+            .unwrap();
+        let model = DeviceKey { kind: DeviceKind::Mouse, vid: 2, pid: 2, name: "@mouse".into() };
+        w.get_or_create_device(&model).unwrap();
+        let src = w
+            .register_mouse_source(&MouseSourceDescriptor {
+                source_key: r"\\?\hid#vid_0002&pid_0002".into(),
+                model: model.clone(),
+                interface_path: None,
+                physical: true,
+            })
+            .unwrap();
+        w.flush(&FlushBatch {
+            // 0x0C = 主键盘区 '-'，0x0D = '='
+            input: vec![(kb, DAY.into(), 0x0C, 1), (kb, DAY.into(), 0x0D, 2)],
+            combos: vec![(DAY.into(), mods::CTRL, 0x0D, 1)],
+            apps: vec![(DAY.into(), "\tx.exe".into(), 10, 1, 1), (DAY.into(), "@x.exe".into(), 5, 0, 0)],
+            mouse_motion: vec![MouseMotionWrite {
+                source_id: src,
+                day: DAY.into(),
+                dpi: 800,
+                origin: DpiOrigin::Manual,
+                counts: 10.0,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        w.rebuild_wp_tables(&WpImportBatch {
+            meta: WpMetaRow {
+                imported_at: "2026-09-28T12:00:00+08:00".into(),
+                source_path: r"C:\wp\whatpulse.db".into(),
+                source_size: None,
+                date_min: Some(DAY.into()),
+                date_max: Some(DAY.into()),
+                note: String::new(),
+            },
+            keys: vec![
+                WpKeyDailyRow { day: DAY.into(), qt_key: 0x2D, label: "-".into(), count: 1 },
+                WpKeyDailyRow { day: DAY.into(), qt_key: 0x3D, label: "=".into(), count: 1 },
+                WpKeyDailyRow { day: DAY.into(), qt_key: 0x2B, label: "+".into(), count: 1 },
+            ],
+            combos: vec![clrecoder_store::reader::WpComboDailyRow {
+                day: DAY.into(),
+                combo: "=a,b".into(),
+                label: "=a,b".into(),
+                count: 1,
+            }],
+            apps: vec![clrecoder_store::reader::WpAppDailyRow {
+                day: DAY.into(),
+                path: EVIL.into(),
+                name: EVIL.into(),
+                seconds: 1,
+                keys: 1,
+                clicks: 1,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        drop(w);
+        let conn = ro_conn(&f);
+        let dir = TempFile::new("export-csv-prefix-dir", "dir");
+        let own = export_csv(&conn, Scope::Own, FROM, TO, dir.as_ref()).unwrap();
+        let wp = export_csv(&conn, Scope::Wp, FROM, TO, dir.as_ref()).unwrap();
+        let find = |name: &str| -> Vec<String> {
+            let p = own
+                .iter()
+                .chain(wp.iter())
+                .map(|(p, _)| p)
+                .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(name))
+                .unwrap_or_else(|| panic!("缺文件 {name}"));
+            csv_lines(p)
+        };
+        let evil_out = format!("'{EVIL}");
+
+        let devices = find("devices.csv");
+        assert!(devices.iter().any(|l| l.contains(&format!(",{evil_out},"))), "{devices:?}");
+        assert!(devices.iter().any(|l| l.contains(",'@mouse,")), "{devices:?}");
+
+        let apps = find("apps_");
+        assert!(apps.iter().any(|l| l.starts_with(&format!("{DAY},'\tx.exe,'\tx.exe,"))), "{apps:?}");
+        assert!(apps.iter().any(|l| l.starts_with(&format!("{DAY},'@x.exe,'@x.exe,"))), "{apps:?}");
+
+        let sources = find("mouse_sources.csv");
+        assert!(sources.iter().any(|l| l.contains(",'@mouse,")), "{sources:?}");
+
+        let wp_apps = find("wp_apps_");
+        assert!(wp_apps.iter().any(|l| l.starts_with(&format!("{DAY},{evil_out},"))), "{wp_apps:?}");
+
+        let wp_combos = find("wp_combos_");
+        assert!(
+            wp_combos.iter().any(|l| l == &format!("{DAY},\"'=a,b\",\"'=a,b\",1")),
+            "{wp_combos:?}"
+        );
+
+        // 内部键名列不加前缀
+        let keys = find(&format!("keys_{kb}_"));
+        let minus = keylabel::code_label(DeviceKind::Keyboard, 0x0C);
+        let equals = keylabel::code_label(DeviceKind::Keyboard, 0x0D);
+        assert!(keys.iter().any(|l| l == &format!("{DAY},{},12,1", csv_field(&minus))), "{keys:?}");
+        assert!(keys.iter().any(|l| l == &format!("{DAY},{},13,2", csv_field(&equals))), "{keys:?}");
+        let combos = find("combos_");
+        let label = keylabel::combo_label(mods::CTRL, 0x0D);
+        assert!(combos.iter().any(|l| l.contains(&format!(",{},", csv_field(&label)))), "{combos:?}");
+        let wp_keys = find("wp_keys_");
+        for k in ["-", "=", "+"] {
+            assert!(wp_keys.iter().any(|l| l == &format!("{DAY},{k},1")), "{k}: {wp_keys:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir.as_ref());
     }
 
     /// CSV 转义规则（RFC 4180）。

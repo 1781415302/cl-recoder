@@ -8,6 +8,8 @@
 // 避免无 invoke 环境下抛错——真实运行请始终在 Tauri 窗口内。
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppNotices,
+  LegacyInstallHint,
   AppRowLabeled,
   CollectorStatus,
   ComboRowLabeled,
@@ -195,6 +197,16 @@ export function getDiagnosticsInfo(): Promise<DiagnosticsInfo> {
 /** open_diagnostics_directory() -> Result<(), String>（S1 §4.1：打开后端固定的日志目录） */
 export function openDiagnosticsDirectory(): Promise<void> {
   return call("open_diagnostics_directory", undefined, () => mock.mockOpenDiagnosticsDirectory());
+}
+
+/** get_app_notices() -> AppNotices（hardening-v4：schema 过新横幅 / 旧安装迁移提示，只读） */
+export function getAppNotices(): Promise<AppNotices> {
+  return call("get_app_notices", undefined, () => mock.mockAppNotices());
+}
+
+/** get_legacy_install_hints() -> LegacyInstallHint[]（hardening-v4：只读迁移提示，仅 Settings 活动时查询） */
+export function getLegacyInstallHints(): Promise<LegacyInstallHint[]> {
+  return call("get_legacy_install_hints", undefined, () => mock.mockLegacyInstallHints());
 }
 
 /** get_settings() -> Settings */

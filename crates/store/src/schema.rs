@@ -154,6 +154,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
+    // hardening-v4 §4.5(b)：版本高于本程序支持值时硬拒绝，不执行任何迁移步骤、不改任何表。
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::SchemaTooNew { found: current, supported: SCHEMA_VERSION });
+    }
     while current < SCHEMA_VERSION {
         let next = current + 1;
         // unchecked_transaction：&Connection 即可起事务；出错时 Transaction 被 drop 自动回滚。
@@ -162,7 +166,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             1 => tx.execute_batch(SCHEMA_V1_SQL)?,
             2 => tx.execute_batch(SCHEMA_V2_SQL)?,
             3 => tx.execute_batch(SCHEMA_V3_SQL)?,
-            _ => return Err(StoreError::WalUnavailable(format!("未知 schema 版本 {next}"))),
+            // 不可达防御：循环条件保证 next <= SCHEMA_VERSION，且过新版本已在循环前拒绝。
+            _ => return Err(StoreError::SchemaTooNew { found: next, supported: SCHEMA_VERSION }),
         }
         tx.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
@@ -170,6 +175,30 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         )?;
         tx.commit()?;
         current = next;
+    }
+    Ok(())
+}
+
+/// 只读检查库的 schema 版本是否高于本程序支持值（hardening-v4 §4.5(b)）。
+///
+/// 仅执行 SELECT，可在只读连接上调用；`schema_migrations` 表不存在视为版本 0（新库），返回 `Ok`。
+/// 版本过新返回 [`StoreError::SchemaTooNew`]。
+pub fn check_schema_not_newer(conn: &Connection) -> Result<()> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+        [],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Ok(());
+    }
+    let found: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )?;
+    if found > SCHEMA_VERSION {
+        return Err(StoreError::SchemaTooNew { found, supported: SCHEMA_VERSION });
     }
     Ok(())
 }
@@ -626,5 +655,68 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// hardening-v4 §4.5(b)：迁移后插入 version=99，`migrate` 返回 SchemaTooNew{99,3} 且不修改任何表。
+    #[test]
+    fn migrate_rejects_schema_too_new_without_changes() {
+        let db = TempDb::new("schema-too-new");
+        let conn = Connection::open(db.as_ref()).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'x')",
+            [],
+        )
+        .unwrap();
+        let snapshot = |c: &Connection| -> Vec<(String, Option<String>)> {
+            let mut st = c
+                .prepare("SELECT name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = snapshot(&conn);
+        let rows_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        match migrate(&conn) {
+            Err(StoreError::SchemaTooNew { found, supported }) => {
+                assert_eq!((found, supported), (99, SCHEMA_VERSION));
+                assert_eq!(supported, 3);
+            }
+            other => panic!("期望 SchemaTooNew，实际 {other:?}"),
+        }
+        assert_eq!(snapshot(&conn), before);
+        let rows_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows_before, rows_after);
+    }
+
+    /// `check_schema_not_newer`：新库 / v3 / v99 分别 Ok / Ok / Err。
+    #[test]
+    fn check_schema_not_newer_cases() {
+        let db = TempDb::new("schema-check-newer");
+        let conn = Connection::open(db.as_ref()).unwrap();
+        assert!(check_schema_not_newer(&conn).is_ok(), "新库");
+        migrate(&conn).unwrap();
+        assert!(check_schema_not_newer(&conn).is_ok(), "v3");
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'x')",
+            [],
+        )
+        .unwrap();
+        // 只读连接上同样可用。
+        let ro = Connection::open_with_flags(
+            db.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert!(matches!(
+            check_schema_not_newer(&ro),
+            Err(StoreError::SchemaTooNew { found: 99, supported: 3 })
+        ));
     }
 }

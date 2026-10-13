@@ -10,6 +10,7 @@ import { Apps } from "./pages/Apps";
 import { Combos } from "./pages/Combos";
 import { WhatPulse } from "./pages/WhatPulse";
 import { Settings } from "./pages/Settings";
+import { useAppNotices } from "./api/queries";
 
 const PAGES: Record<PageId, () => React.JSX.Element> = {
   dashboard: Dashboard,
@@ -41,6 +42,8 @@ export default function App() {
     if (window.location.hash !== `#${next}`) window.location.hash = next;
   }
   const Page = PAGES[page];
+  const notices = useAppNotices();
+  const tooNew = notices.data?.schemaTooNew ?? null;
   const labels: Record<PageId, string> = {
     dashboard: "仪表盘",
     keyboard: "键盘",
@@ -66,6 +69,11 @@ export default function App() {
             本地记录
           </div>
         </header>
+        {tooNew && (
+          <div className="app-banner app-banner--danger" role="alert">
+            数据库由更新版本创建（v{tooNew.found}），当前程序支持 v{tooNew.supported}，请升级程序；采集器已拒绝写入
+          </div>
+        )}
         <main key={page} className="app-main" aria-live="off">
           <div className="page">
             <Page />

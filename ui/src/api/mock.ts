@@ -520,6 +520,18 @@ export async function mockDiagnosticsInfo(): Promise<DiagnosticsInfo> {
 }
 
 /** S1 §4.1：打开日志目录（mock 不打开真实目录） */
+/** hardening-v4：只读提示（mock 恒为无提示） */
+export async function mockAppNotices(): Promise<import("./types").AppNotices> {
+  await sleep(60);
+  return { schemaTooNew: null };
+}
+
+/** hardening-v4：旧安装迁移提示（mock 恒为空） */
+export async function mockLegacyInstallHints(): Promise<import("./types").LegacyInstallHint[]> {
+  await sleep(60);
+  return [];
+}
+
 export async function mockOpenDiagnosticsDirectory(): Promise<void> {
   await sleep(120);
 }

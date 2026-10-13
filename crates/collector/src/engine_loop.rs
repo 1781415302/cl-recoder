@@ -1629,6 +1629,60 @@ mod tests {
         cleanup_db(&db);
     }
 
+    /// hardening-v4 §4.1：锁屏场景——WIN down → KeyboardSourcesReset（WIN 的 key-up 丢失）→
+    /// A down/up 不产生组合；随后真实 WIN down/up 计 1 次（WIN 自身按键计数恢复正常）。
+    #[test]
+    fn hardening_v4_session_reset_clears_stuck_win() {
+        let (mut agg, db) = agg_with_frozen_cursor("hv4-reset-win", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey { kind: DeviceKind::Keyboard, vid: 7, pid: 8, name: "测试键盘".to_string() };
+        let src = InputSourceId(201);
+        let key = |agg: &mut Aggregator, sc: u16, down: bool| {
+            agg.handle_event(AggEvent::Input(RawEvent::Keyboard { source: src, device: dev.clone(), sc, down }));
+        };
+        key(&mut agg, 0xE05B, true); // WIN down（随后锁屏，key-up 不投递）
+        agg.handle_event(AggEvent::KeyboardSourcesReset);
+        key(&mut agg, 0x1E, true);
+        key(&mut agg, 0x1E, false);
+        assert!(agg.combos.is_empty(), "复位后 A 不得产生 WIN 组合: {:?}", agg.combos);
+        let dev_id = agg.devices.get(&dev).copied().unwrap();
+        let day = day::today_local();
+        let win_before = agg.inputs.get(&(dev_id, day.clone(), 0xE05B)).copied().unwrap_or(0);
+        key(&mut agg, 0xE05B, true);
+        key(&mut agg, 0xE05B, false);
+        assert_eq!(
+            agg.inputs.get(&(dev_id, day.clone(), 0xE05B)).copied().unwrap_or(0),
+            win_before + 1,
+            "复位后真实 WIN 按下计 1 次"
+        );
+        assert_eq!(agg.inputs.get(&(dev_id, day, 0x1E)), Some(&1));
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// hardening-v4 §4.1（审阅 I9）：复位之后到达的孤立 WIN key-up 不产生任何计数、不 panic，
+    /// 修饰位保持清空；随后 A down 不产生组合。
+    #[test]
+    fn hardening_v4_orphan_keyup_after_reset_is_inert() {
+        let (mut agg, db) = agg_with_frozen_cursor("hv4-orphan-up", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let dev = DeviceKey { kind: DeviceKind::Keyboard, vid: 7, pid: 9, name: "测试键盘".to_string() };
+        let src = InputSourceId(202);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard { source: src, device: dev.clone(), sc: 0xE05B, down: true }));
+        agg.handle_event(AggEvent::KeyboardSourcesReset);
+        let inputs_before = agg.inputs.clone();
+        let combos_before = agg.combos.clone();
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard { source: src, device: dev.clone(), sc: 0xE05B, down: false }));
+        assert_eq!(agg.inputs, inputs_before, "孤立 key-up 不计数");
+        assert_eq!(agg.combos, combos_before);
+        agg.handle_event(AggEvent::Input(RawEvent::Keyboard { source: src, device: dev.clone(), sc: 0x1E, down: true }));
+        assert!(agg.combos.is_empty(), "修饰位应保持清空: {:?}", agg.combos);
+        drop(agg);
+        cleanup_db(&db);
+    }
+
     /// 生命周期事件不写统计、不记 events_seen（§4.3）：SourceRemoved/Reset 前后
     /// 全部统计桶逐键相等（只动 Engine 按下状态，不动任何计数）。
     #[test]

@@ -42,7 +42,7 @@ pub struct DeviceRow {
 }
 
 /// 单日总量。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DayCount {
     /// 日期 `YYYY-MM-DD`
     pub day: String,
@@ -503,6 +503,37 @@ pub fn overview(conn: &Connection, from: &str, to: &str) -> Result<OverviewData>
         }
     }
     Ok(OverviewData { days, today, devices: devices_out })
+}
+
+/// 概览分段查询结果（hardening-v4 §4.3）：供 GUI 概览缓存的“冻结段”使用。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverviewParts {
+    /// `[from, to]` 内逐日总量（同 [`daily_totals`]`(.., None)`，按日升序）
+    pub days: Vec<DayCount>,
+    /// 按 device_id 的 `[from, to]` 区间合计（仅合计 > 0 的设备，按 id 升序）
+    pub device_totals: Vec<(i64, u64)>,
+}
+
+/// 概览分段查询（hardening-v4 §4.3）：逐日总量复用 [`daily_totals`]，设备合计与 [`overview`]
+/// 中 `devices[].total` 同口径（`input_daily` 的 `[from, to]` SUM）。不含“今日拆分”与设备名称，
+/// 这两者由调用方以实时段的 [`overview`] 结果为准。
+pub fn overview_parts(conn: &Connection, from: &str, to: &str) -> Result<OverviewParts> {
+    let days = daily_totals(conn, from, to, None)?;
+    let mut stmt = conn.prepare(
+        "SELECT device_id, COALESCE(SUM(count), 0) FROM input_daily \
+         WHERE day BETWEEN ?1 AND ?2 GROUP BY device_id ORDER BY device_id",
+    )?;
+    let rows = stmt.query_map(params![from, to], |r| {
+        Ok((r.get::<_, i64>(0)?, i64_to_count(r.get::<_, i64>(1)?)))
+    })?;
+    let mut device_totals = Vec::new();
+    for row in rows {
+        let (id, total) = row?;
+        if total > 0 {
+            device_totals.push((id, total));
+        }
+    }
+    Ok(OverviewParts { days, device_totals })
 }
 
 /// 键盘逐日明细（指定设备，`[from, to]` 闭区间；按 day, code 升序）。
@@ -1359,5 +1390,43 @@ mod tests {
         assert!(apps(&conn, "2020-01-01", "2020-01-31", 10).unwrap().is_empty());
         assert!(app_daily_rows(&conn, "2020-01-01", "2020-01-31").unwrap().is_empty());
         assert!(combo_daily_rows(&conn, "2020-01-01", "2020-01-31").unwrap().is_empty());
+    }
+
+    /// hardening-v4 §4.5(a)：导出单快照的 store 级证明——只读连接开启 DEFERRED 事务并首次读取后，
+    /// 另一连接提交的写入对该事务不可见（两次查询结果一致），提交后新连接才可见。
+    #[test]
+    fn read_transaction_pins_snapshot_across_queries() {
+        let (db, w) = seed("reader-snapshot");
+        let ro = Connection::open_with_flags(
+            db.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let tx = ro.unchecked_transaction().unwrap();
+        let first = daily_totals(&tx, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        w.flush(&FlushBatch { input: vec![(1, DAY2.into(), 0x1E, 1000)], ..Default::default() })
+            .unwrap();
+        let second = daily_totals(&tx, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        let dump = |v: &[DayCount]| v.iter().map(|d| (d.day.clone(), d.total)).collect::<Vec<_>>();
+        assert_eq!(dump(&first), dump(&second), "同一读事务内快照固定");
+        tx.commit().unwrap();
+        let after = daily_totals(&ro, RANGE_ALL.0, RANGE_ALL.1, None).unwrap();
+        assert_eq!(after.iter().find(|d| d.day == DAY2).unwrap().total, 12 + 1000);
+    }
+
+    /// hardening-v4 §4.3：overview_parts 与 overview 同口径（days 相等；设备合计 = overview 中 total>0 的设备）。
+    #[test]
+    fn overview_parts_matches_overview() {
+        let (db, w) = seed("reader-overview-parts");
+        drop(w);
+        let conn = Connection::open(db.as_ref()).unwrap();
+        for (from, to) in [RANGE_ALL, (DAY1, DAY1), (DAY2, DAY2), ("2026-10-01", "2026-10-31")] {
+            let full = overview(&conn, from, to).unwrap();
+            let parts = overview_parts(&conn, from, to).unwrap();
+            assert_eq!(parts.days, full.days, "{from}..{to}");
+            let expect: Vec<(i64, u64)> =
+                full.devices.iter().filter(|d| d.total > 0).map(|d| (d.id, d.total)).collect();
+            assert_eq!(parts.device_totals, expect, "{from}..{to}");
+        }
     }
 }
