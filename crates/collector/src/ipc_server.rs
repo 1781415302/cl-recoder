@@ -225,8 +225,25 @@ fn serve_moved_client(pipe: SendHandle, flags: &Flags, status: &RuntimeStatus) {
 
 /// 持有管道实例的安全属性；析构时归还 [`ConvertStringSecurityDescriptorToSecurityDescriptorW`]
 /// 分配的安全描述符（LocalFree）。
-struct OwnedSecurityAttributes {
+///
+/// 开放给 `live_server` 复用同一「当前用户 SID」显式 DACL；控制管行为不变。
+pub(crate) struct OwnedSecurityAttributes {
     sa: SECURITY_ATTRIBUTES,
+}
+
+impl OwnedSecurityAttributes {
+    /// 构造限当前用户 SID 的显式 DACL 安全属性（§4.4）。
+    pub(crate) fn new() -> windows::core::Result<Self> {
+        // SAFETY: build_security_attributes 仅调 Win32；成功后 SD 由 Self::Drop LocalFree。
+        Ok(Self {
+            sa: unsafe { build_security_attributes()? },
+        })
+    }
+
+    /// 供 `CreateNamedPipeW` 等使用的指针；仅在 `Self` 存活期间有效。
+    pub(crate) fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
+        &self.sa
+    }
 }
 
 impl Drop for OwnedSecurityAttributes {
@@ -246,9 +263,9 @@ impl Drop for OwnedSecurityAttributes {
 fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
     // accept 线程退出标志：worker 唤醒器与所有退出路径置位
     let accept_done = Arc::new(AtomicBool::new(false));
-    // SAFETY: 仅调用 Win32 API；返回的 SECURITY_ATTRIBUTES 内的 SD 指针由 guard 在线程退出时释放。
-    let owned_sa = match unsafe { build_security_attributes() } {
-        Ok(sa) => OwnedSecurityAttributes { sa },
+    // SAFETY: OwnedSecurityAttributes::new 仅调 Win32；SD 由 guard 在线程退出时 LocalFree。
+    let owned_sa = match OwnedSecurityAttributes::new() {
+        Ok(sa) => sa,
         Err(err) => {
             debug_log!("创建安全描述符（显式 DACL）失败，pipe 服务未启动: {err}");
             // S1（§4.1）：生产 IPC 启动期致命故障 → facade error（经 adapter 进 collector.log，
@@ -258,7 +275,6 @@ fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
             return;
         }
     };
-    let sa = &owned_sa.sa;
     let name = HSTRING::from(pipe_name());
     // FILE_FLAG_FIRST_PIPE_INSTANCE 只能加在首次创建上（此后管道已存在），用于暴露重名实例。
     let mut first_instance = true;
@@ -266,7 +282,7 @@ fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
         if flags.shutdown.load(Ordering::Acquire) {
             break;
         }
-        // SAFETY: sa 的 SD 在 guard 释放前始终有效；name 为本函数内存活的 HSTRING；
+        // SAFETY: owned_sa 的 SD 在 guard 释放前始终有效；name 为本函数内存活的 HSTRING；
         // 成功创建的句柄由 worker 关闭，失败路径立即 CloseHandle。
         let handle = unsafe {
             let open_mode = if first_instance {
@@ -283,7 +299,7 @@ fn run_server(flags: &Arc<Flags>, status: &Arc<RuntimeStatus>) {
                 PIPE_BUFFER_SIZE,
                 PIPE_BUFFER_SIZE,
                 0,
-                Some(sa),
+                Some(owned_sa.as_ptr()),
             )
         };
         if handle.is_invalid() {

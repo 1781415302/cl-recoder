@@ -37,6 +37,7 @@ mod hidpp_dpi;
 mod hid_transport;
 mod ipc_server;
 mod live_input;
+mod live_server;
 mod mouse_dpi;
 mod motion_runtime;
 mod raw_input;
