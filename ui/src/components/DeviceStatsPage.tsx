@@ -7,18 +7,22 @@
 // §4.6/§4.8：TopKeys limit=65536（u16 完整值域，缺席已计数键不画成 0）；物理布局计数
 // （DeviceLayoutStats，只做 code 查找）+ 完整表分页（全部返回行可访问）；
 // 设备标签次数为全历史累计（DeviceRow.total 不改），紧邻 DeviceTabs 固定说明。
-import { useState } from "react";
+// input-live-trigger S9：分布图经 LiveDeviceControls 接线；移出 devices 加载门，
+// 日期变化只改历史查询，不重启实时；historyState 明确传入。
+import { useCallback, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as client from "../api/client";
+import type { LiveDeviceKey, LiveTarget } from "../api/types";
 import { useDevices } from "../api/queries";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "./DataTable";
 import { DateRangePicker } from "./DateRangePicker";
-import { DeviceLayoutStats } from "./DeviceLayoutStats";
 import { DeviceTabs } from "./DeviceTabs";
 import { EmptyState } from "./EmptyState";
+import { LiveDeviceControls } from "./LiveDeviceControls";
 import { SkeletonCard, SkeletonCards } from "./Skeleton";
 import { fmtDay, fmtNum, kindLabel } from "../lib/format";
+import { sameDevice } from "../lib/liveInputPresentation";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { useStatisticsRange } from "../lib/useStatisticsRange";
 import { IconPlug } from "./icons";
@@ -39,6 +43,15 @@ function goSettings() {
   window.location.hash = "settings";
 }
 
+function toLiveKey(d: {
+  kind: "keyboard" | "mouse" | "gamepad";
+  vid: number;
+  pid: number;
+  name: string;
+}): LiveDeviceKey {
+  return { kind: d.kind, vid: d.vid, pid: d.pid, name: d.name };
+}
+
 export function DeviceStatsPage({
   kind,
   title,
@@ -57,11 +70,39 @@ export function DeviceStatsPage({
   const devices = useDevices();
   const kindDevices = (devices.data ?? []).filter((d) => d.kind === kind);
   const [picked, setPicked] = useState<number | null>(null);
-  // 派生选中设备：未点选或所选设备已消失时回落到第一个设备（无 effect，首帧即可发起查询）
-  const deviceId =
-    picked !== null && kindDevices.some((d) => d.id === picked)
-      ? picked
-      : (kindDevices[0]?.id ?? null);
+  // 无历史元数据时由 live 四字段低频绑定；不伪造 DB id
+  const [liveHint, setLiveHint] = useState<LiveDeviceKey | null>(null);
+  const onLiveDeviceResolved = useCallback((device: LiveDeviceKey) => {
+    setLiveHint(device);
+  }, []);
+
+  // 派生选中设备：用户点选 > live 四字段匹配 > 第一个设备
+  const deviceId = useMemo(() => {
+    if (picked !== null && kindDevices.some((d) => d.id === picked))
+      return picked;
+    if (liveHint !== null) {
+      const match = kindDevices.find((d) =>
+        sameDevice(toLiveKey(d), liveHint),
+      );
+      if (match) return match.id;
+    }
+    return kindDevices[0]?.id ?? null;
+  }, [picked, kindDevices, liveHint]);
+
+  const selectedRow =
+    deviceId !== null
+      ? (kindDevices.find((d) => d.id === deviceId) ?? null)
+      : null;
+
+  // 稳定实时目标：不依赖 range；无历史型号时 device=null 仍启动 kind 实时
+  const liveTarget: LiveTarget = useMemo(
+    () => ({
+      kind: "keyboard",
+      device: selectedRow !== null ? toLiveKey(selectedRow) : null,
+    }),
+    [selectedRow],
+  );
+
   // 设备/范围语义键：变化时清空布局选择并回完整表/逐日表第一页（§4.8 resetKey 语义）
   const deviceRangeKey = `${deviceId ?? "none"}|${range.from}|${range.to}`;
   // selectedCode 受控值：设备/范围语义变化即清（渲染期派生，不用 effect）
@@ -96,6 +137,15 @@ export function DeviceStatsPage({
   const devicesLoading = devices.isLoading || !activity.ready;
   const topKeysLoading = topKeys.isLoading || !activity.ready;
   const noun = kindLabel(kind);
+
+  // 新接线必须明确传入 historyState；loading/error 不当 0
+  const historyState: "loading" | "ready" | "error" = devices.isError
+    ? "error"
+    : topKeys.isError
+      ? "error"
+      : devicesLoading || (deviceId !== null && topKeysLoading)
+        ? "loading"
+        : "ready";
 
   const topColumns: Column<{ code: number; total: number; label: string }>[] = [
     {
@@ -161,6 +211,30 @@ export function DeviceStatsPage({
         <DateRangePicker value={range} onChange={onChange} />
       </div>
 
+      {/* 历史型号 tabs 就绪时放分布图前；分布图本身移出 devices 加载门 */}
+      {!devicesLoading && kindDevices.length > 0 ? (
+        <DeviceTabs
+          devices={kindDevices}
+          selectedId={deviceId}
+          onSelect={setPicked}
+          onRenamed={() =>
+            void qc.invalidateQueries({ queryKey: ["devices"] })
+          }
+        />
+      ) : null}
+
+      <LiveDeviceControls
+        kind="keyboard"
+        target={liveTarget}
+        rows={topKeys.data ?? []}
+        historyState={historyState}
+        selectedCode={selection.code}
+        onSelect={(code) =>
+          setSelection((prev) => ({ key: prev.key, code }))
+        }
+        onLiveDeviceResolved={onLiveDeviceResolved}
+      />
+
       {devicesLoading ? (
         <SkeletonCards count={2} />
       ) : kindDevices.length === 0 ? (
@@ -172,25 +246,6 @@ export function DeviceStatsPage({
         />
       ) : (
         <>
-          <DeviceTabs
-            devices={kindDevices}
-            selectedId={deviceId}
-            onSelect={setPicked}
-            onRenamed={() =>
-              void qc.invalidateQueries({ queryKey: ["devices"] })
-            }
-          />
-          {/* §4.6：DeviceRow.total 仍为全历史口径，固定说明紧邻设备标签（不改 DeviceTabs） */}
-          <DeviceLayoutStats
-            kind={kind}
-            rows={topKeys.data ?? []}
-            title="按键使用"
-            loading={topKeysLoading}
-            selectedCode={selection.code}
-            onSelect={(code) =>
-              setSelection((prev) => ({ key: prev.key, code }))
-            }
-          />
           {topKeysLoading ? null : (
             <details className="card overview-details">
               <summary className="card-title">{noun}完整列表</summary>

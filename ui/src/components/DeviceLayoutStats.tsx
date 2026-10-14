@@ -1,10 +1,10 @@
-// 设备参考物理布局卡（usability-runtime-v3 §4.8 U4）：键盘 ANSI-104 四区 / 鼠标中性 9 控件 / 手柄 Xbox 17 控件。
+// 设备参考物理布局卡（usability-runtime-v3 §4.8 U4 + input-live-trigger §4.7 S8）：键盘 ANSI-104 四区 / 鼠标中性 9 控件 / 手柄 Xbox 17 控件。
 // 几何数据来自 lib/deviceLayouts.ts 纯模板；本组件只做 code 直接查找计数（不 SUM，缺行=0）、
 // 每区一个 Tab 入口的 roving 焦点导航（方向键 focus 与 selectedCode 独立）与受控选择：
 // 点击/Enter/Space 仅 onSelect(code) 供页面展示精确详情，不重放输入、不写统计、不查询 API。
 // 所有填充保持中性（不按频率染色），仅选择/焦点强调用主色；数字缩写展示，详情/aria 为精确 fmtNum。
-import { useId, useMemo, useState } from "react";
-import type { TopKeyRow } from "../api/types";
+import { useId, useMemo, useState, type ReactNode } from "react";
+import type { DeviceLiveView, TopKeyRow } from "../api/types";
 import {
   getDeviceLayout,
   getUnmappedRows,
@@ -29,12 +29,15 @@ const NAV_KEYS: readonly string[] = [
 
 export interface DeviceLayoutStatsProps {
   kind: DeviceKind;
-  rows: TopKeyRow[];
+  rows: readonly TopKeyRow[];
   title: string;
   loading?: boolean;
   /** 受控选择：组件用该值画选中态；Escape 清除经 onSelect(null) 回传页面 */
   selectedCode: number | null;
   onSelect: (code: number | null) => void;
+  live?: DeviceLiveView | null;
+  liveToolbar?: ReactNode;
+  historyState?: "loading" | "ready" | "error";
 }
 
 function fmtHex(code: number): string {
@@ -93,7 +96,18 @@ export function DeviceLayoutStats({
   loading = false,
   selectedCode,
   onSelect,
+  live = null,
+  liveToolbar,
+  historyState: historyStateProp,
 }: DeviceLayoutStatsProps) {
+  const historyState =
+    historyStateProp ?? (loading ? "loading" : "ready");
+  const countReady = historyState === "ready";
+  const held = useMemo(() => new Set(live?.heldCodes ?? []), [live?.heldCodes]);
+  const pulse = useMemo(
+    () => new Set(live?.pulseCodes ?? []),
+    [live?.pulseCodes],
+  );
   const layout = getDeviceLayout(kind);
   const idPrefix = useId();
   // 区内 roving 焦点：每区恰好一个 tabIndex=0 的控件作为 Tab 入口；
@@ -109,7 +123,8 @@ export function DeviceLayoutStats({
   // 没有绘制位置的输入：在“其它输入”保留（完整行仍由页面完整表呈现，不能只显示布局控件）。
   const unmapped = useMemo(() => getUnmappedRows(kind, rows), [kind, rows]);
 
-  const totalOf = (code: number): number => rowByCode.get(code)?.total ?? 0;
+  const totalOf = (code: number): number | undefined =>
+    countReady ? (rowByCode.get(code)?.total ?? 0) : undefined;
 
   const subtitle =
     kind === "keyboard"
@@ -149,21 +164,15 @@ export function DeviceLayoutStats({
     <div className="card" onKeyDown={onCardKeyDown}>
       <h2 className="card-title">{title}</h2>
       <p className="card-sub">{subtitle}</p>
-      {loading ? (
-        <div
-          role="status"
-          aria-label={`${title}加载中`}
-          style={{ marginTop: "var(--space-3)" }}
-        >
-          <div className="skeleton" style={{ height: 44 }} />
-          <div
-            className="skeleton"
-            style={{ height: 220, marginTop: "var(--space-3)" }}
-          />
-        </div>
-      ) : (
-        <>
-          <div className="dev-zones" style={{ marginTop: "var(--space-3)" }}>
+      {liveToolbar}
+      {!countReady ? (
+        <p className="chart-hint" role="status">
+          {historyState === "error"
+            ? "历史次数暂不可用"
+            : "历史次数加载中…"}
+        </p>
+      ) : null}
+      <div className="dev-zones" style={{ marginTop: "var(--space-3)" }}>
             {layout.zones.map((zone) => {
               const zoneControls = layout.controls.filter(
                 (c) => c.zone === zone.id,
@@ -202,12 +211,24 @@ export function DeviceLayoutStats({
                       {zoneControls.map((c) => {
                         const total = totalOf(c.code);
                         const selected = selectedCode === c.code;
+                        const isLive = held.has(c.code);
+                        const isPulse = !isLive && pulse.has(c.code);
+                        const ariaCount =
+                          total === undefined
+                            ? "历史次数暂不可用"
+                            : `${fmtNum(total)} 次`;
                         return (
                           <button
                             key={c.id}
                             id={`${idPrefix}-${c.id}`}
                             type="button"
-                            className="dev-key"
+                            className={[
+                              "dev-key",
+                              isLive ? "is-live" : "",
+                              isPulse ? "is-pulse" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
                             style={{
                               left: c.x * UNIT_PX,
                               top: c.y * UNIT_PX,
@@ -216,7 +237,12 @@ export function DeviceLayoutStats({
                             }}
                             tabIndex={tabStopId === c.id ? 0 : -1}
                             aria-pressed={selected}
-                            aria-label={`${c.shortLabel}，编码 ${fmtHex(c.code)}，${fmtNum(total)} 次${selected ? "，已选中" : ""}`}
+                            aria-label={`${c.shortLabel}，编码 ${fmtHex(c.code)}，${ariaCount}${selected ? "，已选中" : ""}`}
+                            title={
+                              total === undefined
+                                ? `${c.shortLabel}：历史次数暂不可用`
+                                : `${c.shortLabel}：${fmtNum(total)} 次`
+                            }
                             onClick={() => onSelect(c.code)}
                             onFocus={() =>
                               setFocusByZone((prev) => ({
@@ -229,7 +255,7 @@ export function DeviceLayoutStats({
                               {c.shortLabel}
                             </span>
                             <span className="dev-key-num" aria-hidden="true">
-                              {fmtCompact(total)}
+                              {total === undefined ? "—" : fmtCompact(total)}
                             </span>
                           </button>
                         );
@@ -245,6 +271,16 @@ export function DeviceLayoutStats({
               <span className="td-muted">
                 点击按键，查看使用次数；也可用方向键选择
               </span>
+            ) : !countReady ? (
+              <>
+                <span style={{ fontWeight: 600 }}>
+                  {selectedRow?.label ??
+                    selectedFallback ??
+                    fmtHex(selectedCode)}
+                </span>
+                <span className="mono">（编码 {fmtHex(selectedCode)}）</span>
+                <span className="td-muted">历史次数暂不可用</span>
+              </>
             ) : selectedRow ? (
               <>
                 <span style={{ fontWeight: 600 }}>{selectedRow.label}</span>
@@ -275,22 +311,27 @@ export function DeviceLayoutStats({
                     type="button"
                     className="dev-other-chip"
                     aria-pressed={selectedCode === r.code}
+                    aria-label={
+                      countReady
+                        ? `${r.label}，${fmtNum(r.total)} 次`
+                        : `${r.label}，历史次数暂不可用`
+                    }
                     onClick={() => onSelect(r.code)}
                   >
                     <span className="dev-other-label">{r.label}</span>
-                    <span className="dev-key-num">{fmtNum(r.total)}</span>
+                    <span className="dev-key-num">
+                      {countReady ? fmtNum(r.total) : "—"}
+                    </span>
                   </button>
                 ))}
               </div>
             </div>
           ) : null}
-          {kind === "keyboard" ? (
-            <p className="chart-hint">
-              键位以参考布局展示；较宽区域可左右滚动查看。
-            </p>
-          ) : null}
-        </>
-      )}
+      {kind === "keyboard" ? (
+        <p className="chart-hint">
+          键位以参考布局展示；较宽区域可左右滚动查看。
+        </p>
+      ) : null}
     </div>
   );
 }

@@ -1,4 +1,5 @@
-// 手柄页（motion-dpi §4.6 固定布局，S8）：现有型号 tabs → 左右摇杆热力并排 → 全宽手柄控件图 → 折叠明细。
+// 手柄页（motion-dpi §4.6 固定布局，S8 + input-live-trigger S9）：型号 tabs →
+// 分布图优先（LiveDeviceControls）→ 摇杆热力 → 扳机历史热力 → 折叠明细。
 //
 // 数据接线（§4.5）：摇杆运动 useGamepadMotion（今日 1s/历史无 interval）；按钮 TopKeys 与键盘共享页
 // 同键同构（statsPolicy：范围含今日 1s）；逐日明细展开才查询。全部查询复用 uiQueryPolicy
@@ -7,22 +8,29 @@
 // selectedBin 在范围/型号变化清空。没有新运动记录（needs_upgrade 或全零）时说明
 // "从更新后的采集器开始记录"，旧按钮仍显示——不把零热度画成采集正常的证据。
 // 页面不做聚合（PLAN §2.5）；宽度不足时两热力上下排列（flex wrap）。
-import { useMemo, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import * as client from "../api/client";
-import type { KeyDailyRowLabeled, TopKeyRow } from "../api/types";
+import type {
+  KeyDailyRowLabeled,
+  LiveDeviceKey,
+  LiveTarget,
+  TopKeyRow,
+} from "../api/types";
 import { useDevices, useGamepadMotion } from "../api/queries";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
 import { DeviceTabs } from "../components/DeviceTabs";
 import { EmptyState } from "../components/EmptyState";
-import { PeripheralControlsStats } from "../components/PeripheralControlsStats";
+import { LiveDeviceControls } from "../components/LiveDeviceControls";
 import { Skeleton, SkeletonCards } from "../components/Skeleton";
 import { StickHeatmap } from "../components/StickHeatmap";
+import { TriggerHeatmap } from "../components/TriggerHeatmap";
 import { IconPlug } from "../components/icons";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { useStatisticsRange } from "../lib/useStatisticsRange";
+import { sameDevice } from "../lib/liveInputPresentation";
 import { fmtDay, fmtNum } from "../lib/format";
 
 /** §4.5：设备输入专用 limit——u16 完整值域（与键盘共享页同键同参，缓存互通） */
@@ -136,11 +144,27 @@ export function Gamepad() {
   const devices = useDevices();
   const gamepads = (devices.data ?? []).filter((d) => d.kind === "gamepad");
   const [picked, setPicked] = useState<number | null>(null);
-  // 派生选中设备：未点选或所选设备已消失时回落到第一个设备（无 effect，首帧即可发起查询）
-  const deviceId =
-    picked !== null && gamepads.some((d) => d.id === picked)
-      ? picked
-      : (gamepads[0]?.id ?? null);
+  // 无历史元数据时由 live 四字段低频绑定；不伪造 DB id
+  const [liveHint, setLiveHint] = useState<LiveDeviceKey | null>(null);
+  const onLiveDeviceResolved = useCallback((device: LiveDeviceKey) => {
+    setLiveHint(device);
+  }, []);
+
+  // 派生选中设备：用户点选 > live 四字段匹配 > 第一个设备
+  const deviceId = useMemo(() => {
+    if (picked !== null && gamepads.some((d) => d.id === picked)) return picked;
+    if (liveHint !== null) {
+      const match = gamepads.find(
+        (d) =>
+          sameDevice(
+            { kind: d.kind, vid: d.vid, pid: d.pid, name: d.name },
+            liveHint,
+          ),
+      );
+      if (match) return match.id;
+    }
+    return gamepads[0]?.id ?? null;
+  }, [picked, gamepads, liveHint]);
 
   const motion = useGamepadMotion(deviceId, range);
   const topKeys = useQuery({
@@ -218,6 +242,71 @@ export function Gamepad() {
   const onSelectCode = (code: number | null) =>
     setCodeState((prev) => ({ key: prev.key, code }));
 
+  // 扳机热力选中 bin（与摇杆 selectedBin 独立；设备/范围变化随 deviceRangeKey 清）
+  const [trigBinState, setTrigBinState] = useState<{
+    key: string;
+    left: number | null;
+    right: number | null;
+  }>(() => ({ key: deviceRangeKey, left: null, right: null }));
+  if (trigBinState.key !== deviceRangeKey) {
+    setTrigBinState({ key: deviceRangeKey, left: null, right: null });
+  }
+
+  const selectedRow =
+    deviceId !== null
+      ? (gamepads.find((d) => d.id === deviceId) ?? null)
+      : null;
+
+  const liveTarget: LiveTarget = useMemo(
+    () => ({
+      kind: "gamepad",
+      device:
+        selectedRow !== null
+          ? {
+              kind: "gamepad" as const,
+              vid: selectedRow.vid,
+              pid: selectedRow.pid,
+              name: selectedRow.name,
+            }
+          : null,
+      sourceId: null, // 连接选择归 LiveDeviceControls
+    }),
+    [selectedRow],
+  );
+
+  const historyState: "loading" | "ready" | "error" = devices.isError
+    ? "error"
+    : topKeys.isError
+      ? "error"
+      : devicesLoading || (deviceId !== null && topKeysLoading)
+        ? "loading"
+        : "ready";
+
+  // LT/RT 共同色标（与摇杆 scale 独立）
+  const triggerScaleMaxSeconds = useMemo(() => {
+    const trig = motion.data?.triggers;
+    if (trig === undefined || trig.availability !== "ready") return 0;
+    let max = 0;
+    for (const v of trig.left.dwellSeconds) {
+      if (Number.isFinite(v) && v > max) max = v;
+    }
+    for (const v of trig.right.dwellSeconds) {
+      if (Number.isFinite(v) && v > max) max = v;
+    }
+    return max;
+  }, [motion.data]);
+
+  const triggersNeedsUpgrade =
+    motion.data !== undefined &&
+    motion.data.triggers.availability === "needs_upgrade";
+  const triggersReady =
+    motion.data !== undefined &&
+    motion.data.triggers.availability === "ready";
+  const noTriggerRecord =
+    triggersReady &&
+    motion.data!.triggers.left.activeSeconds === 0 &&
+    motion.data!.triggers.right.activeSeconds === 0;
+
   return (
     <>
       <div className="page-header">
@@ -230,6 +319,28 @@ export function Gamepad() {
         <DateRangePicker value={range} onChange={onChange} />
       </div>
 
+      {!devicesLoading && gamepads.length > 0 ? (
+        <DeviceTabs
+          devices={gamepads}
+          selectedId={deviceId}
+          onSelect={setPicked}
+          onRenamed={() =>
+            void qc.invalidateQueries({ queryKey: ["devices"] })
+          }
+        />
+      ) : null}
+
+      {/* 分布图优先：移出 devices 加载门，连接选择在 LiveDeviceControls */}
+      <LiveDeviceControls
+        kind="gamepad"
+        target={liveTarget}
+        rows={topKeys.data ?? []}
+        historyState={historyState}
+        selectedCode={codeState.code}
+        onSelect={onSelectCode}
+        onLiveDeviceResolved={onLiveDeviceResolved}
+      />
+
       {devicesLoading ? (
         <SkeletonCards count={2} />
       ) : gamepads.length === 0 ? (
@@ -241,16 +352,6 @@ export function Gamepad() {
         />
       ) : (
         <>
-          <DeviceTabs
-            devices={gamepads}
-            selectedId={deviceId}
-            onSelect={setPicked}
-            onRenamed={() =>
-              void qc.invalidateQueries({ queryKey: ["devices"] })
-            }
-          />
-          {/* DeviceRow.total 仍为全历史口径，固定说明紧邻设备标签（不改 DeviceTabs） */}
-
           {motion.isError ? (
             <div className="card" role="alert">
               <h2 className="card-title">摇杆运动读取失败</h2>
@@ -276,7 +377,6 @@ export function Gamepad() {
             </div>
           ) : (
             <>
-              {/* 左右摇杆并排卡片（宽度不足时上下排列）；scaleMaxSeconds 为两侧共同色标 */}
               <div className="stick-grid">
                 <div style={{ minWidth: 0 }}>
                   <StickHeatmap
@@ -313,16 +413,64 @@ export function Gamepad() {
             </>
           )}
 
-          {/* 全宽手柄控件图 */}
-          <PeripheralControlsStats
-            kind="gamepad"
-            rows={topKeys.data ?? []}
-            selectedCode={codeState.code}
-            onSelect={onSelectCode}
-            loading={topKeysLoading}
-          />
+          {/* 历史扳机热力（仅历史；与实时扳机填充独立；LT/RT 共同色标） */}
+          {motion.isError ? null : triggersNeedsUpgrade ? (
+            <div className="card" role="note">
+              <h2 className="card-title">扳机热力从新版开始记录</h2>
+              <p className="card-sub">
+                请启动或更新采集器以启用扳机停留热力。现有按键与摇杆统计仍可查看。
+              </p>
+            </div>
+          ) : motion.data === undefined || !activity.ready ? (
+            <div className="stick-grid">
+              <div style={{ minWidth: 0 }}>
+                <div className="card" role="status" aria-label="左扳机热力加载中">
+                  <h2 className="card-title">左扳机停留热力</h2>
+                  <Skeleton h="120px" style={{ marginTop: "var(--space-3)" }} />
+                </div>
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div className="card" role="status" aria-label="右扳机热力加载中">
+                  <h2 className="card-title">右扳机停留热力</h2>
+                  <Skeleton h="120px" style={{ marginTop: "var(--space-3)" }} />
+                </div>
+              </div>
+            </div>
+          ) : triggersReady ? (
+            <>
+              <div className="stick-grid">
+                <div style={{ minWidth: 0 }}>
+                  <TriggerHeatmap
+                    title="左扳机停留热力"
+                    summary={motion.data.triggers.left}
+                    scaleMaxSeconds={triggerScaleMaxSeconds}
+                    selectedBin={trigBinState.left}
+                    onSelect={(bin) =>
+                      setTrigBinState((prev) => ({ ...prev, left: bin }))
+                    }
+                  />
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <TriggerHeatmap
+                    title="右扳机停留热力"
+                    summary={motion.data.triggers.right}
+                    scaleMaxSeconds={triggerScaleMaxSeconds}
+                    selectedBin={trigBinState.right}
+                    onSelect={(bin) =>
+                      setTrigBinState((prev) => ({ ...prev, right: bin }))
+                    }
+                  />
+                </div>
+              </div>
+              <p className="chart-hint">
+                扳机行程 0%–100%；左右使用相同色标。不显示实时游标。
+              </p>
+              {noTriggerRecord ? (
+                <p className="chart-hint">从新版开始记录</p>
+              ) : null}
+            </>
+          ) : null}
 
-          {/* 折叠明细：完整列表（无额外查询）+ 逐日明细（展开才查询） */}
           <DetailCard
             title="手柄按键完整列表"
             sub="全部按键记录，可排序查看"

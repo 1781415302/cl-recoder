@@ -20,6 +20,7 @@ import type {
   ImportReport,
   KeyDailyRowLabeled,
   LegacyMouseSummary,
+  LiveSnapshotReply,
   MouseDistance,
   MouseMotionSummary,
   MouseSourceRow,
@@ -259,4 +260,11 @@ export function getGamepadMotion(
 ): Promise<GamepadMotionSummary> {
   return call("get_gamepad_motion", { deviceId, from, to }, () =>
     mock.mockGetGamepadMotion(deviceId, from, to));
+}
+
+/* ===== 实时输入快照（input-live-trigger §4.6 S7） ===== */
+
+/** get_live_input_snapshot() -> LiveSnapshotReply（真实 invoke 或 mock，同一 DTO） */
+export function getLiveInputSnapshot(): Promise<LiveSnapshotReply> {
+  return call("get_live_input_snapshot", undefined, () => mock.mockLiveInputSnapshot());
 }

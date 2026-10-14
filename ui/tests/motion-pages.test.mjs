@@ -735,3 +735,161 @@ test("选择契约：已连接物理 > 列表首位 > 型号；已选保留不�
   await assert.rejects(mock.mockGetGamepadMotion(3, HIST_RANGE.from, HIST_RANGE.to), /不是手柄/);
   await assert.rejects(mock.mockGetMouseLegacy(5, HIST_RANGE.from, HIST_RANGE.to), /不是鼠标/);
 });
+
+/* ===== S9 T4：三页 LiveDeviceControls 接线、日期独立性、旧 schema、统计失败时实时独立 ===== */
+
+async function loadPageSource(rel) {
+  return readFile(new URL(rel, import.meta.url), "utf8");
+}
+
+function stripTsComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+test("S9 页面接线：三页只经 LiveDeviceControls；明确 historyState；无日期入 hook", async () => {
+  const keyboard = await loadPageSource("../src/components/DeviceStatsPage.tsx");
+  const mouse = await loadPageSource("../src/pages/Mouse.tsx");
+  const gamepad = await loadPageSource("../src/pages/Gamepad.tsx");
+  const controls = await loadPageSource("../src/components/LiveDeviceControls.tsx");
+
+  for (const [name, src] of [
+    ["DeviceStatsPage", keyboard],
+    ["Mouse", mouse],
+    ["Gamepad", gamepad],
+  ]) {
+    assert.match(src, /LiveDeviceControls/, `${name} 必须挂载 LiveDeviceControls`);
+    assert.match(src, /historyState/, `${name} 必须明确传入 historyState`);
+    assert.doesNotMatch(
+      stripTsComments(src),
+      /useLiveInput\s*\(/,
+      `${name} 不得直接调用 useLiveInput（仅容器）`,
+    );
+  }
+
+  // 每页只挂一份分布图容器
+  assert.equal((keyboard.match(/<LiveDeviceControls/g) || []).length, 1);
+  assert.equal((mouse.match(/<LiveDeviceControls/g) || []).length, 1);
+  assert.equal((gamepad.match(/<LiveDeviceControls/g) || []).length, 1);
+  // 鼠标两处旧 PeripheralControlsStats 已合并（忽略注释）
+  assert.doesNotMatch(stripTsComments(mouse), /PeripheralControlsStats/);
+  assert.doesNotMatch(stripTsComments(gamepad), /PeripheralControlsStats/);
+
+  // 日期变化不进实时目标：liveTarget useMemo 体与依赖不含 range
+  for (const [name, src] of [
+    ["DeviceStatsPage", keyboard],
+    ["Mouse", mouse],
+    ["Gamepad", gamepad],
+  ]) {
+    const memo = src.match(
+      /const liveTarget:\s*LiveTarget\s*=\s*useMemo\([\s\S]*?\)\s*;/,
+    );
+    assert.ok(memo, `${name} 应有 liveTarget useMemo`);
+    assert.doesNotMatch(
+      memo[0],
+      /range\.|range,|range\s*\]/,
+      `${name} liveTarget 不得绑定日期范围`,
+    );
+  }
+
+  // LiveDeviceControls：拥有开关默认开、手柄 sourceId、useLiveInput、toolbar；不写 settings
+  assert.match(controls, /useLiveInput/);
+  assert.match(controls, /useState\(true\)/);
+  assert.match(controls, /ownedSourceId|setOwnedSourceId/);
+  assert.match(controls, /LiveInputToolbar/);
+  assert.match(controls, /onLiveDeviceResolved/);
+  assert.doesNotMatch(stripTsComments(controls), /settings\.json|setSettings|saveSettings/);
+  assert.doesNotMatch(stripTsComments(controls), /from:\s*string|dateRange|StatisticsRange/);
+});
+
+test("S9 首次 devices/sources 延迟：分布图在加载门外；device=null 仍启动 kind 实时", async () => {
+  const keyboard = await loadPageSource("../src/components/DeviceStatsPage.tsx");
+  const mouse = await loadPageSource("../src/pages/Mouse.tsx");
+  const gamepad = await loadPageSource("../src/pages/Gamepad.tsx");
+
+  // 键盘：LiveDeviceControls 出现在 devicesLoading 分支之外（源码顺序：控件在 loading 骨架前）
+  const kLive = keyboard.indexOf("<LiveDeviceControls");
+  const kLoad = keyboard.indexOf("devicesLoading");
+  assert.ok(kLive > 0 && kLoad > 0);
+  // 控件 JSX 应在 return 内且不嵌在 devicesLoading ? Skeleton 真分支
+  assert.doesNotMatch(
+    keyboard.slice(keyboard.indexOf("return ("), kLive),
+    /devicesLoading\s*\?\s*\(\s*<SkeletonCards/,
+    "LiveDeviceControls 不得落在 devicesLoading 真分支内",
+  );
+
+  // 鼠标：liveDiagram / LiveDeviceControls 在 bootLoading 空态之外仍渲染（mouse-workspace 无条件）
+  assert.match(mouse, /mouse-workspace/);
+  assert.match(mouse, /liveDiagram/);
+  const mWs = mouse.indexOf("mouse-workspace");
+  const mBootGate = mouse.indexOf("bootLoading ?");
+  assert.ok(mWs > mBootGate, "分布图工作区应在 picker 加载分支之后独立渲染");
+
+  // 手柄：分布图优先于摇杆热力（比较 JSX 标签，避开 import 行）
+  const gLive = gamepad.indexOf("<LiveDeviceControls");
+  const gStick = gamepad.indexOf("<StickHeatmap");
+  assert.ok(gLive > 0 && gStick > gLive, "分布图优先于摇杆热力");
+
+  // target.device 允许 null（尚未绑定历史型号）
+  assert.match(keyboard, /device:\s*selectedRow\s*!==\s*null\s*\?[\s\S]*:\s*null/);
+  assert.match(mouse, /sourceKey:\s*selectedSource\?\.sourceKey\s*\?\?\s*null/);
+  assert.match(gamepad, /sourceId:\s*null/);
+});
+
+test("S9 旧 schema / 统计失败：扳机 needs_upgrade 形状；实时与历史失败独立", async () => {
+  // 旧 schema：扳机热力 needs_upgrade（mock 合同，页面据此渲染引导）
+  mock.motionState.schemaReady = false;
+  const nuGamepad = await mock.mockGetGamepadMotion(5, HIST_RANGE.from, HIST_RANGE.to);
+  assert.equal(nuGamepad.availability, "needs_upgrade");
+  assert.ok(nuGamepad.triggers, "GamepadMotionSummary 含 triggers");
+  assert.equal(nuGamepad.triggers.availability, "needs_upgrade");
+  assert.equal(nuGamepad.triggers.binCount, 101);
+  assert.equal(nuGamepad.triggers.left.dwellSeconds.length, 101);
+  assert.ok(nuGamepad.triggers.left.dwellSeconds.every((v) => v === 0));
+
+  mock.motionState.schemaReady = true;
+  const ready = await mock.mockGetGamepadMotion(5, HIST_RANGE.from, HIST_RANGE.to);
+  assert.equal(ready.triggers.availability, "ready");
+  assert.equal(ready.triggers.binCount, 101);
+
+  // 页面源码：统计 historyState 含 error；TriggerHeatmap 仅历史
+  const gamepad = await loadPageSource("../src/pages/Gamepad.tsx");
+  assert.match(gamepad, /TriggerHeatmap/);
+  assert.match(gamepad, /triggersNeedsUpgrade|needs_upgrade/);
+  assert.match(gamepad, /historyState[\s\S]*error/);
+  assert.match(gamepad, /topKeys\.isError|devices\.isError/);
+
+  const mouse = await loadPageSource("../src/pages/Mouse.tsx");
+  assert.match(mouse, /historyState[\s\S]*error/);
+  // 实时开关/容器不依赖 topKeys 成功
+  assert.match(mouse, /LiveDeviceControls/);
+  assert.doesNotMatch(
+    stripTsComments(mouse).slice(
+      mouse.indexOf("liveDiagram"),
+      mouse.indexOf("liveDiagram") + 500,
+    ),
+    /topKeys\.isSuccess|topKeys\.data\s*&&/,
+  );
+});
+
+test("S9 DPI/日期/热力不订阅 40ms：页面无 live store 订阅；仅容器 useLiveInput", async () => {
+  const mouse = await loadPageSource("../src/pages/Mouse.tsx");
+  const gamepad = await loadPageSource("../src/pages/Gamepad.tsx");
+  const keyboard = await loadPageSource("../src/components/DeviceStatsPage.tsx");
+  const controls = await loadPageSource("../src/components/LiveDeviceControls.tsx");
+
+  for (const [name, src] of [
+    ["Mouse", mouse],
+    ["Gamepad", gamepad],
+    ["DeviceStatsPage", keyboard],
+  ]) {
+    assert.doesNotMatch(src, /liveInputStore|LiveInputStore|useSyncExternalStore/, `${name} 不得直接订阅读取`);
+    assert.doesNotMatch(src, /getLiveInputSnapshot/, `${name} 不得直接拉快照`);
+  }
+  assert.match(controls, /useLiveInput/);
+  // DateRangePicker 仍在页面（历史），与 liveTarget 解耦已在上文断言
+  assert.match(mouse, /DateRangePicker/);
+  assert.match(gamepad, /DateRangePicker/);
+  assert.match(mouse, /MouseDpiEditor/);
+});

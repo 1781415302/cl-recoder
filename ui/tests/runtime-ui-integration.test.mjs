@@ -404,3 +404,74 @@ test("跨设备旧数据不绘制：切设备先显示加载态，解析后为�
   );
   unsub();
 });
+
+/* ===== S9 T5：隐藏/恢复/路由卸载与活动状态 + 实时容器生命周期合同 ===== */
+
+test("S9 实时容器：隐藏时 useLiveInput 不跑（activity.active）；开关与页面卸载经 start/stop", async () => {
+  const controls = await readFile(
+    new URL("../src/components/LiveDeviceControls.tsx", import.meta.url),
+    "utf8",
+  );
+  const hook = await readFile(
+    new URL("../src/lib/useLiveInput.ts", import.meta.url),
+    "utf8",
+  );
+  // hook：enabled && activity.active && target !== null 才 start
+  assert.match(hook, /activity\.active/);
+  assert.match(hook, /shouldRun/);
+  assert.match(hook, /store\.start\(\)/);
+  assert.match(hook, /store\.stop\(token\)/);
+  // 容器：enabled 默认 true；不接日期
+  assert.match(controls, /useState\(true\)/);
+  assert.match(controls, /useLiveInput\(hookTarget,\s*enabled\)/);
+  assert.doesNotMatch(controls, /range\.from|StatisticsRange|dateRange/);
+});
+
+test("S9 三页卸载分布图即停实时：仅 LiveDeviceControls 持有 hook；页面无第二订阅", async () => {
+  const pages = [
+    "../src/components/DeviceStatsPage.tsx",
+    "../src/pages/Mouse.tsx",
+    "../src/pages/Gamepad.tsx",
+  ];
+  for (const rel of pages) {
+    const src = await readFile(new URL(rel, import.meta.url), "utf8");
+    assert.match(src, /LiveDeviceControls/);
+    assert.equal(
+      (src.match(/useLiveInput/g) || []).length,
+      0,
+      `${rel} 不得 import/调用 useLiveInput`,
+    );
+  }
+  // 路由卸载：组件卸载 → LiveDeviceControls 卸载 → hook cleanup stop
+  const hook = await readFile(
+    new URL("../src/lib/useLiveInput.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    hook,
+    /return\s*\(\)\s*=>\s*\{[\s\S]*store\.stop\(token\)/,
+  );
+});
+
+test("S9 活动恢复不因日期重绑实时目标：topKeys 仍按 range，liveTarget 稳定键无 range", async () => {
+  // 既有 topKeys 转录：范围含 today 才 1s —— 历史活动回归保留
+  const range = resolveStatisticsRange({ mode: "today" }, DAY);
+  const hist = { from: "2026-09-01", to: "2026-09-15" };
+  const activity = { ready: true, active: true, today: DAY, error: null };
+  const todayOpts = topKeysOptions(1, range, activity, () => Promise.resolve([]));
+  const histOpts = topKeysOptions(1, hist, activity, () => Promise.resolve([]));
+  assert.equal(todayOpts.refetchInterval, 1_000);
+  assert.equal(histOpts.refetchInterval, false);
+
+  const keyboard = await readFile(
+    new URL("../src/components/DeviceStatsPage.tsx", import.meta.url),
+    "utf8",
+  );
+  // liveTarget useMemo 依赖不含 range
+  assert.match(keyboard, /const liveTarget:\s*LiveTarget\s*=\s*useMemo/);
+  const memo = keyboard.match(
+    /const liveTarget:\s*LiveTarget\s*=\s*useMemo\(\s*\(\)\s*=>[\s\S]*?\),\s*\[([^\]]*)\]/,
+  );
+  assert.ok(memo, "liveTarget useMemo 依赖列表可解析");
+  assert.doesNotMatch(memo[1], /range/);
+});

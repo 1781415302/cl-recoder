@@ -26,6 +26,8 @@
 
 use std::time::Duration;
 
+use std::time::Instant;
+
 use clrecoder_core::event::{AggEvent, DeviceKey};
 use clrecoder_core::motion::{
     GamepadMotionFrame, MotionConnectionId, MotionControlSnapshot, MotionStamp, StickPoint,
@@ -34,6 +36,7 @@ use windows::Win32::Foundation::{ERROR_DEVICE_NOT_CONNECTED, ERROR_SUCCESS};
 use windows::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_GAMEPAD, XINPUT_STATE};
 
 use crate::gamepad::device_key;
+use crate::live_input::{LiveCaptureToken, LiveGamepadSample, LiveInputRuntime};
 use crate::motion_runtime::MotionRuntime;
 
 /// XInput 采样周期下限（§4.3：每 ≥20ms 直接调用 XInputGetState；调用方按此节流）。
@@ -69,7 +72,7 @@ impl Default for XInputMotionSampler {
 /// 单槽读取结果（注入点抽象；生产实现 [`poll_slot`] 即一次 `XInputGetState`）。
 #[derive(Clone)]
 pub(crate) enum SlotRead {
-    /// 读取成功：**同一次** `XINPUT_STATE` 快照的四轴原始值（左右摇杆同帧）。
+    /// 读取成功：**同一次** `XINPUT_STATE` 快照的四轴、按钮与扳机（左右摇杆同帧）。
     Connected {
         /// 左摇杆 X 原始值
         lx: i16,
@@ -79,6 +82,12 @@ pub(crate) enum SlotRead {
         rx: i16,
         /// 右摇杆 Y 原始值（正向上）
         ry: i16,
+        /// `XINPUT_GAMEPAD.wButtons` 位掩码
+        buttons: u16,
+        /// 左扳机 raw 0..=255
+        lt: u8,
+        /// 右扳机 raw 0..=255
+        rt: u8,
     },
     /// `ERROR_DEVICE_NOT_CONNECTED`：槽位无手柄（断连清锚点，重连换代际）。
     NotConnected,
@@ -103,24 +112,39 @@ impl XInputMotionSampler {
         stamp: MotionStamp,
         control: MotionControlSnapshot,
         motion: &MotionRuntime,
+        live: Option<&LiveInputRuntime>,
     ) -> Vec<AggEvent> {
-        self.sample_with(stamp, control, motion, poll_slot)
+        // 会话门令牌必须在原生取样前捕获（§4.3）：旧 epoch 在途帧不得回填清态后的实时态。
+        let token = live.and_then(|l| l.capture_token());
+        self.sample_with(stamp, control, motion, live, token, poll_slot)
     }
 
     /// [`Self::sample`] 的注入版（单测；生产固定走 [`poll_slot`]）。
-    /// `poll` 对每个槽位恰好调用一次——帧内左右摇杆必来自同一次快照。
+    /// `poll` 对每个槽位恰好调用一次——帧内左右摇杆+按钮+扳机必来自同一次快照。
     fn sample_with(
         &mut self,
         stamp: MotionStamp,
         control: MotionControlSnapshot,
         motion: &MotionRuntime,
+        live: Option<&LiveInputRuntime>,
+        token: Option<LiveCaptureToken>,
         mut poll: impl FnMut(u32) -> SlotRead,
     ) -> Vec<AggEvent> {
         let mut events = Vec::new();
+        let now = Instant::now();
         for slot in 0..u32::try_from(SLOT_COUNT).expect("槽位数固定为 4") {
             let idx = slot as usize;
+            let slot_u8 = u8::try_from(slot).expect("槽位 < 4");
             match poll(slot) {
-                SlotRead::Connected { lx, ly, rx, ry } => {
+                SlotRead::Connected {
+                    lx,
+                    ly,
+                    rx,
+                    ry,
+                    buttons,
+                    lt,
+                    rt,
+                } => {
                     // 首次成功（或断连重连/上下文重建后）分配新连接代际；既有连接复用。
                     if self.slots[idx].is_none() {
                         let connection = motion.allocate_connection();
@@ -128,7 +152,7 @@ impl XInputMotionSampler {
                             Some(SlotMotion { connection, device: xinput_device_key() });
                     }
                     let slot_state = self.slots[idx].as_ref().expect("上方已确保槽位存在");
-                    events.push(AggEvent::GamepadMotion(frame_from_axes(
+                    let frame = frame_from_state(
                         slot_state.device.clone(),
                         slot_state.connection,
                         stamp,
@@ -137,7 +161,27 @@ impl XInputMotionSampler {
                         ly,
                         rx,
                         ry,
-                    )));
+                        lt,
+                        rt,
+                    );
+                    // 实时发布：仅当会话门开放且 token 仍有效；统计帧无论门是否开放都产出。
+                    if let (Some(live), Some(token)) = (live, token) {
+                        live.gamepad_sample(
+                            token,
+                            LiveGamepadSample {
+                                slot: slot_u8,
+                                connection: slot_state.connection,
+                                device: slot_state.device.clone(),
+                                buttons,
+                                left: frame.left,
+                                right: frame.right,
+                                left_trigger: frame.left_trigger,
+                                right_trigger: frame.right_trigger,
+                            },
+                            now,
+                        );
+                    }
+                    events.push(AggEvent::GamepadMotion(frame));
                 }
                 SlotRead::NotConnected => {
                     // 断连清锚点：清槽并通知 aggregator 复位该连接 tracker；绝不合成
@@ -146,6 +190,9 @@ impl XInputMotionSampler {
                         events.push(AggEvent::GamepadMotionDisconnected {
                             connection: s.connection,
                         });
+                    }
+                    if let Some(live) = live {
+                        live.gamepad_unavailable(slot_u8, true);
                     }
                 }
                 SlotRead::Failed => {
@@ -156,6 +203,9 @@ impl XInputMotionSampler {
                             connection: s.connection,
                         });
                     }
+                    if let Some(live) = live {
+                        live.gamepad_unavailable(slot_u8, false);
+                    }
                 }
             }
         }
@@ -163,12 +213,12 @@ impl XInputMotionSampler {
     }
 }
 
-/// 由**同一次** `XINPUT_STATE` 快照的四轴原始值构造摇杆帧（纯函数）。
+/// 由**同一次** `XINPUT_STATE` 快照的四轴与扳机构造运动帧（纯函数）。
 ///
-/// 四轴一次读取、按名映射——X/Y 值的提取顺序不影响结果（§4.3"同一帧读取"）。
+/// 四轴/扳机一次读取、按名映射——提取顺序不影响结果（§4.3"同一帧读取"）。
 /// （位置参数为刻意保留：验收用例以"上报反序"逐位反传同组值断言帧一致。）
 #[allow(clippy::too_many_arguments)]
-fn frame_from_axes(
+fn frame_from_state(
     device: DeviceKey,
     connection: MotionConnectionId,
     stamp: MotionStamp,
@@ -177,6 +227,8 @@ fn frame_from_axes(
     ly: i16,
     rx: i16,
     ry: i16,
+    lt: u8,
+    rt: u8,
 ) -> GamepadMotionFrame {
     GamepadMotionFrame {
         device,
@@ -184,8 +236,15 @@ fn frame_from_axes(
         stamp,
         left: StickPoint { x: axis_to_f64(lx), y: axis_to_f64(ly) },
         right: StickPoint { x: axis_to_f64(rx), y: axis_to_f64(ry) },
+        left_trigger: trigger_to_f64(lt),
+        right_trigger: trigger_to_f64(rt),
         control,
     }
+}
+
+/// 扳机 raw 0..=255 → [0, 1]（§4.2：position = raw/255）。
+fn trigger_to_f64(raw: u8) -> f64 {
+    f64::from(raw) / 255.0
 }
 
 /// XInput 轴原始 i16 → [-1, 1]（§4.3：正值除 32767、负值除 32768；XInput 轴 Y 正向上）。
@@ -217,6 +276,9 @@ fn poll_slot(slot: u32) -> SlotRead {
             ly: gamepad.sThumbLY,
             rx: gamepad.sThumbRX,
             ry: gamepad.sThumbRY,
+            buttons: gamepad.wButtons.0,
+            lt: gamepad.bLeftTrigger,
+            rt: gamepad.bRightTrigger,
         }
     } else if code == ERROR_DEVICE_NOT_CONNECTED.0 {
         SlotRead::NotConnected
@@ -248,7 +310,19 @@ mod tests {
     }
 
     fn connected(lx: i16, ly: i16, rx: i16, ry: i16) -> SlotRead {
-        SlotRead::Connected { lx, ly, rx, ry }
+        connected_full(lx, ly, rx, ry, 0, 0, 0)
+    }
+
+    fn connected_full(
+        lx: i16,
+        ly: i16,
+        rx: i16,
+        ry: i16,
+        buttons: u16,
+        lt: u8,
+        rt: u8,
+    ) -> SlotRead {
+        SlotRead::Connected { lx, ly, rx, ry, buttons, lt, rt }
     }
 
     /// 注入式采样：`reads[slot]` 为每次采样该槽位的读取序列（按次弹出，耗尽后重复末项）。
@@ -257,14 +331,21 @@ mod tests {
         motion: &MotionRuntime,
         reads: &mut [Vec<SlotRead>; SLOT_COUNT],
     ) -> Vec<AggEvent> {
-        sampler.sample_with(stamp(0), MotionControlSnapshot::default(), motion, |slot| {
-            let seq = &mut reads[slot as usize];
-            if seq.len() > 1 {
-                seq.remove(0)
-            } else {
-                seq.first().cloned().unwrap_or(SlotRead::NotConnected)
-            }
-        })
+        sampler.sample_with(
+            stamp(0),
+            MotionControlSnapshot::default(),
+            motion,
+            None,
+            None,
+            |slot| {
+                let seq = &mut reads[slot as usize];
+                if seq.len() > 1 {
+                    seq.remove(0)
+                } else {
+                    seq.first().cloned().unwrap_or(SlotRead::NotConnected)
+                }
+            },
+        )
     }
 
     // ------------------------------------------------------------------
@@ -278,10 +359,17 @@ mod tests {
         let motion = offline_runtime();
         let mut sampler = XInputMotionSampler::new();
         let mut polls = 0usize;
-        let events = sampler.sample_with(stamp(0), MotionControlSnapshot::default(), &motion, |_| {
-            polls += 1;
-            connected(16_384, -16_384, 32_767, 0)
-        });
+        let events = sampler.sample_with(
+            stamp(0),
+            MotionControlSnapshot::default(),
+            &motion,
+            None,
+            None,
+            |_| {
+                polls += 1;
+                connected(16_384, -16_384, 32_767, 0)
+            },
+        );
         assert_eq!(polls, SLOT_COUNT, "一轮采样必须恰好读取 slot0..=3 各一次");
         assert_eq!(events.len(), 4, "四个已连接槽位各产一帧");
         for ev in &events {
@@ -321,11 +409,21 @@ mod tests {
         let conn = MotionConnectionId(3);
         let st = stamp(1_000);
         let control = MotionControlSnapshot { epoch: 1, paused: false };
-        let direct =
-            frame_from_axes(dev.clone(), conn, st, control, 16_384, -16_384, 32_767, -32_768);
+        let direct = frame_from_state(
+            dev.clone(),
+            conn,
+            st,
+            control,
+            16_384,
+            -16_384,
+            32_767,
+            -32_768,
+            64,
+            128,
+        );
         // "上报反序"：同一快照按 ry→rx→ly→lx 顺序提取，再按名归位——结果必须一致
         let (ry, rx, ly, lx) = (-32_768i16, 32_767i16, -16_384i16, 16_384i16);
-        let reversed = frame_from_axes(dev, conn, st, control, lx, ly, rx, ry);
+        let reversed = frame_from_state(dev, conn, st, control, lx, ly, rx, ry, 64, 128);
         assert_eq!(direct, reversed);
         // 归一化数值：左 (16384/32767, -16384/32768)、右 (1.0, -1.0)
         assert!((direct.left.x - 16_384.0 / 32_767.0).abs() < 1e-12);
@@ -335,6 +433,8 @@ mod tests {
         );
         assert!((direct.right.x - 1.0).abs() < 1e-12, "+32767 → 1.0");
         assert!((direct.right.y + 1.0).abs() < 1e-12, "-32768 → -1.0");
+        assert!((direct.left_trigger - 64.0 / 255.0).abs() < 1e-12);
+        assert!((direct.right_trigger - 128.0 / 255.0).abs() < 1e-12);
         // 边界：+1 → 1/32767、-1 → -1/32768（正负分母不对称）
         assert!((axis_to_f64(1) - 1.0 / 32_767.0).abs() < 1e-15);
         assert!((axis_to_f64(-1) + 1.0 / 32_768.0).abs() < 1e-15);
@@ -426,5 +526,90 @@ mod tests {
             assert_eq!(round.len(), 1, "无变化也必须产出帧: {round:?}");
             assert!(matches!(round[0], AggEvent::GamepadMotion(_)));
         }
+    }
+
+    /// 同次 XInput 字段：按钮/LT/RT 与四轴来自同一次 Connected 快照，写入运动帧扳机行程。
+    #[test]
+    fn input_live_same_xinput_snapshot_carries_buttons_and_triggers() {
+        let motion = offline_runtime();
+        let mut sampler = XInputMotionSampler::new();
+        let events = sampler.sample_with(
+            stamp(0),
+            MotionControlSnapshot::default(),
+            &motion,
+            None,
+            None,
+            |slot| {
+                if slot == 0 {
+                    connected_full(0, 0, 0, 0, 0x1000, 64, 255) // A + LT64 + RT255
+                } else {
+                    SlotRead::NotConnected
+                }
+            },
+        );
+        let AggEvent::GamepadMotion(frame) = &events[0] else {
+            panic!("{events:?}");
+        };
+        assert!((frame.left_trigger - 64.0 / 255.0).abs() < 1e-12);
+        assert!((frame.right_trigger - 1.0).abs() < 1e-12);
+    }
+
+    /// 会话门关闭（无 token）时仍产统计帧，但不得经 live 回填；开门后 token 校验拒绝旧代际。
+    #[test]
+    fn input_live_wts_gate_closed_does_not_refill_gamepad_live() {
+        use clrecoder_core::live_input::LiveCaptureState;
+        use crate::live_input::LiveInputRuntime;
+
+        let motion = offline_runtime();
+        let live = LiveInputRuntime::new("test:1".into());
+        assert!(live.capture_token().is_none());
+        let mut sampler = XInputMotionSampler::new();
+        let events = sampler.sample_with(
+            stamp(0),
+            MotionControlSnapshot::default(),
+            &motion,
+            Some(&live),
+            None, // 门关：无 token
+            |slot| {
+                if slot == 0 {
+                    connected_full(16_384, 0, 0, 0, 0, 200, 0)
+                } else {
+                    SlotRead::NotConnected
+                }
+            },
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AggEvent::GamepadMotion(_)), "门关仍产统计帧");
+        let snap = live.snapshot(Instant::now(), false);
+        assert!(snap.sources.is_empty(), "门关不得写入手柄实时来源");
+
+        // 开门后用旧 token 不得回填
+        live.set_capture_state(LiveCaptureState::Active);
+        let stale = live.capture_token().expect("active");
+        live.set_capture_state(LiveCaptureState::Suspended);
+        live.set_capture_state(LiveCaptureState::Active);
+        let mut sampler2 = XInputMotionSampler::new();
+        let _ = sampler2.sample_with(
+            stamp(20_000),
+            MotionControlSnapshot::default(),
+            &motion,
+            Some(&live),
+            Some(stale),
+            |slot| {
+                if slot == 0 {
+                    connected_full(0, 0, 0, 0, 0, 200, 0)
+                } else {
+                    SlotRead::NotConnected
+                }
+            },
+        );
+        let snap2 = live.snapshot(Instant::now(), false);
+        let refilled = snap2.sources.iter().any(|s| match s {
+            clrecoder_core::live_input::LiveSource::Gamepad { analog: Some(a), .. } => {
+                a.left_trigger > 0.01
+            }
+            _ => false,
+        });
+        assert!(!refilled, "旧 token 不得把 LT 填回清态后的实时态: {snap2:?}");
     }
 }

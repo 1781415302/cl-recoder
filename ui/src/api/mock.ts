@@ -10,9 +10,11 @@ import type {
   Evidence,
   ExportReport,
   GamepadMotionSummary,
+  GamepadTriggerSummary,
   ImportReport,
   KeyDailyRowLabeled,
   LegacyMouseSummary,
+  LiveSnapshotReply,
   MouseMotionDay,
   MouseMotionSummary,
   MouseSourceRow,
@@ -22,6 +24,7 @@ import type {
   SettingsPatch,
   StickMotionSummary,
   TaskPolicy,
+  TriggerHeatSummary,
   TopKeyRow,
   WpAppRow,
   WpComboRow,
@@ -610,6 +613,8 @@ function localToday(): string {
 interface MockMotionSource {
   id: number;
   deviceId: number;
+  /** 物理来源 key（与库 source_key 一致；缺省时按 id 生成确定性 mock 路径） */
+  sourceKey?: string;
   physical: boolean;
   /** 手动配置 DPI（set_mouse_dpi 的可变目标；null=未配置） */
   manualDpi: number | null;
@@ -636,11 +641,11 @@ export const motionState: {
   failNextSetDpi: false,
   sources: [
     // id 1：同型号第一只——manual 800 + auto 1600 有效（available），含 unknown 桶 → partial coverage
-    { id: 1, deviceId: 3, physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
+    { id: 1, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_00", physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
     // id 2：同型号第二只（不同接口路径）——探测失败（unavailable），manual 1200 后备可离线编辑
-    { id: 2, deviceId: 3, physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
+    { id: 2, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_01", physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
     // id 3：另一型号——离线、无配置、无运动桶 → 合法空（raw=0/meters=null/coverage=null）
-    { id: 3, deviceId: 4, physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
+    { id: 3, deviceId: 4, sourceKey: "\\?\hid#vid_1532&pid_0045&mi_00", physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
   ],
 };
 
@@ -661,6 +666,7 @@ function displaySourceRow(s: MockMotionSource, now: number): MouseSourceRow {
     deviceId: s.deviceId,
     name: row.name,
     nickname: row.nickname,
+    sourceKey: s.sourceKey ?? `\\\\?\\hid#mock&id_${s.id}`,
     physical: s.physical,
     connected,
     manualDpi: s.manualDpi,
@@ -800,7 +806,36 @@ function emptyStick(side: "left" | "right"): StickMotionSummary {
   return { side, activeSeconds: 0, travelR: 0, dwellSeconds: new Array<number>(625).fill(0) };
 }
 
-/** 手柄摇杆运动（§4.5：恰 625 格 row-major；仅 mock 手柄型号 device 5 有数据） */
+function emptyTrigger(side: "left" | "right"): TriggerHeatSummary {
+  return { side, activeSeconds: 0, dwellSeconds: new Array<number>(101).fill(0) };
+}
+
+function emptyTriggers(availability: "ready" | "needs_upgrade"): GamepadTriggerSummary {
+  return {
+    availability,
+    binCount: 101,
+    left: emptyTrigger("left"),
+    right: emptyTrigger("right"),
+  };
+}
+
+/** 扳机停留剖面（101 格；中间偏下热点，Σ权重=1） */
+function triggerProfile(side: "left" | "right"): number[] {
+  const peak = side === "left" ? 35 : 55;
+  const w = new Array<number>(101).fill(0);
+  for (let i = 0; i < 101; i++) {
+    const d = (i - peak) ** 2;
+    w[i] = Math.exp(-d / 180);
+  }
+  const total = w.reduce((acc, v) => acc + v, 0);
+  return w.map((v) => v / total);
+}
+const TRIGGER_PROFILES: Record<"left" | "right", number[]> = {
+  left: triggerProfile("left"),
+  right: triggerProfile("right"),
+};
+
+/** 手柄摇杆+扳机运动（§4.5：摇杆恰 625 格；扳机恰 101 格；mock 与 schemaReady 同步） */
 export async function mockGetGamepadMotion(deviceId: number, from: string, to: string): Promise<GamepadMotionSummary> {
   await sleep(120);
   const profile = PROFILES.find((p) => p.row.id === deviceId);
@@ -809,7 +844,15 @@ export async function mockGetGamepadMotion(deviceId: number, from: string, to: s
   const left = emptyStick("left");
   const right = emptyStick("right");
   if (!motionState.schemaReady) {
-    return { availability: "needs_upgrade", deviceId, gridSize: 25, left, right };
+    // 旧 schema：摇杆与扳机同为 needs_upgrade（mock 不单独拆 v3 摇杆 ready）
+    return {
+      availability: "needs_upgrade",
+      deviceId,
+      gridSize: 25,
+      left,
+      right,
+      triggers: emptyTriggers("needs_upgrade"),
+    };
   }
   const today = localToday();
   for (const side of ["left", "right"] as const) {
@@ -828,5 +871,160 @@ export async function mockGetGamepadMotion(deviceId: number, from: string, to: s
     stick.travelR = Math.round(stick.travelR * 10) / 10;
     stick.dwellSeconds = stick.dwellSeconds.map((v) => Math.round(v * 1000) / 1000);
   }
-  return { availability: "ready", deviceId, gridSize: 25, left, right };
+  const triggers = emptyTriggers("ready");
+  for (const side of ["left", "right"] as const) {
+    const trig = side === "left" ? triggers.left : triggers.right;
+    const prof = TRIGGER_PROFILES[side];
+    for (const day of rangeDays(from, to)) {
+      if (day > today) continue;
+      const active = (side === "left" ? 1800 : 900)
+        * (day === today ? 1 : 0.5 + rng(`gtr:${side}:${day}`) * 0.5)
+        * weekendFactor(day);
+      trig.activeSeconds += active;
+      for (let i = 0; i < 101; i++) trig.dwellSeconds[i] += active * prof[i];
+    }
+    trig.activeSeconds = Math.round(trig.activeSeconds * 100) / 100;
+    trig.dwellSeconds = trig.dwellSeconds.map((v) => Math.round(v * 1000) / 1000);
+  }
+  return { availability: "ready", deviceId, gridSize: 25, left, right, triggers };
+}
+
+
+/* ===== 实时输入快照 mock（input-live-trigger §4.6 S7；确定性相位，无硬件/真实 IPC） ===== */
+
+/** 调用计数：驱动 held→释放→短按→摇杆/扳机→断连 的确定性相位 */
+let liveCallCount = 0;
+
+/** 测试接缝：重置相位（仅测试） */
+export function __resetMockLiveInputForTests(): void {
+  liveCallCount = 0;
+}
+
+const LIVE_KB_DEVICE = {
+  kind: "keyboard" as const,
+  vid: 0x046d,
+  pid: 0xc31c,
+  name: "Logitech K845 机械键盘",
+};
+const LIVE_MOUSE_DEVICE = {
+  kind: "mouse" as const,
+  vid: 0x046d,
+  pid: 0xc092,
+  name: "Logitech G102 游戏鼠标",
+};
+const LIVE_PAD_DEVICE = {
+  kind: "gamepad" as const,
+  vid: 0,
+  pid: 0,
+  name: "XInput 手柄",
+};
+const LIVE_MOUSE_SOURCE_KEY = "\\?\hid#vid_046d&pid_c092&mi_00";
+
+/**
+ * mockLiveInputSnapshot —— 确定性模拟 held、释放、短按、摇杆、扳机、断连。
+ * 同一 DTO 供 client 在非 Tauri / VITE_CLRECODER_MOCK 下使用。
+ */
+export async function mockLiveInputSnapshot(): Promise<LiveSnapshotReply> {
+  liveCallCount += 1;
+  const phase = (liveCallCount - 1) % 10;
+  const sampleSeq = String(liveCallCount);
+
+  // phase 8/9：模拟断连 / 不可用
+  if (phase >= 8) {
+    return {
+      protocolVersion: 1,
+      snapshot: null,
+      error: { code: "not_running", message: "实时输入不可用，请更新并启动采集器" },
+    };
+  }
+
+  const kbHeld = phase < 2 ? [0x1d, 0x1e] : phase === 2 ? [0x1d] : [];
+  const kbPresses =
+    phase === 3
+      ? [{ code: 0x39, pressSeq: String(liveCallCount), ageMs: 12 }]
+      : kbHeld.map((code, i) => ({
+          code,
+          pressSeq: String(10 + i),
+          ageMs: 200,
+        }));
+
+  const mouseHeld = phase === 4 ? [1] : [];
+  const mousePresses =
+    phase === 5
+      ? [{ code: 6, pressSeq: String(liveCallCount), ageMs: 8 }]
+      : mouseHeld.map((code) => ({ code, pressSeq: "3", ageMs: 100 }));
+
+  const padReady = phase !== 7;
+  const stickT = phase * 0.12;
+  const analog = padReady
+    ? {
+        leftStick: { x: Math.cos(stickT) * 0.7, y: Math.sin(stickT) * 0.7 },
+        rightStick: { x: 0.2, y: -0.4 },
+        leftTrigger: Math.min(1, phase * 0.15),
+        rightTrigger: Math.min(1, 0.1 + phase * 0.1),
+      }
+    : null;
+
+  return {
+    protocolVersion: 1,
+    snapshot: {
+      sessionId: "mock-session-1",
+      sampleSeq,
+      resetEpoch: "0",
+      statisticsPaused: phase === 6,
+      captureState: "active",
+      rawInputAgeMs: 16,
+      sources: [
+        {
+          kind: "keyboard",
+          sourceId: "kb-src-1",
+          device: LIVE_KB_DEVICE,
+          digital: { heldCodes: kbHeld, presses: kbPresses },
+        },
+        {
+          kind: "mouse",
+          sourceId: "ms-src-1",
+          device: LIVE_MOUSE_DEVICE,
+          sourceKey: LIVE_MOUSE_SOURCE_KEY,
+          digital: { heldCodes: mouseHeld, presses: mousePresses },
+        },
+        {
+          kind: "gamepad",
+          sourceId: "pad-slot-0",
+          device: LIVE_PAD_DEVICE,
+          slot: 0,
+          connectionId: "1",
+          availability: padReady ? "ready" : "unavailable",
+          ageMs: padReady ? 20 : 800,
+          digital: {
+            heldCodes: phase === 1 ? [1] : [],
+            presses:
+              phase === 1
+                ? [{ code: 1, pressSeq: "5", ageMs: 50 }]
+                : [],
+          },
+          analog,
+          unsupportedCodes: [11],
+        },
+        {
+          kind: "gamepad",
+          sourceId: "pad-slot-1",
+          device: LIVE_PAD_DEVICE,
+          slot: 1,
+          connectionId: "2",
+          availability: "ready",
+          ageMs: 30,
+          digital: { heldCodes: [], presses: [] },
+          analog: {
+            leftStick: { x: 0, y: 0 },
+            rightStick: { x: 0, y: 0 },
+            leftTrigger: 0,
+            rightTrigger: 0,
+          },
+          unsupportedCodes: [],
+        },
+      ],
+    },
+    error: null,
+  };
 }

@@ -228,6 +228,8 @@ export interface MouseSourceRow {
   name: string;
   /** 用户自定义昵称（可空；展示优先于 name） */
   nickname: string | null;
+  /** 物理来源 key（与库 mouse_motion_sources.source_key / 实时 live sourceKey 一致） */
+  sourceKey: string;
   /** 虚拟/未知桶为 false，禁配置/换算 DPI */
   physical: boolean;
   /** collector 发布的在线证据且观测 ≤5 秒，否则 false */
@@ -290,6 +292,8 @@ export interface GamepadMotionSummary {
   gridSize: 25;
   left: StickMotionSummary;
   right: StickMotionSummary;
+  /** 扳机热力子汇总（独立 readiness；v3 库 needs_upgrade + 101 零格） */
+  triggers: GamepadTriggerSummary;
 }
 
 /** hardening-v4：只读提示（get_app_notices）。schemaTooNew 非空时显示红色横幅。 */
@@ -302,4 +306,135 @@ export interface AppNotices {
 export interface LegacyInstallHint {
   code: "collector_task_legacy_path" | "gui_autostart_legacy_path";
   message: string;
+}
+
+/* ===== 实时输入 / 扳机热力（DEVPLAN-input-live-trigger §4.6；独立类型，不改旧 summary） ===== */
+
+/** 十进制字符串计数器（跨进程 u64；只用 BigInt 比较/判序，不转 Number 做运算） */
+export type DecimalCounter = string;
+
+/** 实时来源型号键（原名，非 nickname；与 DeviceRow 四字段对齐） */
+export type LiveDeviceKey = Pick<DeviceRow, "kind" | "vid" | "pid" | "name">;
+
+export type LiveCaptureState = "active" | "suspended" | "unknown";
+
+export type LiveErrorCode =
+  | "not_running"
+  | "access_denied"
+  | "busy"
+  | "timeout"
+  | "io"
+  | "protocol"
+  | "too_large";
+
+export interface LivePress {
+  code: number;
+  pressSeq: DecimalCounter;
+  ageMs: number;
+}
+
+export interface LiveDigitalState {
+  heldCodes: number[];
+  presses: LivePress[];
+}
+
+export interface LivePoint {
+  x: number;
+  y: number;
+}
+
+export interface LiveGamepadAnalog {
+  leftStick: LivePoint;
+  rightStick: LivePoint;
+  leftTrigger: number;
+  rightTrigger: number;
+}
+
+export type LiveSource =
+  | {
+      kind: "keyboard";
+      sourceId: string;
+      device: LiveDeviceKey;
+      digital: LiveDigitalState;
+    }
+  | {
+      kind: "mouse";
+      sourceId: string;
+      device: LiveDeviceKey;
+      sourceKey: string;
+      digital: LiveDigitalState;
+    }
+  | {
+      kind: "gamepad";
+      sourceId: string;
+      device: LiveDeviceKey;
+      slot: number;
+      connectionId: DecimalCounter;
+      availability: "ready" | "unavailable";
+      ageMs: number;
+      digital: LiveDigitalState;
+      analog: LiveGamepadAnalog | null;
+      unsupportedCodes: number[];
+    };
+
+export interface LiveSnapshot {
+  sessionId: string;
+  sampleSeq: DecimalCounter;
+  resetEpoch: DecimalCounter;
+  statisticsPaused: boolean;
+  captureState: LiveCaptureState;
+  rawInputAgeMs: number | null;
+  sources: LiveSource[];
+}
+
+export interface LiveSnapshotReply {
+  protocolVersion: number;
+  snapshot: LiveSnapshot | null;
+  error: { code: LiveErrorCode; message: string } | null;
+}
+
+/** 单侧扳机热力汇总（dwellSeconds 恰 101；无数据全 0） */
+export interface TriggerHeatSummary {
+  side: "left" | "right";
+  activeSeconds: number;
+  dwellSeconds: number[];
+}
+
+/** 手柄双扳机热力（挂在 GamepadMotionSummary.triggers） */
+export interface GamepadTriggerSummary {
+  availability: MotionAvailability;
+  binCount: 101;
+  left: TriggerHeatSummary;
+  right: TriggerHeatSummary;
+}
+
+/** 分布图实时目标选择 */
+export type LiveTarget =
+  | { kind: "keyboard"; device: LiveDeviceKey | null }
+  | { kind: "mouse"; device: LiveDeviceKey | null; sourceKey: string | null }
+  | { kind: "gamepad"; device: LiveDeviceKey | null; sourceId: string | null };
+
+export interface LiveConnectionOption {
+  sourceId: string;
+  label: string;
+  available: boolean;
+}
+
+export interface DeviceLiveView {
+  state: "off" | "connecting" | "ready" | "waiting" | "unavailable" | "suspended";
+  heldCodes: readonly number[];
+  pulseCodes: readonly number[];
+  analog: LiveGamepadAnalog | null;
+  unsupportedCodes: readonly number[];
+  statisticsPaused: boolean;
+  message: string | null;
+  selectedDevice: LiveDeviceKey | null;
+  connections: readonly LiveConnectionOption[];
+  selectedSourceId: string | null;
+}
+
+export interface LiveInputState {
+  state: "off" | "connecting" | "ready" | "unavailable";
+  reply: LiveSnapshotReply | null;
+  receivedAtMs: number | null;
 }

@@ -1,4 +1,4 @@
-// S7 回归（motion-dpi §4.6 展示组件自包含合同）：motion-presentation。
+// S7/S8 回归（motion-dpi §4.6 + input-live-trigger §4.7）：motion-presentation。
 //
 // 用 Node 内建 test 验证纯契约（无渲染——渲染层由 tsc --noEmit 与 S8 页面/Browser mock 验收覆盖）：
 // - heatCells：恰 625 格输出、x/y 为格中心（行主序）、圆盘 y 向上（bin 12 正上在顶、bin 612 正下在底、
@@ -77,6 +77,9 @@ const {
   motionControlSpecs,
   MOTION_CANVAS,
   MOTION_HIT_MIN_PX,
+  peripheralShellSpec,
+  triggerHeatCells,
+  stickTipPosition,
 } = lib;
 
 /** 构造一份 625 格 dwell（仅 bin 处为 seconds，其余 0） */
@@ -96,6 +99,9 @@ test("motionPresentation 纯模块：零运行时 import/require、无 DOM/时�
   assert.equal(typeof formatTravelR, "function");
   assert.equal(typeof formatMouseDistance, "function");
   assert.equal(typeof parseManualDpi, "function");
+  assert.equal(typeof peripheralShellSpec, "function");
+  assert.equal(typeof triggerHeatCells, "function");
+  assert.equal(typeof stickTipPosition, "function");
 });
 
 test("heatCells：恰 625 格输出，x/y 为格中心（行主序），圆盘 y 向上（bin 12 顶、612 底、312 中心）", () => {
@@ -350,6 +356,83 @@ test("控件几何模板冻结：同一 kind 恒返回同一冻结模板，未�
   assert.throws(() => motionControlSpecs("joystick"), /未知控件种类/);
 });
 
+
+/* ===== S8：外壳 / 扳机热力 / 摇杆点 ===== */
+
+test("peripheralShellSpec：mouse 无摇杆井、gamepad 左右井与 LS/RS 中心对齐、模板冻结", () => {
+  const mouse = peripheralShellSpec("mouse");
+  const gp = peripheralShellSpec("gamepad");
+  assert.equal(peripheralShellSpec("mouse"), mouse);
+  assert.equal(peripheralShellSpec("gamepad"), gp);
+  assert.ok(Object.isFrozen(mouse));
+  assert.ok(Object.isFrozen(gp.stickWells));
+  assert.equal(mouse.stickWells.length, 0);
+  assert.ok(typeof mouse.bodyPath === "string" && mouse.bodyPath.length > 0);
+  assert.equal(gp.stickWells.length, 2);
+  const ls = motionControlSpecs("gamepad").find((c) => c.code === 12);
+  const rs = motionControlSpecs("gamepad").find((c) => c.code === 13);
+  const left = gp.stickWells.find((w) => w.side === "left");
+  const right = gp.stickWells.find((w) => w.side === "right");
+  assert.equal(left.code, 12);
+  assert.equal(right.code, 13);
+  assert.equal(left.cx, ls.cx);
+  assert.equal(left.cy, ls.cy);
+  assert.equal(right.cx, rs.cx);
+  assert.equal(right.cy, rs.cy);
+  assert.ok(left.radius > 0 && right.radius > 0);
+  assert.throws(() => peripheralShellSpec("keyboard"), /未知外壳种类/);
+});
+
+test("triggerHeatCells：恰 101 格、percent=bin、intensity=sqrt、scale<=0 全零、共同色标", () => {
+  const values = new Array(101).fill(0);
+  values[0] = 25;
+  values[50] = 100;
+  values[100] = 200;
+  const cells = triggerHeatCells(values, 100);
+  assert.equal(cells.length, 101);
+  assert.deepEqual(Object.keys(cells[0]).sort(), ["bin", "intensity", "percent", "seconds"]);
+  assert.equal(cells[0].percent, 0);
+  assert.equal(cells[50].percent, 50);
+  assert.equal(cells[100].percent, 100);
+  assert.equal(cells[0].intensity, 0.5);
+  assert.equal(cells[50].intensity, 1);
+  assert.equal(cells[100].intensity, 1);
+  assert.equal(cells[100].seconds, 200);
+  for (const scale of [0, -1, NaN]) {
+    const zeros = triggerHeatCells(values, scale);
+    assert.ok(zeros.every((c) => c.intensity === 0), `scale=${scale}`);
+  }
+  // 共同色标：同秒数同 scale → 同强度（跨 LT/RT）
+  const a = triggerHeatCells(values, 200)[0].intensity;
+  const flipped = new Array(101).fill(0);
+  flipped[80] = 25;
+  const b = triggerHeatCells(flipped, 200)[80].intensity;
+  assert.equal(a, b);
+  assert.throws(() => triggerHeatCells([], 10), /101/);
+  assert.throws(() => triggerHeatCells(new Array(100).fill(0), 10), /101/);
+  assert.throws(() => triggerHeatCells(new Array(102).fill(0), 10), /101/);
+});
+
+test("stickTipPosition：Y 向上、单位圆内原样、对角径向投影到单位圆", () => {
+  const well = { cx: 100, cy: 200, radius: 40 };
+  // 中立
+  assert.deepEqual(stickTipPosition(well, 0, 0), { x: 100, y: 200 });
+  // +Y（前推）→ 画布上方（y 减小）
+  assert.deepEqual(stickTipPosition(well, 0, 1), { x: 100, y: 160 });
+  // -Y → 画布下方
+  assert.deepEqual(stickTipPosition(well, 0, -1), { x: 100, y: 240 });
+  // +X → 右
+  assert.deepEqual(stickTipPosition(well, 1, 0), { x: 140, y: 200 });
+  // 对角 (1,1) 径向投影到单位圆：长度 √2 → (1/√2, 1/√2)
+  const tip = stickTipPosition(well, 1, 1);
+  const s = Math.SQRT1_2;
+  assert.ok(Math.abs(tip.x - (100 + 40 * s)) < 1e-9);
+  assert.ok(Math.abs(tip.y - (200 - 40 * s)) < 1e-9);
+  // 已在圆内不放大
+  const inside = stickTipPosition(well, 0.5, 0);
+  assert.deepEqual(inside, { x: 120, y: 200 });
+});
+
 /* ===== 组件模块冒烟（不渲染） ===== */
 
 const COMPONENTS = [
@@ -358,11 +441,22 @@ const COMPONENTS = [
   ["MouseDpiEditor.tsx", "MouseDpiEditor"],
   ["MouseSourcePicker.tsx", "MouseSourcePicker"],
   ["MotionSummary.tsx", "MotionSummary"],
+  ["MouseDeviceDiagram.tsx", "MouseDeviceDiagram"],
+  ["GamepadDeviceDiagram.tsx", "GamepadDeviceDiagram"],
+  ["TriggerHeatmap.tsx", "TriggerHeatmap"],
 ];
 
-test("五个组件模块可加载并导出组件函数；只依赖 react/本地展示层，不查询 API", async () => {
-  // 组件允许的运行时依赖：react hooks、运动展示 lib、格式化 lib、骨架屏与本地 SVG 图标
-  const allowed = new Set(["react", "../lib/motionPresentation", "../lib/format", "./Skeleton", "./icons"]);
+test("展示组件模块可加载并导出组件函数；只依赖 react/本地展示层，不查询 API", async () => {
+  // 组件允许的运行时依赖：react hooks、运动展示 lib、格式化 lib、骨架屏与本地 SVG 图标、兄弟图组件
+  const allowed = new Set([
+    "react",
+    "../lib/motionPresentation",
+    "../lib/format",
+    "./Skeleton",
+    "./icons",
+    "./MouseDeviceDiagram",
+    "./GamepadDeviceDiagram",
+  ]);
   for (const [file, exportName] of COMPONENTS) {
     const { exports, required } = await loadComponentModule(`../src/components/${file}`);
     assert.equal(typeof exports[exportName], "function", `${file} 应导出 ${exportName}`);

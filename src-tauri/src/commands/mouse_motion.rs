@@ -11,7 +11,7 @@
 //! - 校验在后端（§4.5）：正 ID、规范日期（`day::valid_range`）、DPI 范围、来源 physical
 //!   与归属 kind；auto 有效（在线且未过期）时拒绝改 manual（自动值只读）；`null` 清除
 //!   手动后备；
-//! - `source_key`（rawpath/ContainerID）只入库匹配，任何 DTO 均不携带、不暴露前端。
+//! - `source_key`（rawpath/ContainerID）入库匹配；GUI DTO 追加 `sourceKey`（与实时 live 对齐），历史导出仍不携带。
 
 use serde::Serialize;
 
@@ -43,6 +43,8 @@ pub struct MouseSourceRowDto {
     pub name: String,
     /// 型号昵称（可空）
     pub nickname: Option<String>,
+    /// 物理来源 key（与库 `source_key` / 实时 live sourceKey 一致）
+    pub source_key: String,
     /// 是否物理来源（虚拟/未知桶为 false，禁配置 DPI）
     pub physical: bool,
     /// 当前是否在线（collector 发布且观测 ≤5 秒）
@@ -68,6 +70,7 @@ impl From<MouseSourceRow> for MouseSourceRowDto {
             device_id: r.device_id,
             name: r.name,
             nickname: r.nickname,
+            source_key: r.source_key,
             physical: r.physical,
             connected: r.connected,
             manual_dpi: r.manual_dpi,
@@ -530,8 +533,8 @@ mod tests {
     }
 
     /// DTO camelCase 线形状逐字钉死（§4.5 MouseSources/MouseSourceRow）：
-    /// deviceId/manualDpi/autoDpi/autoValidUntil/effectiveDpi/dpiOrigin/probeStatus 在场，
-    /// snake_case 缺席，source_key（rawpath）不出现。
+    /// deviceId/sourceKey/manualDpi/autoDpi/autoValidUntil/effectiveDpi/dpiOrigin/probeStatus 在场，
+    /// snake_case 缺席；sourceKey 与库已有 source_key 列一致。
     #[test]
     fn motion_dpi_mouse_sources_dto_camel_case_and_freshness() {
         let (f, w) = seeded_v3("mouse-sources");
@@ -589,6 +592,7 @@ mod tests {
             (1, true, true),
             "同型号两来源都归属 device 1"
         );
+        assert_eq!(a.source_key, desc_a.source_key, "sourceKey 与已有列一致");
         assert_eq!((a.manual_dpi, a.auto_dpi), (Some(800), Some(1600)));
         assert!(a.auto_valid_until.is_some(), "auto 有效时给出失效时刻");
         assert_eq!((a.effective_dpi, a.dpi_origin), (Some(1600), DpiOrigin::Auto));
@@ -596,25 +600,34 @@ mod tests {
 
         let b = dto.sources.iter().find(|r| r.id == id_b).unwrap();
         assert!(b.connected);
+        assert_eq!(b.source_key, desc_b.source_key);
         assert_eq!(b.auto_dpi, None, "无自动值不展示");
         assert_eq!((b.effective_dpi, b.dpi_origin), (Some(1200), DpiOrigin::Manual));
         assert_eq!(b.probe_status, DpiProbeStatus::Unavailable);
 
         let v = dto.sources.iter().find(|r| r.id == id_v).unwrap();
         assert_eq!((v.physical, v.connected), (false, false));
+        assert_eq!(v.source_key, "virtual:unknown");
 
-        // camelCase 线形状逐字（任取一行序列化）
-        let js = serde_json::to_string(&dto.sources[0]).unwrap();
-        for key in
-            ["\"deviceId\"", "\"manualDpi\"", "\"autoDpi\"", "\"autoValidUntil\"", "\"effectiveDpi\"", "\"dpiOrigin\"", "\"probeStatus\""]
-        {
+        // camelCase 线形状逐字（序列化含 sourceKey 的来源 A）
+        let js = serde_json::to_string(&a).unwrap();
+        for key in [
+            "\"deviceId\"",
+            "\"sourceKey\"",
+            "\"manualDpi\"",
+            "\"autoDpi\"",
+            "\"autoValidUntil\"",
+            "\"effectiveDpi\"",
+            "\"dpiOrigin\"",
+            "\"probeStatus\"",
+        ] {
             assert!(js.contains(key), "缺 {key}: {js}");
         }
-        assert!(!js.contains("device_id") && !js.contains("manual_dpi"), "snake_case 不得出现: {js}");
         assert!(
-            !js.contains("hid#") && !js.contains("source_key") && !js.contains("sourceKey"),
-            "rawpath/source_key 不得暴露前端: {js}"
+            !js.contains("device_id") && !js.contains("manual_dpi") && !js.contains("source_key"),
+            "snake_case 不得出现: {js}"
         );
+        assert!(js.contains("hid#"), "sourceKey 携带已有 rawpath: {js}");
 
         // 心跳过期（>5s）：connected 变 false、auto 证据失效 → effective 回落 manual（§6.1）
         let dto = query_mouse_sources(&conn, fixed_now_us() + 6_000_000).unwrap();

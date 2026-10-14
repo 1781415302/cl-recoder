@@ -26,6 +26,8 @@
   --heat-low: #f3f7f8;
   --heat-mid: #64aaa8;
   --heat-high: #b88330;
+  --input-live: #187b66;
+  --input-live-soft: #e8f5ee;
   --font-sans:
     "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei",
     sans-serif;
@@ -1501,6 +1503,127 @@ select {
     grid-row: auto;
   }
 }
+
+/* ===== input-live-trigger §4.7 S8：实时态与扳机热力 ===== */
+.peripheral-button .peripheral-count {
+  display: none;
+}
+.peripheral-button {
+  transition:
+    background-color var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition),
+    color var(--transition);
+}
+.peripheral-button.is-live,
+.dev-key.is-live {
+  border-color: var(--input-live);
+  background: var(--input-live-soft);
+  box-shadow: inset 0 0 0 1px #187b6633;
+}
+.peripheral-button.is-pulse,
+.dev-key.is-pulse {
+  border-color: var(--input-live);
+  box-shadow: 0 0 0 2px #187b6640;
+}
+.peripheral-button.is-live[aria-pressed="true"],
+.peripheral-button.is-pulse[aria-pressed="true"],
+.dev-key.is-live[aria-pressed="true"]::before,
+.dev-key.is-pulse[aria-pressed="true"]::before {
+  border-color: var(--color-primary);
+  box-shadow:
+    inset 0 0 0 1px #187b6633,
+    0 0 0 1px var(--color-primary);
+}
+.peripheral-button.is-unsupported .peripheral-unsupported {
+  display: block;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  line-height: 1.1;
+  margin-top: 1px;
+}
+.peripheral-unsupported {
+  display: none;
+}
+.trigger-pct {
+  display: block;
+  font-size: 11px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  color: var(--input-live);
+  margin-top: 1px;
+}
+.trigger-travel-track {
+  fill: #eef4f7;
+  stroke: #d2e0e7;
+  stroke-width: 1;
+  pointer-events: none;
+}
+.peripheral-live-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+.gamepad-button .peripheral-label {
+  position: relative;
+  z-index: 2;
+}
+.trigger-travel-fill {
+  fill: #187b6688;
+  stroke: none;
+  pointer-events: none;
+}
+.stick-tip-line {
+  stroke: var(--input-live);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.stick-tip-dot {
+  fill: var(--input-live);
+  stroke: #fff;
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.trigger-heat-card .trigger-heat-bar {
+  display: flex;
+  width: 100%;
+  height: 36px;
+  margin: 14px 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--heat-low);
+}
+.trigger-heat-cell {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+  background: transparent;
+}
+.trigger-heat-cell:hover,
+.trigger-heat-cell:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: -2px;
+  z-index: 1;
+}
+.trigger-heat-cell.is-selected,
+.trigger-heat-cell[aria-pressed="true"] {
+  box-shadow: inset 0 0 0 2px var(--color-primary);
+  z-index: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .peripheral-button.is-pulse,
+  .dev-key.is-pulse {
+    box-shadow: inset 0 0 0 2px var(--input-live);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
