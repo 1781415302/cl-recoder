@@ -10,6 +10,7 @@ import type {
   Evidence,
   ExportReport,
   GamepadMotionSummary,
+  GamepadTriggerSummary,
   ImportReport,
   KeyDailyRowLabeled,
   LegacyMouseSummary,
@@ -22,6 +23,7 @@ import type {
   SettingsPatch,
   StickMotionSummary,
   TaskPolicy,
+  TriggerHeatSummary,
   TopKeyRow,
   WpAppRow,
   WpComboRow,
@@ -610,6 +612,8 @@ function localToday(): string {
 interface MockMotionSource {
   id: number;
   deviceId: number;
+  /** 物理来源 key（与库 source_key 一致；缺省时按 id 生成确定性 mock 路径） */
+  sourceKey?: string;
   physical: boolean;
   /** 手动配置 DPI（set_mouse_dpi 的可变目标；null=未配置） */
   manualDpi: number | null;
@@ -636,11 +640,11 @@ export const motionState: {
   failNextSetDpi: false,
   sources: [
     // id 1：同型号第一只——manual 800 + auto 1600 有效（available），含 unknown 桶 → partial coverage
-    { id: 1, deviceId: 3, physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
+    { id: 1, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_00", physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
     // id 2：同型号第二只（不同接口路径）——探测失败（unavailable），manual 1200 后备可离线编辑
-    { id: 2, deviceId: 3, physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
+    { id: 2, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_01", physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
     // id 3：另一型号——离线、无配置、无运动桶 → 合法空（raw=0/meters=null/coverage=null）
-    { id: 3, deviceId: 4, physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
+    { id: 3, deviceId: 4, sourceKey: "\\?\hid#vid_1532&pid_0045&mi_00", physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
   ],
 };
 
@@ -661,6 +665,7 @@ function displaySourceRow(s: MockMotionSource, now: number): MouseSourceRow {
     deviceId: s.deviceId,
     name: row.name,
     nickname: row.nickname,
+    sourceKey: s.sourceKey ?? `\\\\?\\hid#mock&id_${s.id}`,
     physical: s.physical,
     connected,
     manualDpi: s.manualDpi,
@@ -800,7 +805,36 @@ function emptyStick(side: "left" | "right"): StickMotionSummary {
   return { side, activeSeconds: 0, travelR: 0, dwellSeconds: new Array<number>(625).fill(0) };
 }
 
-/** 手柄摇杆运动（§4.5：恰 625 格 row-major；仅 mock 手柄型号 device 5 有数据） */
+function emptyTrigger(side: "left" | "right"): TriggerHeatSummary {
+  return { side, activeSeconds: 0, dwellSeconds: new Array<number>(101).fill(0) };
+}
+
+function emptyTriggers(availability: "ready" | "needs_upgrade"): GamepadTriggerSummary {
+  return {
+    availability,
+    binCount: 101,
+    left: emptyTrigger("left"),
+    right: emptyTrigger("right"),
+  };
+}
+
+/** 扳机停留剖面（101 格；中间偏下热点，Σ权重=1） */
+function triggerProfile(side: "left" | "right"): number[] {
+  const peak = side === "left" ? 35 : 55;
+  const w = new Array<number>(101).fill(0);
+  for (let i = 0; i < 101; i++) {
+    const d = (i - peak) ** 2;
+    w[i] = Math.exp(-d / 180);
+  }
+  const total = w.reduce((acc, v) => acc + v, 0);
+  return w.map((v) => v / total);
+}
+const TRIGGER_PROFILES: Record<"left" | "right", number[]> = {
+  left: triggerProfile("left"),
+  right: triggerProfile("right"),
+};
+
+/** 手柄摇杆+扳机运动（§4.5：摇杆恰 625 格；扳机恰 101 格；mock 与 schemaReady 同步） */
 export async function mockGetGamepadMotion(deviceId: number, from: string, to: string): Promise<GamepadMotionSummary> {
   await sleep(120);
   const profile = PROFILES.find((p) => p.row.id === deviceId);
@@ -809,7 +843,15 @@ export async function mockGetGamepadMotion(deviceId: number, from: string, to: s
   const left = emptyStick("left");
   const right = emptyStick("right");
   if (!motionState.schemaReady) {
-    return { availability: "needs_upgrade", deviceId, gridSize: 25, left, right };
+    // 旧 schema：摇杆与扳机同为 needs_upgrade（mock 不单独拆 v3 摇杆 ready）
+    return {
+      availability: "needs_upgrade",
+      deviceId,
+      gridSize: 25,
+      left,
+      right,
+      triggers: emptyTriggers("needs_upgrade"),
+    };
   }
   const today = localToday();
   for (const side of ["left", "right"] as const) {
@@ -828,5 +870,20 @@ export async function mockGetGamepadMotion(deviceId: number, from: string, to: s
     stick.travelR = Math.round(stick.travelR * 10) / 10;
     stick.dwellSeconds = stick.dwellSeconds.map((v) => Math.round(v * 1000) / 1000);
   }
-  return { availability: "ready", deviceId, gridSize: 25, left, right };
+  const triggers = emptyTriggers("ready");
+  for (const side of ["left", "right"] as const) {
+    const trig = side === "left" ? triggers.left : triggers.right;
+    const prof = TRIGGER_PROFILES[side];
+    for (const day of rangeDays(from, to)) {
+      if (day > today) continue;
+      const active = (side === "left" ? 1800 : 900)
+        * (day === today ? 1 : 0.5 + rng(`gtr:${side}:${day}`) * 0.5)
+        * weekendFactor(day);
+      trig.activeSeconds += active;
+      for (let i = 0; i < 101; i++) trig.dwellSeconds[i] += active * prof[i];
+    }
+    trig.activeSeconds = Math.round(trig.activeSeconds * 100) / 100;
+    trig.dwellSeconds = trig.dwellSeconds.map((v) => Math.round(v * 1000) / 1000);
+  }
+  return { availability: "ready", deviceId, gridSize: 25, left, right, triggers };
 }

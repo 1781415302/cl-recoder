@@ -4,18 +4,18 @@
 //!   列 = §4.7 同名 TS 类型字段；WhatPulse 侧 `wp_keys_/wp_combos_/wp_apps_/wp_mouse_/
 //!   wp_mouse_buttons_/wp_mouse_scrolls_`。motion-dpi §6.3 起 scope=own 追加五个运动
 //!   视图：`mouse_sources`（无范围后缀，同 devices.csv 惯例）与 `mouse_motion_/
-//!   gamepad_motion_/gamepad_heat_/legacy_mouse_motion_`（带 `{from}_{to}` 后缀），
-//!   列顺序逐字对应 §6.3 行类型；scope=wp 只出既有 WP 文件，不重新解释 WP 英寸。
-//!   运动视图的 null 单元格写空字符串（不写字面 null）。
+//!   gamepad_motion_/gamepad_heat_/legacy_mouse_motion_/gamepad_trigger_heat_`（带
+//!   `{from}_{to}` 后缀），列顺序逐字对应 §6.3 行类型；scope=wp 只出既有 WP 文件，
+//!   不重新解释 WP 英寸。运动视图的 null 单元格写空字符串（不写字面 null）。
 //! - JSON：单文件全量，顶层键逐字按 §4.10（`schema_version`/`generated_at`/`range`/
 //!   `devices`/`input_daily`/`combos`/`apps`/`motion`/`whatpulse`——文件格式键名为
 //!   plan 原文），数组元素 = §4.7 同名 TS 类型（camelCase DTO）；scope=own 省略
 //!   whatpulse 节点。文件格式 v2（correctness-v2 §4.7）：`input_daily` 每行带设备外键
 //!   `deviceId`（由外层设备循环注入，不从 code/label 猜测）。文件格式 v3（motion-dpi
-//!   §6.3）：v2 语义保留并新增 `motion` 节点（§6.3 `MotionExportRows`，camelCase；
-//!   legacy 行带常量 `quality="legacy_uncalibrated"`，source_key/path 不导出）；
-//!   scope=wp 时 motion 仍表达自有数据；`schema_version=3` 只是导出文件格式版本，
-//!   与 SQLite schema_migrations 无关；v1/v2 旧文件保留原样，无反向导入。
+//!   §6.3）：v2 语义保留并新增 `motion` 节点。文件格式 v4（input-live-trigger §6.3）：
+//!   motion 追加 `triggerBinCount`/`gamepadTriggerHeat`；source_key/path/快照不导出；
+//!   scope=wp 时 motion 仍表达自有数据并追加扳机；`schema_version=4` 只是导出文件
+//!   格式版本，与 SQLite schema_migrations 无关；v1/v2/v3 旧文件保留原样，无反向导入。
 //!
 //! `path` 参数约定（前端对接，S12 按此传参）：`format="csv"` 时 `path` 为**目录**
 //! （带扩展名时取其父目录，兼容保存框回传文件名）；`format="json"` 时 `path` 为**文件**。
@@ -29,7 +29,7 @@ use crate::keylabel;
 use crate::state::AppState;
 use clrecoder_core::codes::DeviceKind;
 use clrecoder_core::day;
-use clrecoder_core::motion::{DpiOrigin, StickSide};
+use clrecoder_core::motion::{DpiOrigin, StickSide, TriggerSide};
 use clrecoder_store::motion;
 use clrecoder_store::reader;
 
@@ -257,7 +257,7 @@ pub fn export_csv(
                 rows,
             )?);
 
-            // motion-dpi §6.3：五个运动视图（数据经 store::motion::export_motion_rows；
+            // motion-dpi/input-live §6.3：六个运动视图（数据经 store::motion::export_motion_rows；
             // 列顺序逐字对应 §6.3 行类型 camelCase 字段。mouse_sources 无范围后缀，
             // 同 devices.csv 惯例；null 单元格写空字符串；BOM/转义复用 write_csv_file）
             let motion_rows = motion::export_motion_rows(conn, from, to)?;
@@ -359,6 +359,27 @@ pub fn export_csv(
             files.push(write_csv_file(
                 &dir.join(format!("legacy_mouse_motion_{suffix}.csv")),
                 &["deviceId", "day", "rawCounts", "quality"],
+                rows,
+            )?);
+
+            // gamepad_trigger_heat_{from}_{to}.csv（input-live-trigger §6.3）：
+            // 列为 device_id,day,trigger,bin,dwell_us；空范围仅表头；不导出 sourceKey
+            let rows = motion_rows
+                .gamepad_trigger_heat
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.device_id.to_string(),
+                        r.day.clone(),
+                        serde_json::to_string(&r.trigger).unwrap().trim_matches('"').to_string(),
+                        r.bin.to_string(),
+                        r.dwell_us.to_string(),
+                    ]
+                })
+                .collect();
+            files.push(write_csv_file(
+                &dir.join(format!("gamepad_trigger_heat_{suffix}.csv")),
+                &["device_id", "day", "trigger", "bin", "dwell_us"],
                 rows,
             )?);
         }
@@ -592,6 +613,34 @@ impl From<motion::ExportGamepadHeatRow> for ExportGamepadHeatRowDto {
     }
 }
 
+/// JSON 导出：手柄扳机热力行（空格本就不落行；triggerBinCount 恒 101）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportGamepadTriggerHeatRowDto {
+    /// 型号设备 id
+    device_id: i64,
+    /// 日期
+    day: String,
+    /// 扳机侧
+    trigger: TriggerSide,
+    /// 热力格号（0..=100）
+    bin: u8,
+    /// 该格停留微秒
+    dwell_us: u64,
+}
+
+impl From<motion::ExportGamepadTriggerHeatRow> for ExportGamepadTriggerHeatRowDto {
+    fn from(r: motion::ExportGamepadTriggerHeatRow) -> Self {
+        Self {
+            device_id: r.device_id,
+            day: r.day,
+            trigger: r.trigger,
+            bin: r.bin,
+            dwell_us: r.dwell_us,
+        }
+    }
+}
+
 /// JSON 导出：旧算法鼠标移动逐日行（原始量；米数/倍率不回写，quality 常量在此层添加）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -612,7 +661,7 @@ impl From<motion::ExportLegacyMouseRow> for ExportLegacyMouseRowDto {
     }
 }
 
-/// JSON 导出 motion 节点（§6.3 `MotionExportRows`）。
+/// JSON 导出 motion 节点（§6.3 `MotionExportRows` + v4 triggerBinCount/gamepadTriggerHeat）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExportMotionNodeDto {
@@ -626,16 +675,21 @@ struct ExportMotionNodeDto {
     gamepad_heat: Vec<ExportGamepadHeatRowDto>,
     /// 旧算法鼠标移动逐日行
     legacy_mouse_daily: Vec<ExportLegacyMouseRowDto>,
+    /// 扳机热力格数（恒 101；标量，不计入 rows）
+    trigger_bin_count: u8,
+    /// 手柄扳机热力稀疏行
+    gamepad_trigger_heat: Vec<ExportGamepadTriggerHeatRowDto>,
 }
 
 impl ExportMotionNodeDto {
-    /// rows 口径（§6.3"rows 包括新增各数组元素"）：motion 节点各数组元素合计。
+    /// rows 口径（§6.3"rows 包括新增各数组元素"）：motion 节点各数组元素合计（含扳机）。
     fn rows(&self) -> u64 {
         self.mice.len() as u64
             + self.mouse_daily.len() as u64
             + self.gamepad_daily.len() as u64
             + self.gamepad_heat.len() as u64
             + self.legacy_mouse_daily.len() as u64
+            + self.gamepad_trigger_heat.len() as u64
     }
 }
 
@@ -658,10 +712,16 @@ fn export_motion_node(
             .into_iter()
             .map(ExportLegacyMouseRowDto::from)
             .collect(),
+        trigger_bin_count: 101,
+        gamepad_trigger_heat: rows
+            .gamepad_trigger_heat
+            .into_iter()
+            .map(ExportGamepadTriggerHeatRowDto::from)
+            .collect(),
     })
 }
 
-/// JSON 导出（§4.10 单文件全量；v3 文件格式：v2 语义保留 + motion 节点，motion-dpi §6.3）。
+/// JSON 导出（§4.10 单文件全量；v4 文件格式：v3 语义保留 + triggerBinCount/gamepadTriggerHeat）。
 /// 返回 (文件路径, 数组元素总数)。
 pub fn export_json(
     conn: &rusqlite::Connection,
@@ -693,8 +753,8 @@ pub fn export_json(
     let motion_node = export_motion_node(conn, from, to)?;
 
     let mut root = serde_json::json!({
-        // 导出文件格式版本 v3（motion-dpi §6.3；非 SQLite schema_migrations 版本）
-        "schema_version": 3,
+        // 导出文件格式版本 v4（input-live-trigger §6.3；非 SQLite schema_migrations 版本）
+        "schema_version": 4,
         "generated_at": day::now_local_rfc3339(),
         "range": { "from": from, "to": to },
         "devices": devices,
@@ -850,8 +910,8 @@ mod tests {
     use crate::state::testutil::TempFile;
     use clrecoder_core::codes::mods;
     use clrecoder_core::event::DeviceKey;
-    use clrecoder_core::motion::{MouseSourceDescriptor, StickBinDelta};
-    use clrecoder_store::motion::{MouseMotionWrite, StickMotionWrite};
+    use clrecoder_core::motion::{MouseSourceDescriptor, StickBinDelta, TriggerBinDelta, TriggerSide};
+    use clrecoder_store::motion::{MouseMotionWrite, StickMotionWrite, TriggerHeatWrite};
     use clrecoder_store::writer::{FlushBatch, WpImportBatch, Writer};
     use clrecoder_store::reader::{WpKeyDailyRow, WpMetaRow, WpMouseDailyRow};
 
@@ -993,8 +1053,8 @@ mod tests {
         assert!(rows > 0);
         let text = std::fs::read_to_string(out.as_ref()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("JSON 必须可解析");
-        // §4.10 顶层键逐字（schema_version=3 为导出文件格式版本，非 SQLite 迁移版本）
-        assert_eq!(v["schema_version"], 3);
+        // §4.10 顶层键逐字（schema_version=4 为导出文件格式版本，非 SQLite 迁移版本）
+        assert_eq!(v["schema_version"], 4);
         assert!(v["generated_at"].as_str().unwrap().len() == 25);
         assert_eq!(v["range"]["from"], FROM);
         assert_eq!(v["range"]["to"], TO);
@@ -1115,8 +1175,8 @@ mod tests {
 
         assert_eq!(
             v["schema_version"],
-            3,
-            "JSON 文件格式版本 v3（motion-dpi §6.3 起，非 SQLite 迁移版本）"
+            4,
+            "JSON 文件格式版本 v4（input-live-trigger §6.3 起，非 SQLite 迁移版本）"
         );
 
         // 根 devices 按现有查询 id 顺序
@@ -1187,7 +1247,7 @@ mod tests {
             export_json(&conn, Scope::Own, "2026-09-29", "2026-09-30", miss.as_ref()).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(miss.as_ref()).unwrap()).unwrap();
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
         assert!(v["input_daily"].as_array().unwrap().is_empty(), "范围外不得有输入行");
         assert!(v["combos"].as_array().unwrap().is_empty(), "范围外不得有组合行");
         assert!(v["apps"].as_array().unwrap().is_empty(), "范围外不得有应用行");
@@ -1222,8 +1282,8 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(out.as_ref()).unwrap()).unwrap();
 
-        // own 根字段齐全且为 v3 形状（motion 节点为自有数据，见 motion_dpi_ 用例）
-        assert_eq!(v["schema_version"], 3);
+        // own 根字段齐全且为 v4 形状（motion 节点为自有数据，见 motion_dpi_ 用例）
+        assert_eq!(v["schema_version"], 4);
         assert_eq!(v["devices"].as_array().unwrap().len(), 4);
         let daily = v["input_daily"].as_array().unwrap();
         assert!(daily.iter().all(|r| r["deviceId"].as_i64().is_some()), "{daily:?}");
@@ -1298,7 +1358,8 @@ mod tests {
             physical: true,
         })
         .unwrap();
-        w.flush(&FlushBatch {
+        w.flush_with_triggers(
+            &FlushBatch {
             mouse_motion: vec![
                 MouseMotionWrite {
                     source_id: a,
@@ -1353,7 +1414,31 @@ mod tests {
             ],
             mouse_move: vec![(ms, DAY.into(), 1.0)], // 旧算法：1 英寸 → ×80 原始量
             ..Default::default()
-        })
+        },
+            &[
+                TriggerHeatWrite {
+                    device_id: gp,
+                    day: DAY.into(),
+                    side: TriggerSide::Left,
+                    bins: vec![
+                        TriggerBinDelta { bin: 40, dwell_us: 800_000 },
+                        TriggerBinDelta { bin: 41, dwell_us: 200_000 },
+                    ],
+                },
+                TriggerHeatWrite {
+                    device_id: gp,
+                    day: DAY.into(),
+                    side: TriggerSide::Right,
+                    bins: vec![TriggerBinDelta { bin: 60, dwell_us: 500_000 }],
+                },
+                TriggerHeatWrite {
+                    device_id: gp,
+                    day: DAY2.into(),
+                    side: TriggerSide::Left,
+                    bins: vec![TriggerBinDelta { bin: 40, dwell_us: 100_000 }],
+                },
+            ],
+        )
         .unwrap();
         w.rebuild_wp_tables(&WpImportBatch {
             meta: WpMetaRow {
@@ -1378,10 +1463,9 @@ mod tests {
         (f, conn, ms, a, gp)
     }
 
-    /// 验收点（motion-dpi §8-S9）：JSON v3 —— motion 节点在场、camelCase 逐字（无
-    /// snake_case 泄漏）、mice 只列 motion 引用的来源、mouseDaily.sourceId 与 mice/
-    /// deviceId 与根 devices 外键齐全、unknown 桶 dpi/meters=null、legacy 行带 quality
-    /// 常量、source_key/path 不导出、rows 含 motion 各数组元素。
+    /// 验收点（motion-dpi §8-S9 + input-live §6.3）：JSON v4 —— motion 节点在场、
+    /// camelCase 逐字、triggerBinCount/gamepadTriggerHeat、source_key/path 不导出、
+    /// rows 含 motion 各数组元素（含扳机）。
     #[test]
     fn motion_dpi_json_v3_motion_node_camel_case_foreign_keys_and_rows() {
         let (_f, conn, ms, a, _gp) = seed_motion("export-motion-json");
@@ -1391,7 +1475,7 @@ mod tests {
         let text = std::fs::read_to_string(out.as_ref()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("JSON 必须可解析");
 
-        assert_eq!(v["schema_version"], 3, "v3 文件格式（motion-dpi §6.3）");
+        assert_eq!(v["schema_version"], 4, "v4 文件格式（input-live-trigger §6.3）");
         let motion = v.get("motion").expect("v3 导出必须有 motion 节点");
 
         // mice：只列有运动桶的来源（B 注册但无桶 → 不在场）
@@ -1451,22 +1535,52 @@ mod tests {
         assert_eq!(legacy[0]["rawCounts"], 80.0);
         assert_eq!(legacy[0]["quality"], LEGACY_MOUSE_QUALITY);
 
+        // v4：triggerBinCount 恒 101；扳机稀疏行（DAY 左2 + DAY 右1 + DAY2 左1）
+        assert_eq!(motion["triggerBinCount"], 101);
+        let theat = motion["gamepadTriggerHeat"].as_array().unwrap();
+        assert_eq!(theat.len(), 4, "{theat:?}"); // DAY 左2+右1 + DAY2 左1
+        assert!(theat.iter().all(|r| device_ids.contains(&r["deviceId"].as_i64().unwrap())));
+        let t40 = theat.iter().find(|r| r["bin"] == 40 && r["day"] == DAY).unwrap();
+        assert_eq!(t40["trigger"], "left");
+        assert_eq!(t40["dwellUs"], 800_000);
+        let t60 = theat.iter().find(|r| r["bin"] == 60).unwrap();
+        assert_eq!(t60["trigger"], "right");
+        assert_eq!(t60["dwellUs"], 500_000);
+
         // camelCase 逐字（文件全文）：新键在场、snake_case 键缺席、source_key/path 不导出
         for key in [
-            "\"sourceId\"", "\"deviceId\"", "\"manualDpi\"", "\"dpiOrigin\"", "\"activeUs\"",
-            "\"travelR\"", "\"dwellUs\"", "\"rawCounts\"", "\"mouseDaily\"", "\"gamepadDaily\"",
-            "\"gamepadHeat\"", "\"legacyMouseDaily\"",
+            "\"sourceId\"",
+            "\"deviceId\"",
+            "\"manualDpi\"",
+            "\"dpiOrigin\"",
+            "\"activeUs\"",
+            "\"travelR\"",
+            "\"dwellUs\"",
+            "\"rawCounts\"",
+            "\"mouseDaily\"",
+            "\"gamepadDaily\"",
+            "\"gamepadHeat\"",
+            "\"legacyMouseDaily\"",
+            "\"triggerBinCount\"",
+            "\"gamepadTriggerHeat\"",
         ] {
             assert!(text.contains(key), "缺 {key}");
         }
         for bad in [
-            "\"source_id\"", "\"device_id\"", "\"manual_dpi\"", "\"active_us\"", "\"travel_r\"",
-            "\"dwell_us\"", "\"raw_counts\"", "source_key", "interface_path",
+            "\"source_id\"",
+            "\"device_id\"",
+            "\"manual_dpi\"",
+            "\"active_us\"",
+            "\"travel_r\"",
+            "\"dwell_us\"",
+            "\"raw_counts\"",
+            "source_key",
+            "interface_path",
         ] {
             assert!(!text.contains(bad), "不得出现 {bad}");
         }
 
-        // rows = own 四数组 + motion 五数组元素精确合计
+        // rows = own 四数组 + motion 六数组元素精确合计（triggerBinCount 标量不计）
         let arr_len = |x: &serde_json::Value| x.as_array().map_or(0, |a| a.len()) as u64;
         let expect = arr_len(&v["devices"])
             + arr_len(&v["input_daily"])
@@ -1476,7 +1590,8 @@ mod tests {
             + daily.len() as u64
             + gdaily.len() as u64
             + heat.len() as u64
-            + legacy.len() as u64;
+            + legacy.len() as u64
+            + theat.len() as u64;
         assert_eq!(rows, expect, "rows 须含 motion 各数组元素");
     }
 
@@ -1500,6 +1615,11 @@ mod tests {
         assert_eq!(daily[0]["counts"], 100.0);
         assert!(motion["gamepadDaily"].as_array().unwrap().iter().all(|r| r["day"] == DAY2));
         assert!(motion["gamepadHeat"].as_array().unwrap().iter().all(|r| r["day"] == DAY2));
+        let th_d2 = motion["gamepadTriggerHeat"].as_array().unwrap();
+        assert_eq!(th_d2.len(), 1, "{th_d2:?}");
+        assert_eq!(th_d2[0]["day"], DAY2);
+        assert_eq!(th_d2[0]["bin"], 40);
+        assert_eq!(th_d2[0]["dwellUs"], 100_000);
         assert!(motion["legacyMouseDaily"].as_array().unwrap().is_empty(), "legacy 行在 DAY");
 
         // 空范围：五数组全空但 motion 节点在场，rows = devices 数
@@ -1509,9 +1629,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(empty.as_ref()).unwrap()).unwrap();
         let motion = &v["motion"];
-        for k in ["mice", "mouseDaily", "gamepadDaily", "gamepadHeat", "legacyMouseDaily"] {
+        for k in ["mice", "mouseDaily", "gamepadDaily", "gamepadHeat", "legacyMouseDaily", "gamepadTriggerHeat"] {
             assert!(motion[k].as_array().is_some_and(|a| a.is_empty()), "{k} 须为空数组");
         }
+        assert_eq!(motion["triggerBinCount"], 101);
         assert_eq!(rows_empty, 2, "空范围 rows = devices 数");
 
         // 旧 schema：删运动四表 → 新 motion 全空，legacy 可读部分照常导出
@@ -1519,7 +1640,8 @@ mod tests {
         {
             let rw = rusqlite::Connection::open(f.as_ref()).unwrap();
             rw.execute_batch(
-                "DROP TABLE IF EXISTS gamepad_heat_daily;
+                "DROP TABLE IF EXISTS gamepad_trigger_heat_daily;
+                 DROP TABLE IF EXISTS gamepad_heat_daily;
                  DROP TABLE IF EXISTS gamepad_motion_daily;
                  DROP TABLE IF EXISTS mouse_motion_daily;
                  DROP TABLE IF EXISTS mouse_motion_sources;",
@@ -1532,9 +1654,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(old.as_ref()).unwrap()).unwrap();
         let motion = &v["motion"];
-        for k in ["mice", "mouseDaily", "gamepadDaily", "gamepadHeat"] {
+        for k in ["mice", "mouseDaily", "gamepadDaily", "gamepadHeat", "gamepadTriggerHeat"] {
             assert!(motion[k].as_array().is_some_and(|a| a.is_empty()), "旧 schema {k} 须为空");
         }
+        assert_eq!(motion["triggerBinCount"], 101);
         let legacy = motion["legacyMouseDaily"].as_array().unwrap();
         assert_eq!(legacy.len(), 1, "旧 schema 不得遗漏可读的 legacy 数据");
         assert_eq!(legacy[0]["rawCounts"], 80.0);
@@ -1542,7 +1665,7 @@ mod tests {
         assert_eq!(rows_old, 2 + 1, "旧 schema rows = devices + legacy 行数");
     }
 
-    /// 验收点（motion-dpi §8-S9）：CSV scope=own 追加五个运动文件——文件名/表头逐字、
+    /// 验收点（motion-dpi §8-S9 + input-live §6.3）：CSV scope=own 追加六个运动文件——文件名/表头逐字、
     /// BOM、null 空单元格、逗号名字引号转义、quality 常量列、空范围 0 数据行、
     /// rows 含新文件数据行。
     #[test]
@@ -1562,6 +1685,7 @@ mod tests {
             format!("gamepad_motion_{FROM}_{TO}.csv"),
             format!("gamepad_heat_{FROM}_{TO}.csv"),
             format!("legacy_mouse_motion_{FROM}_{TO}.csv"),
+            format!("gamepad_trigger_heat_{FROM}_{TO}.csv"),
         ] {
             assert!(names.contains(&expect), "{names:?}");
         }
@@ -1597,11 +1721,17 @@ mod tests {
         assert!(lm.starts_with("deviceId,day,rawCounts,quality\n"), "{lm}");
         assert!(lm.contains(&format!("{ms},{DAY},80,{LEGACY_MOUSE_QUALITY}\n")), "{lm}");
 
+        let th = read_csv(&dir, &format!("gamepad_trigger_heat_{FROM}_{TO}.csv"));
+        assert!(th.starts_with("device_id,day,trigger,bin,dwell_us\n"), "{th}");
+        assert!(th.contains(&format!("{gp},{DAY},left,40,800000\n")), "{th}");
+        assert!(th.contains(&format!("{gp},{DAY},right,60,500000\n")), "{th}");
+        assert!(th.contains(&format!("{gp},{DAY2},left,40,100000\n")), "{th}");
+
         // rows = 各 CSV 数据行合计（devices 2 + mouse_sources 1 + mouse_motion 3 +
-        // gamepad_motion 3 + gamepad_heat 4 + legacy 1；无键盘/apps/combos 数据行）
+        // gamepad_motion 3 + gamepad_heat 4 + legacy 1 + trigger 4；无键盘/apps/combos）
         let total: u64 = files.iter().map(|(_, n)| *n).sum();
-        assert_eq!(total, 14, "rows 须含新运动文件的数据行");
-        assert_eq!(files.len(), 8, "8 个文件（无键盘 → 无 keys_ 视图）: {names:?}");
+        assert_eq!(total, 18, "rows 须含新运动文件的数据行");
+        assert_eq!(files.len(), 9, "9 个文件（无键盘 → 无 keys_ 视图）: {names:?}");
 
         // 空范围：五个运动文件仍在场但 0 数据行（BOM + 表头）
         let dir2 = TempFile::new("export-motion-csv-empty", "dir");
@@ -1617,9 +1747,12 @@ mod tests {
             "gamepad_motion_2026-10-01_2026-10-02.csv".to_string(),
             "gamepad_heat_2026-10-01_2026-10-02.csv".to_string(),
             "legacy_mouse_motion_2026-10-01_2026-10-02.csv".to_string(),
+            "gamepad_trigger_heat_2026-10-01_2026-10-02.csv".to_string(),
         ] {
             assert!(names2.contains(&expect), "{names2:?}");
         }
+        let th2 = read_csv(&dir2, "gamepad_trigger_heat_2026-10-01_2026-10-02.csv");
+        assert_eq!(th2, "device_id,day,trigger,bin,dwell_us\n", "空范围扳机 CSV 只余表头");
         let src2 = read_csv(&dir2, "mouse_sources.csv");
         assert_eq!(src2, "sourceId,deviceId,name,manualDpi\n", "空范围只余表头");
     }
@@ -1676,6 +1809,7 @@ mod tests {
             + arr_len(&motion["gamepadDaily"])
             + arr_len(&motion["gamepadHeat"])
             + arr_len(&motion["legacyMouseDaily"])
+            + arr_len(&motion["gamepadTriggerHeat"])
             + arr_len(&wp_node["keys"])
             + arr_len(&wp_node["combos"])
             + arr_len(&wp_node["apps"])
