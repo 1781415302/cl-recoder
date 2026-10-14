@@ -228,6 +228,8 @@ export interface MouseSourceRow {
   name: string;
   /** 用户自定义昵称（可空；展示优先于 name） */
   nickname: string | null;
+  /** 物理来源 key（与库 mouse_motion_sources.source_key / 实时 live sourceKey 一致） */
+  sourceKey: string;
   /** 虚拟/未知桶为 false，禁配置/换算 DPI */
   physical: boolean;
   /** collector 发布的在线证据且观测 ≤5 秒，否则 false */
@@ -290,6 +292,8 @@ export interface GamepadMotionSummary {
   gridSize: 25;
   left: StickMotionSummary;
   right: StickMotionSummary;
+  /** 扳机热力子汇总（独立 readiness；v3 库 needs_upgrade + 101 零格） */
+  triggers: GamepadTriggerSummary;
 }
 
 /** hardening-v4：只读提示（get_app_notices）。schemaTooNew 非空时显示红色横幅。 */
@@ -396,7 +400,7 @@ export interface TriggerHeatSummary {
   dwellSeconds: number[];
 }
 
-/** 手柄双扳机热力（独立类型；旧 GamepadMotionSummary 追加属 S6） */
+/** 手柄双扳机热力（挂在 GamepadMotionSummary.triggers） */
 export interface GamepadTriggerSummary {
   availability: MotionAvailability;
   binCount: 101;
