@@ -21,6 +21,7 @@ pub mod export;
 pub mod gamepad_motion;
 pub mod import;
 pub mod keys;
+pub mod live_input;
 pub mod mouse_motion;
 pub mod overview;
 pub mod settings;
@@ -100,6 +101,8 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         mouse_motion::get_mouse_legacy,
         mouse_motion::set_mouse_dpi,
         gamepad_motion::get_gamepad_motion,
+        // 实时输入快照（DEVPLAN-input-live-trigger §4.4 / S4b）
+        live_input::get_live_input_snapshot,
         // 诊断日志（S1 §4.1：GUI sink 状态 + 打开日志目录；前端均无参数）
         diagnostics::get_diagnostics_info,
         diagnostics::open_diagnostics_directory,
