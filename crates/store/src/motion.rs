@@ -1,10 +1,10 @@
-//! motion —— schema 3 运动四表的注册/状态/查询/导出 SQL（motion-dpi §4.4/§6.1）。
+//! motion —— schema 3 运动四表 + schema 4 扳机热力的注册/状态/查询/导出 SQL
+//! （motion-dpi §4.4/§6.1；input-live-trigger §4.5/§6.1）。
 //!
 //! 职责边界：
 //! - 来源注册与状态心跳（`mouse_motion_sources`）：元数据写入，幂等可重试、不涉 counts；
-//! - 运动增量查询与口径结算（`mouse_motion_daily` / `gamepad_motion_daily` / `gamepad_heat_daily`）：
-//!   meters/coverage/625 格组装等全部在此按 §4.4 逐字口径结算——meters=`Σ(counts/dpi×0.0254)`
-//!   仅 dpi>0、rawCounts 全桶求和、unconfiguredCounts 仅 dpi=0、coverage=已配置/总量（total=0→null）；
+//! - 运动增量查询与口径结算（`mouse_motion_daily` / `gamepad_motion_daily` / `gamepad_heat_daily` /
+//!   `gamepad_trigger_heat_daily`）：meters/coverage/625 格/101 扳机格组装等按 §4.4/§4.5 结算；
 //! - 旧 `mouse_move_daily` 的 legacy 读数（×80 只还原旧算法已投递的原始累计量，不换算米、
 //!   不归给任何物理来源，§6.2）。
 //!
@@ -12,8 +12,8 @@
 //! 全回滚）；本模块另提供写入行类型与入库校验助手供其复用。
 //!
 //! schema 兼容（§4.5/§6.3）：v2 及更早库上 [`motion_schema_ready`]=false，查询函数据此返回
-//! `NeedsUpgrade`/合法空结果——missing table 是**预期可判定**状态，不算 swallow；真实 SQL
-//! 错误照常报错。`source_key`（本机设备路径）只入库匹配，不出现在任何对外行/日志/导出。
+//! `NeedsUpgrade`/合法空结果；v3 库摇杆仍 ready、扳机单独 [`trigger_schema_ready`]=false→
+//! needs_upgrade。`source_key` 在 [`MouseSourceRow`] 可读；历史导出行仍不导出 source_key。
 
 use std::collections::BTreeMap;
 
@@ -21,6 +21,7 @@ use chrono::{DateTime, Local, SecondsFormat, Utc};
 use clrecoder_core::day;
 use clrecoder_core::motion::{
     DpiOrigin, DpiProbeStatus, MouseSourceDescriptor, MouseSourceState, StickBinDelta, StickSide,
+    TriggerBinDelta, TriggerSide, TRIGGER_BIN_COUNT,
 };
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,20 @@ pub struct StickMotionWrite {
     pub bins: Vec<StickBinDelta>,
 }
 
+/// 手柄扳机热力增量写入行（input-live-trigger §4.5）：与 FlushBatch 同事务落库，
+/// 空 bin 不落行；不扩展 FlushBatch 字段，经 `Writer::flush_with_triggers` 传入。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerHeatWrite {
+    /// `devices.id`（型号行；FK）
+    pub device_id: i64,
+    /// 归属日 `YYYY-MM-DD`（本地时区；由捕获帧拆分，非写库时刻）
+    pub day: String,
+    /// 扳机侧
+    pub side: TriggerSide,
+    /// 本批各格停留增量（空 bin 由 writer 跳过）
+    pub bins: Vec<TriggerBinDelta>,
+}
+
 /// 来源手动 DPI 配置行（§4.4）：DPI worker ≤500ms 批读的载体。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MouseConfigRow {
@@ -116,6 +131,8 @@ pub struct MouseSourceRow {
     pub id: i64,
     /// 型号设备 id（`devices.id`；按钮 TopKeys 等型号视图仍查它）
     pub device_id: i64,
+    /// 来源 key（本机设备路径；与实时 live sourceKey 一致，从已有列读取）
+    pub source_key: String,
     /// 型号显示名（devices.name）
     pub name: String,
     /// 型号昵称（devices.nickname）
@@ -192,10 +209,34 @@ pub struct StickMotionSummary {
     pub dwell_seconds: Vec<f64>,
 }
 
-/// 手柄摇杆运动汇总（§4.4）：左右两路独立结算。
+/// 单侧扳机热力汇总（§4.5）：停留恰 101 格（秒），无数据全 0。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerHeatSummary {
+    /// 扳机侧
+    pub side: TriggerSide,
+    /// 区间活动秒数（Σdwell_us/1e6）
+    pub active_seconds: f64,
+    /// 停留热力（恰 101 格、单位秒；空格为 0）
+    pub dwell_seconds: Vec<f64>,
+}
+
+/// 手柄扳机热力汇总（§4.5）：左右两路独立；availability 独立于摇杆四表门。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GamepadTriggerSummary {
+    /// 扳机表可用性（v3 及更早 = NeedsUpgrade；v4 无记录 = Ready 零格）
+    pub availability: MotionAvailability,
+    /// 热力格数（恒 101）
+    pub bin_count: u8,
+    /// 左扳机
+    pub left: TriggerHeatSummary,
+    /// 右扳机
+    pub right: TriggerHeatSummary,
+}
+
+/// 手柄摇杆运动汇总（§4.4）：左右两路独立结算；追加 triggers（§4.5）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GamepadMotionSummary {
-    /// schema 可用性
+    /// schema 可用性（摇杆四表门；缺扳机表不得把此项降为 NeedsUpgrade）
     pub availability: MotionAvailability,
     /// 型号设备 id
     pub device_id: i64,
@@ -205,6 +246,8 @@ pub struct GamepadMotionSummary {
     pub left: StickMotionSummary,
     /// 右摇杆
     pub right: StickMotionSummary,
+    /// 扳机热力子汇总（独立 readiness）
+    pub triggers: GamepadTriggerSummary,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +314,21 @@ pub struct ExportGamepadHeatRow {
     pub dwell_us: u64,
 }
 
+/// 导出：手柄扳机热力行（空格不导出；按 device_id/day/trigger/bin 排序）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportGamepadTriggerHeatRow {
+    /// 型号设备 id
+    pub device_id: i64,
+    /// 日期
+    pub day: String,
+    /// 扳机侧
+    pub trigger: TriggerSide,
+    /// 热力格号（0..=100）
+    pub bin: u8,
+    /// 该格停留微秒
+    pub dwell_us: u64,
+}
+
 /// 导出：旧算法鼠标移动逐日行（原始量；米数/倍率不回写）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportLegacyMouseRow {
@@ -295,6 +353,8 @@ pub struct MotionExportRows {
     pub gamepad_heat: Vec<ExportGamepadHeatRow>,
     /// 旧算法鼠标移动逐日行
     pub legacy_mouse_daily: Vec<ExportLegacyMouseRow>,
+    /// 手柄扳机热力行（第六成员；v3 及更旧库为空）
+    pub gamepad_trigger_heat: Vec<ExportGamepadTriggerHeatRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +419,23 @@ pub(crate) fn stick_side_from_text(s: &str) -> Result<StickSide> {
         "left" => Ok(StickSide::Left),
         "right" => Ok(StickSide::Right),
         other => Err(StoreError::InvalidMotionField(format!("未知摇杆侧: {other}"))),
+    }
+}
+
+/// `TriggerSide` → `trigger` 列文本（与 serde snake_case 逐字一致）。
+pub(crate) fn trigger_side_to_text(s: TriggerSide) -> &'static str {
+    match s {
+        TriggerSide::Left => "left",
+        TriggerSide::Right => "right",
+    }
+}
+
+/// `trigger` 列文本 → `TriggerSide`；契约外值报错（库损坏防御）。
+pub(crate) fn trigger_side_from_text(s: &str) -> Result<TriggerSide> {
+    match s {
+        "left" => Ok(TriggerSide::Left),
+        "right" => Ok(TriggerSide::Right),
+        other => Err(StoreError::InvalidMotionField(format!("未知扳机侧: {other}"))),
     }
 }
 
@@ -433,6 +510,7 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// schema 3 四张运动表是否齐备（§4.5：无 schema → NeedsUpgrade，不把失败伪装成没有运动）。
+/// 不检查扳机表——缺扳机不得把鼠标/摇杆也隐藏。
 pub fn motion_schema_ready(conn: &Connection) -> Result<bool> {
     for name in
         ["mouse_motion_sources", "mouse_motion_daily", "gamepad_motion_daily", "gamepad_heat_daily"]
@@ -442,6 +520,11 @@ pub fn motion_schema_ready(conn: &Connection) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// schema 4 扳机热力表是否存在（§4.5：单独门；不改变 [`motion_schema_ready`] 的四表门）。
+pub fn trigger_schema_ready(conn: &Connection) -> Result<bool> {
+    table_exists(conn, "gamepad_trigger_heat_daily")
 }
 
 /// 注册鼠标运动来源（§4.4）：按 `source_key` 幂等——已存在则刷新 model/物理性/last_seen
@@ -577,7 +660,7 @@ pub fn list_mouse_sources(conn: &Connection, now_unix_us: i64) -> Result<Vec<Mou
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.device_id, d.name, d.nickname, s.physical, s.connected,
+        "SELECT s.id, s.device_id, s.source_key, d.name, d.nickname, s.physical, s.connected,
                 s.manual_dpi, s.auto_dpi, s.auto_valid_until_unix_us, s.probe_status, s.last_seen
          FROM mouse_motion_sources AS s JOIN devices AS d ON d.id = s.device_id
          ORDER BY s.id",
@@ -585,14 +668,14 @@ pub fn list_mouse_sources(conn: &Connection, now_unix_us: i64) -> Result<Vec<Mou
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(r) = rows.next()? {
-        let connected_flag = r.get::<_, i64>(5)? != 0;
-        let last_seen: String = r.get(10)?;
+        let connected_flag = r.get::<_, i64>(6)? != 0;
+        let last_seen: String = r.get(11)?;
         let connected = connected_flag
             && last_seen_fresh_within(&last_seen, now_unix_us, CONNECTED_FRESH_WINDOW_US);
-        let manual_dpi = r.get::<_, Option<i64>>(6)?.and_then(dpi_from_i64);
-        let auto_stored = r.get::<_, Option<i64>>(7)?.and_then(dpi_from_i64);
-        let auto_until_us: Option<i64> = r.get(8)?;
-        let probe_status = probe_status_from_text(&r.get::<_, String>(9)?)?;
+        let manual_dpi = r.get::<_, Option<i64>>(7)?.and_then(dpi_from_i64);
+        let auto_stored = r.get::<_, Option<i64>>(8)?.and_then(dpi_from_i64);
+        let auto_until_us: Option<i64> = r.get(9)?;
+        let probe_status = probe_status_from_text(&r.get::<_, String>(10)?)?;
         // 自动值只在有效期与当前连接证据成立时使用（§6.1）
         let auto_valid = connected
             && auto_until_us.is_some_and(|until| until > now_unix_us)
@@ -607,9 +690,10 @@ pub fn list_mouse_sources(conn: &Connection, now_unix_us: i64) -> Result<Vec<Mou
         out.push(MouseSourceRow {
             id: r.get(0)?,
             device_id: r.get(1)?,
-            name: r.get(2)?,
-            nickname: r.get(3)?,
-            physical: r.get::<_, i64>(4)? != 0,
+            source_key: r.get(2)?,
+            name: r.get(3)?,
+            nickname: r.get(4)?,
+            physical: r.get::<_, i64>(5)? != 0,
             connected,
             manual_dpi,
             auto_dpi: if auto_valid { auto_stored } else { None },
@@ -774,6 +858,25 @@ fn empty_stick_summary(side: StickSide) -> StickMotionSummary {
     }
 }
 
+/// 空扳机侧汇总（恰 101 个 0）。
+fn empty_trigger_summary(side: TriggerSide) -> TriggerHeatSummary {
+    TriggerHeatSummary {
+        side,
+        active_seconds: 0.0,
+        dwell_seconds: vec![0.0; TRIGGER_BIN_COUNT],
+    }
+}
+
+/// 空扳机总汇总（availability 由调用方指定）。
+fn empty_gamepad_trigger_summary(availability: MotionAvailability) -> GamepadTriggerSummary {
+    GamepadTriggerSummary {
+        availability,
+        bin_count: TRIGGER_BIN_COUNT as u8,
+        left: empty_trigger_summary(TriggerSide::Left),
+        right: empty_trigger_summary(TriggerSide::Right),
+    }
+}
+
 /// 摇杆侧 → 汇总数组下标（左 0 / 右 1）。
 fn stick_index(side: StickSide) -> usize {
     match side {
@@ -782,8 +885,61 @@ fn stick_index(side: StickSide) -> usize {
     }
 }
 
+/// 扳机侧 → 汇总数组下标（左 0 / 右 1）。
+fn trigger_index(side: TriggerSide) -> usize {
+    match side {
+        TriggerSide::Left => 0,
+        TriggerSide::Right => 1,
+    }
+}
+
+/// 手柄扳机热力区间汇总（§4.5）：日期闭区间，左右稀疏聚合为 101 格。
+/// 缺扳机表返回 `NeedsUpgrade` 且 101 零格；真实 SQL 错误仍 Err。
+pub fn gamepad_trigger_heat(
+    conn: &Connection,
+    device_id: i64,
+    from: &str,
+    to: &str,
+) -> Result<GamepadTriggerSummary> {
+    if !trigger_schema_ready(conn)? {
+        return Ok(empty_gamepad_trigger_summary(MotionAvailability::NeedsUpgrade));
+    }
+    let mut dwell = [[0.0f64; TRIGGER_BIN_COUNT]; 2];
+    let mut active_us = [0u64; 2];
+    let mut stmt = conn.prepare(
+        "SELECT trigger, bin, dwell_us FROM gamepad_trigger_heat_daily
+         WHERE device_id = ?1 AND day >= ?2 AND day <= ?3",
+    )?;
+    let mut rows = stmt.query(params![device_id, from, to])?;
+    while let Some(r) = rows.next()? {
+        let side = trigger_side_from_text(&r.get::<_, String>(0)?)?;
+        let i = trigger_index(side);
+        let bin: i64 = r.get(1)?;
+        let us = i64_to_count(r.get::<_, i64>(2)?);
+        if (0..TRIGGER_BIN_COUNT as i64).contains(&bin) {
+            dwell[i][bin as usize] += us as f64 / 1_000_000.0;
+            active_us[i] = active_us[i].saturating_add(us);
+        }
+    }
+    let side_summary = |side: TriggerSide| {
+        let i = trigger_index(side);
+        TriggerHeatSummary {
+            side,
+            active_seconds: active_us[i] as f64 / 1_000_000.0,
+            dwell_seconds: dwell[i].to_vec(),
+        }
+    };
+    Ok(GamepadTriggerSummary {
+        availability: MotionAvailability::Ready,
+        bin_count: TRIGGER_BIN_COUNT as u8,
+        left: side_summary(TriggerSide::Left),
+        right: side_summary(TriggerSide::Right),
+    })
+}
+
 /// 手柄摇杆运动区间汇总（§4.4）：左右两路独立，停留组装恰 625 格（空格 0）。
 /// `[from, to]` 闭区间；schema 未就绪返回 `NeedsUpgrade` 全零（§4.5）。
+/// 扳机子汇总经 [`gamepad_trigger_heat`] 独立结算——v3 库摇杆 ready、扳机 needs_upgrade。
 pub fn gamepad_motion(
     conn: &Connection,
     device_id: i64,
@@ -793,6 +949,7 @@ pub fn gamepad_motion(
     let mut active_us = [0u64; 2];
     let mut travel = [0.0f64; 2];
     let mut dwell = [[0.0f64; STICK_BIN_COUNT]; 2];
+    let triggers = gamepad_trigger_heat(conn, device_id, from, to)?;
     if !motion_schema_ready(conn)? {
         return Ok(GamepadMotionSummary {
             availability: MotionAvailability::NeedsUpgrade,
@@ -800,6 +957,7 @@ pub fn gamepad_motion(
             grid_size: GRID_SIZE,
             left: empty_stick_summary(StickSide::Left),
             right: empty_stick_summary(StickSide::Right),
+            triggers,
         });
     }
 
@@ -846,6 +1004,7 @@ pub fn gamepad_motion(
         grid_size: GRID_SIZE,
         left: side_summary(StickSide::Left),
         right: side_summary(StickSide::Right),
+        triggers,
     })
 }
 
@@ -853,8 +1012,8 @@ pub fn gamepad_motion(
 // 导出（§6.3：from/to 过滤全部 daily；mice 只列 motion 引用的来源；source_key 不导出）
 // ---------------------------------------------------------------------------
 
-/// 导出 motion 节点全部行（§6.3）。schema 3 未就绪时新运动数组全空；旧
-/// `mouse_move_daily`（schema≥2）可读部分照常导出——"不报导出成功却遗漏可读数据"。
+/// 导出 motion 节点全部行（§6.3）。schema 3 未就绪时新运动数组全空；扳机数组仅
+/// schema 4 就绪时填充；旧 `mouse_move_daily`（schema≥2）可读部分照常导出。
 pub fn export_motion_rows(conn: &Connection, from: &str, to: &str) -> Result<MotionExportRows> {
     let mut out = MotionExportRows::default();
     if motion_schema_ready(conn)? {
@@ -943,6 +1102,24 @@ pub fn export_motion_rows(conn: &Connection, from: &str, to: &str) -> Result<Mot
             }
         }
     }
+    // 扳机热力：仅 v4 表存在时导出；v3 及更旧库新数组空（§6.3）
+    if trigger_schema_ready(conn)? {
+        let mut stmt = conn.prepare(
+            "SELECT device_id, day, trigger, bin, dwell_us FROM gamepad_trigger_heat_daily
+             WHERE day >= ?1 AND day <= ?2
+             ORDER BY device_id, day, trigger, bin",
+        )?;
+        let mut rows = stmt.query(params![from, to])?;
+        while let Some(r) = rows.next()? {
+            out.gamepad_trigger_heat.push(ExportGamepadTriggerHeatRow {
+                device_id: r.get(0)?,
+                day: r.get(1)?,
+                trigger: trigger_side_from_text(&r.get::<_, String>(2)?)?,
+                bin: r.get::<_, i64>(3)?.try_into().unwrap_or(0),
+                dwell_us: i64_to_count(r.get::<_, i64>(4)?),
+            });
+        }
+    }
     // legacy：schema≥2 即可读（v3 未迁移时仍导出，§6.3"仅 legacy 可读部分"）
     if table_exists(conn, "mouse_move_daily")? {
         let mut stmt = conn.prepare(
@@ -965,7 +1142,7 @@ pub fn export_motion_rows(conn: &Connection, from: &str, to: &str) -> Result<Mot
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SCHEMA_V1_SQL, SCHEMA_V2_SQL};
+    use crate::schema::{SCHEMA_V1_SQL, SCHEMA_V2_SQL, SCHEMA_V3_SQL};
     use crate::testutil::TempDb;
     use chrono::TimeZone;
     use clrecoder_core::codes::DeviceKind;
@@ -985,7 +1162,7 @@ mod tests {
         Local.with_ymd_and_hms(y, m, d, h, mi, s).unwrap().to_rfc3339_opts(SecondsFormat::Secs, false)
     }
 
-    /// 建内存态 v3 库（临时文件 + migrate）。
+    /// 建内存态当前 schema 库（临时文件 + migrate → v4）。
     fn open_v3(tag: &str) -> (TempDb, Connection) {
         let db = TempDb::new(tag);
         let conn = Connection::open(db.as_ref()).unwrap();
@@ -1009,6 +1186,30 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO schema_migrations(version, applied_at)
              VALUES (1, '2026-01-01T00:00:00+00:00'), (2, '2026-01-02T00:00:00+00:00');",
+        )
+        .unwrap();
+        (db, conn)
+    }
+
+    /// 真实 v3 库（有运动四表、无 gamepad_trigger_heat_daily；版本止于 3）。
+    fn open_v3_only(tag: &str) -> (TempDb, Connection) {
+        let db = TempDb::new(tag);
+        let conn = Connection::open(db.as_ref()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(
+               version INTEGER PRIMARY KEY,
+               applied_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V1_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V2_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V3_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO schema_migrations(version, applied_at)
+             VALUES (1, '2026-01-01T00:00:00+00:00'),
+                    (2, '2026-01-02T00:00:00+00:00'),
+                    (3, '2026-01-03T00:00:00+00:00');",
         )
         .unwrap();
         (db, conn)
@@ -1097,10 +1298,16 @@ mod tests {
             assert_eq!(serde_json::to_string(&s).unwrap(), format!(r#""{text}""#));
             assert_eq!(stick_side_from_text(text).unwrap(), s);
         }
+        for (s, text) in [(TriggerSide::Left, "left"), (TriggerSide::Right, "right")] {
+            assert_eq!(trigger_side_to_text(s), text);
+            assert_eq!(serde_json::to_string(&s).unwrap(), format!(r#""{text}""#));
+            assert_eq!(trigger_side_from_text(text).unwrap(), s);
+        }
         // 契约外值拒绝
         assert!(dpi_origin_from_text("Auto").is_err());
         assert!(probe_status_from_text("ok").is_err());
         assert!(stick_side_from_text("center").is_err());
+        assert!(trigger_side_from_text("center").is_err());
         // MotionAvailability serde 形状（DTO adapter 映射 ready/needs_upgrade 的对侧锚点）
         assert_eq!(serde_json::to_string(&MotionAvailability::Ready).unwrap(), r#""ready""#);
         assert_eq!(
@@ -1317,8 +1524,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
         assert_eq!(
-            (r.id, r.device_id, r.name.as_str(), r.nickname.as_deref(), r.physical, r.connected),
-            (id, 1, "M", None, true, true)
+            (r.id, r.device_id, r.source_key.as_str(), r.name.as_str(), r.nickname.as_deref(), r.physical, r.connected),
+            (id, 1, "k1", "M", None, true, true)
         );
         assert_eq!((r.manual_dpi, r.auto_dpi), (Some(800), Some(1600)));
         assert!(r.auto_valid_until.is_some(), "auto 有效时给出失效时刻");
@@ -1535,6 +1742,10 @@ mod tests {
         let g = gamepad_motion(&conn, 1, DAY, DAY).unwrap();
         assert_eq!(g.availability, MotionAvailability::Ready);
         assert_eq!((g.device_id, g.grid_size), (1, 25));
+        assert_eq!(g.triggers.availability, MotionAvailability::Ready);
+        assert_eq!(g.triggers.bin_count, 101);
+        assert_eq!(g.triggers.left.dwell_seconds.len(), 101);
+        assert_eq!(g.triggers.left.active_seconds, 0.0);
         assert_eq!((g.left.active_seconds, g.left.travel_r), (1.5, 0.707));
         assert_eq!(g.left.dwell_seconds.len(), 625, "恰 625 格");
         assert_eq!(g.left.dwell_seconds[312], 1.0);
@@ -1619,6 +1830,9 @@ mod tests {
         assert_eq!(g.availability, MotionAvailability::NeedsUpgrade);
         assert_eq!(g.left.dwell_seconds.len(), 625);
         assert_eq!(g.left.dwell_seconds.iter().sum::<f64>(), 0.0);
+        assert_eq!(g.triggers.availability, MotionAvailability::NeedsUpgrade);
+        assert_eq!(g.triggers.left.dwell_seconds.len(), 101);
+        assert!(!trigger_schema_ready(&conn).unwrap());
 
         // legacy 在旧 schema 仍可读（×80）
         assert_eq!(legacy_mouse_counts(&conn, 1, DAY, DAY).unwrap(), 160.0);
@@ -1627,12 +1841,13 @@ mod tests {
         let ex = export_motion_rows(&conn, DAY, DAY).unwrap();
         assert!(ex.mice.is_empty() && ex.mouse_daily.is_empty());
         assert!(ex.gamepad_daily.is_empty() && ex.gamepad_heat.is_empty());
+        assert!(ex.gamepad_trigger_heat.is_empty());
         assert_eq!(
             ex.legacy_mouse_daily,
             vec![ExportLegacyMouseRow { device_id: 1, day: DAY.to_string(), raw_counts: 160.0 }]
         );
 
-        // 升级到 v3 后 schema 就绪（同一连接续跑迁移链）；注册来源后查询为合法空 Ready
+        // 升级到当前 schema 后运动/扳机表就绪；注册来源后查询为合法空 Ready
         crate::schema::migrate(&conn).unwrap();
         assert!(motion_schema_ready(&conn).unwrap());
         let id = register_mouse_source(&conn, &descriptor("k1", "M"), 1, "t").unwrap();
@@ -1751,5 +1966,105 @@ mod tests {
         assert_eq!(ex2.mouse_daily[0].counts, 100.0);
         assert!(ex2.gamepad_daily.is_empty() && ex2.gamepad_heat.is_empty());
         assert!(ex2.legacy_mouse_daily.is_empty());
+        assert!(ex.gamepad_trigger_heat.is_empty());
+        assert!(ex2.gamepad_trigger_heat.is_empty());
+    }
+
+    /// S3：单独 trigger readiness；v3 摇杆 ready / 扳机 needs_upgrade；v4 聚合与导出。
+    #[test]
+    fn trigger_schema_ready_and_v3_sticks_remain_ready() {
+        let (_db, conn) = open_v3_only("trigger-v3-ready");
+        assert!(motion_schema_ready(&conn).unwrap());
+        assert!(!trigger_schema_ready(&conn).unwrap());
+        conn.execute(
+            "INSERT INTO devices(kind, vid, pid, name, first_seen, last_seen)
+             VALUES ('gamepad', 3, 4, '手柄', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gamepad_motion_daily(device_id, day, stick, active_us, travel_r)
+             VALUES (1, ?1, 'left', 1_000_000, 0.1)",
+            params![DAY],
+        )
+        .unwrap();
+        let g = gamepad_motion(&conn, 1, DAY, DAY).unwrap();
+        assert_eq!(g.availability, MotionAvailability::Ready);
+        assert_eq!(g.left.active_seconds, 1.0);
+        assert_eq!(g.triggers.availability, MotionAvailability::NeedsUpgrade);
+        assert_eq!(g.triggers.bin_count, 101);
+        assert_eq!(g.triggers.left.dwell_seconds, vec![0.0; 101]);
+        assert_eq!(g.triggers.right.dwell_seconds.len(), 101);
+        let th = gamepad_trigger_heat(&conn, 1, DAY, DAY).unwrap();
+        assert_eq!(th.availability, MotionAvailability::NeedsUpgrade);
+        let ex = export_motion_rows(&conn, DAY, DAY).unwrap();
+        assert_eq!(ex.gamepad_daily.len(), 1);
+        assert!(ex.gamepad_trigger_heat.is_empty());
+    }
+
+    /// S3：v4 扳机稀疏聚合（101 格）、active_seconds、导出行排序。
+    #[test]
+    fn trigger_heat_query_aggregate_and_export() {
+        let (_db, conn) = open_v3("trigger-heat-query");
+        assert!(trigger_schema_ready(&conn).unwrap());
+        conn.execute(
+            "INSERT INTO devices(kind, vid, pid, name, first_seen, last_seen)
+             VALUES ('gamepad', 3, 4, '手柄', 't', 't')",
+            [],
+        )
+        .unwrap();
+        for (day, side, bin, us) in [
+            (DAY, "left", 25i64, 40_000i64),
+            (DAY, "left", 25, 10_000),
+            (DAY, "right", 100, 1_000_000),
+            (DAY2, "left", 0, 500_000),
+        ] {
+            conn.execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, ?1, ?2, ?3, ?4)
+                 ON CONFLICT(device_id, day, trigger, bin) DO UPDATE SET
+                   dwell_us = dwell_us + excluded.dwell_us",
+                params![day, side, bin, us],
+            )
+            .unwrap();
+        }
+        let th = gamepad_trigger_heat(&conn, 1, DAY, DAY).unwrap();
+        assert_eq!(th.availability, MotionAvailability::Ready);
+        assert_eq!(th.bin_count, 101);
+        assert_eq!(th.left.dwell_seconds[25], 0.05);
+        assert_eq!(th.left.active_seconds, 0.05);
+        assert_eq!(th.right.dwell_seconds[100], 1.0);
+        assert_eq!(th.right.active_seconds, 1.0);
+        assert_eq!(th.left.dwell_seconds[0], 0.0);
+        let g = gamepad_motion(&conn, 1, DAY, DAY).unwrap();
+        assert_eq!(g.availability, MotionAvailability::Ready);
+        assert_eq!(g.triggers.left.active_seconds, 0.05);
+        let ex = export_motion_rows(&conn, DAY, DAY2).unwrap();
+        assert_eq!(
+            ex.gamepad_trigger_heat,
+            vec![
+                ExportGamepadTriggerHeatRow {
+                    device_id: 1,
+                    day: DAY.to_string(),
+                    trigger: TriggerSide::Left,
+                    bin: 25,
+                    dwell_us: 50_000,
+                },
+                ExportGamepadTriggerHeatRow {
+                    device_id: 1,
+                    day: DAY.to_string(),
+                    trigger: TriggerSide::Right,
+                    bin: 100,
+                    dwell_us: 1_000_000,
+                },
+                ExportGamepadTriggerHeatRow {
+                    device_id: 1,
+                    day: DAY2.to_string(),
+                    trigger: TriggerSide::Left,
+                    bin: 0,
+                    dwell_us: 500_000,
+                },
+            ]
+        );
     }
 }
