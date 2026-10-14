@@ -179,7 +179,7 @@ fn accept_client(handle: HANDLE, event: HANDLE, flags: &Flags) -> AcceptOutcome 
         }
         let _ = unsafe { WaitForSingleObject(event, WAIT_SLICE.as_millis() as u32) };
         let mut transferred = 0u32;
-        match unsafe { GetOverlappedResult(handle, &mut ov, &mut transferred, false) } {
+        match unsafe { GetOverlappedResult(handle, &ov, &mut transferred, false) } {
             Ok(()) => return AcceptOutcome::Connected,
             Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => {
                 continue;
@@ -219,7 +219,7 @@ fn serve_connection(handle: HANDLE, event: HANDLE, flags: &Flags, live: &LiveInp
         let reply = build_reply(&line, live, flags);
         let out = match encode_reply(&reply) {
             Ok(bytes) => bytes,
-            Err(too_large) => match encode_reply(&too_large) {
+            Err(too_large) => match encode_reply(too_large.as_ref()) {
                 Ok(bytes) => bytes,
                 Err(_) => return, // 极端：连 too_large 都编不过，断开
             },
@@ -270,22 +270,22 @@ fn build_reply(line: &[u8], live: &LiveInputRuntime, flags: &Flags) -> LiveSnaps
 }
 
 /// 编码响应行；若超过 [`LIVE_MAX_RESPONSE_BYTES`]（含换行）返回 Err(too_large 回复)。
-fn encode_reply(reply: &LiveSnapshotReply) -> Result<Vec<u8>, LiveSnapshotReply> {
+fn encode_reply(reply: &LiveSnapshotReply) -> Result<Vec<u8>, Box<LiveSnapshotReply>> {
     let mut bytes = serde_json::to_vec(reply).map_err(|e| {
-        err_reply(
+        Box::new(err_reply(
             LiveErrorCode::Protocol,
             format!("序列化实时响应失败: {e}"),
-        )
+        ))
     })?;
     bytes.push(b'\n');
     if bytes.len() > LIVE_MAX_RESPONSE_BYTES {
-        return Err(err_reply(
+        return Err(Box::new(err_reply(
             LiveErrorCode::TooLarge,
             format!(
                 "实时响应过大（{} 字节 > {LIVE_MAX_RESPONSE_BYTES}）",
                 bytes.len()
             ),
-        ));
+        )));
     }
     Ok(bytes)
 }
