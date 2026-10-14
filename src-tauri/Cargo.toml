@@ -16,7 +16,9 @@ tauri-plugin-opener = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
-windows = { workspace = true }
+# DEVPLAN-input-live-trigger S0（§3 G5）：GUI live pipe 客户端需要 OVERLAPPED I/O
+# （ReadFile/WriteFile/CancelIoEx）；与 collector 已用的 Win32_System_IO 对齐，不新增包。
+windows = { workspace = true, features = ["Win32_System_IO"] }
 chrono = { workspace = true }
 dirs = { workspace = true }
 clrecoder-core = { path = "../crates/core" }

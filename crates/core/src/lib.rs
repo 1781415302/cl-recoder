@@ -7,6 +7,7 @@
 //! - [`codes`]：三种外设的 code 空间 + 归一化规则（§4.1，全系统最重要契约）
 //! - [`event`]：采集层 → aggregator 的事件语言（§4.2）
 //! - [`ipc`]：GUI ↔ collector 控制协议（§4.4）
+//! - [`live_input`]：实时输入 v1 跨进程 DTO/常量（DEVPLAN-input-live-trigger §4.1）
 //! - [`motion`]：运动共享类型与日历助手（motion-dpi §4.1；AggEvent 变体接入属 S4/S5）
 //! - [`qtkeys`]：WhatPulse Qt 键码 → 显示名映射（§4.8）
 //! - [`day`]：日期工具（一律 `YYYY-MM-DD` 本地时区字符串）
@@ -15,5 +16,6 @@ pub mod codes;
 pub mod day;
 pub mod event;
 pub mod ipc;
+pub mod live_input;
 pub mod motion;
 pub mod qtkeys;

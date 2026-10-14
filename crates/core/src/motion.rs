@@ -223,6 +223,47 @@ pub struct StickDayDelta {
     pub bins: Vec<StickBinDelta>,
 }
 
+/// 扳机侧（DEVPLAN-input-live-trigger §4.2）：线上 snake_case（`"left"` / `"right"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerSide {
+    /// 左扳机（LT）
+    Left,
+    /// 右扳机（RT）
+    Right,
+}
+
+/// 扳机热力格数（0..=100，共 101 格）。
+pub const TRIGGER_BIN_COUNT: usize = 101;
+
+/// 进入活动行程的阈值（raw/255；≠ 实时 held 门 0.33）。
+pub const TRIGGER_ENTER: f64 = 2.0 / 255.0;
+
+/// 退出活动行程的阈值（raw/255；迟滞低于 ENTER）。
+pub const TRIGGER_EXIT: f64 = 1.0 / 255.0;
+
+/// 扳机热力单格停留增量（§4.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerBinDelta {
+    /// 热力格号（0..=100）
+    pub bin: u8,
+    /// 本格停留微秒
+    pub dwell_us: u64,
+}
+
+/// 扳机按日增量（§4.2）：tracker 回吐的稀疏格增量，按本地日拆分。
+///
+/// 帧字段扩展（`GamepadMotionFrame` 加 LT/RT）属 S5，本模块此处只落地类型/常量。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerDayDelta {
+    /// 归属日（`YYYY-MM-DD` 本地时区）
+    pub day: String,
+    /// 扳机侧
+    pub side: TriggerSide,
+    /// 本日各格停留增量
+    pub bins: Vec<TriggerBinDelta>,
+}
+
 /// UTC µs → 本地日期（§4.2：chrono 本地日历换算，不固定加 24 小时）。
 ///
 /// 超出 chrono 可表示范围（不可能来自真实时钟）返回 `None`，调用方按时钟异常处理。
@@ -448,5 +489,22 @@ mod tests {
         }
         // 日标签可回写解析（day.rs 同形规范）
         assert_eq!(crate::day::parse_day(&format_day(day)), Some(day));
+    }
+
+    #[test]
+    fn trigger_side_and_constants() {
+        assert_eq!(TRIGGER_BIN_COUNT, 101);
+        assert!((TRIGGER_ENTER - 2.0 / 255.0).abs() < 1e-15);
+        assert!((TRIGGER_EXIT - 1.0 / 255.0).abs() < 1e-15);
+        assert_eq!(serde_json::to_string(&TriggerSide::Left).unwrap(), r#""left""#);
+        assert_eq!(serde_json::to_string(&TriggerSide::Right).unwrap(), r#""right""#);
+        let delta = TriggerDayDelta {
+            day: "2026-10-14".into(),
+            side: TriggerSide::Left,
+            bins: vec![TriggerBinDelta { bin: 50, dwell_us: 1000 }],
+        };
+        let s = serde_json::to_string(&delta).unwrap();
+        let back: TriggerDayDelta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, delta);
     }
 }
