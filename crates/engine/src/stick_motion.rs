@@ -23,12 +23,16 @@
 //! 6) 跨日：正常跨本地午夜以 UTC 两端确定午夜切点比例，按该比例分配单调 dt，最后
 //!    一段取剩余微秒保证总和；路程增量归当前采样日；chrono 本地日历换算经
 //!    [`clrecoder_core::motion`] 助手完成，不固定加 24 小时。
+//!
+//! 时间合法性与本地午夜拆分复用 [`crate::motion_interval`]（E1）；本模块只保留摇杆
+//! 径向投影、活动迟滞、路径去噪与行程/热力产出。
 
 use clrecoder_core::day::format_day;
 use clrecoder_core::motion::{
-    local_day_from_unix_us, local_midnight_unix_us, MotionStamp, NaiveDate, StickBinDelta,
-    StickDayDelta, StickPoint, StickSide,
+    MotionStamp, StickBinDelta, StickDayDelta, StickPoint, StickSide,
 };
+
+use crate::motion_interval::{accepted_interval, split_interval_by_local_day};
 
 /// 热力图网格边长：25×25 = 625 格（§4.2 分箱 / §4.6 展示共用）。
 pub const STICK_GRID_SIZE: usize = 25;
@@ -39,8 +43,6 @@ const STICK_ENTER_RADIUS: f64 = 0.20;
 const STICK_EXIT_RADIUS: f64 = 0.15;
 /// 行程锚点接受阈值：与最近**接受的锚点**距离 ≥ 0.01 R 才接受新锚点并累计路程。
 const STICK_NOISE_RADIUS: f64 = 0.01;
-/// 断段阈值：单调 dt 或 UTC/单调偏差超过 250 ms 视为断段（休眠/时钟跳变），不填补。
-const MAX_INTERVAL_US: i128 = 250_000;
 
 /// 非活动点的行程有效位置（§4.2：非活动点用于行程的有效位置为 (0,0)）。
 const CENTER: StickPoint = StickPoint { x: 0.0, y: 0.0 };
@@ -125,48 +127,30 @@ impl StickMotionTracker {
             return Vec::new();
         }
 
-        // 时间异常 → 断段：不填补该间隔，reset 并将当前点设为新锚点。
-        let dt = i128::from(stamp.mono_us) - i128::from(self.prev_stamp.mono_us);
-        let d_utc = i128::from(stamp.unix_us) - i128::from(self.prev_stamp.unix_us);
-        let stamp_broken = stamp.unix_us <= self.prev_stamp.unix_us
-            || dt <= 0
-            || dt > MAX_INTERVAL_US
-            || (d_utc - dt).abs() > MAX_INTERVAL_US;
-        // 日期标签不可得（超出 chrono 表示范围）同样视作时钟异常。
-        let cur_day = match local_day_from_unix_us(stamp.unix_us) {
-            Some(d) => d,
-            None => {
-                self.reset();
-                self.establish(stamp, side, eff, active);
-                return Vec::new();
-            }
-        };
-        if stamp_broken {
+        // 时间异常 / 日期不可换算 → 断段：不填补该间隔，reset 并将当前点设为新锚点。
+        let Some(interval) = accepted_interval(self.prev_stamp, stamp) else {
             self.reset();
             self.establish(stamp, side, eff, active);
             return Vec::new();
-        }
+        };
+        let cur_day = interval.current_day;
 
         // 时间积分：[prev, current) 用上一完整帧的位置/活动态累计实际 dt（µs）。
         let mut deltas: Vec<StickDayDelta> = Vec::new();
         if self.prev_active {
-            let prev_day = match local_day_from_unix_us(self.prev_stamp.unix_us) {
-                Some(d) => d,
-                None => {
-                    self.reset();
-                    self.establish(stamp, side, eff, active);
-                    return Vec::new();
-                }
-            };
-            deltas = split_dwell_by_local_day(
-                prev_day,
-                cur_day,
-                self.prev_stamp.unix_us,
-                stamp.unix_us,
-                dt as u64,
-                self.prev_eff,
-                side,
-            );
+            deltas = split_interval_by_local_day(self.prev_stamp, stamp, interval)
+                .into_iter()
+                .map(|(day, us)| StickDayDelta {
+                    day,
+                    side,
+                    active_us: us,
+                    travel_r: 0.0,
+                    bins: vec![StickBinDelta {
+                        bin: stick_bin(self.prev_eff),
+                        dwell_us: us,
+                    }],
+                })
+                .collect();
         }
 
         // 路径去噪（§4.2）：与最近接受的锚点距离 ≥0.01 R 才接受新锚点并累计欧氏距离；
@@ -239,52 +223,13 @@ fn normalize_to_unit_circle(p: StickPoint) -> StickPoint {
     }
 }
 
-/// 停留时长按本地午夜切点拆日（§4.2）：以 UTC 两端确定午夜切点比例，按该比例分配
-/// 单调 dt，最后一段取剩余微秒保证总和；每段一个 bin（原位置格），满足
-/// `active_us = Σbins.dwell_us`。不跨日时输出单段；切点被 clamp 进区间，
-/// 任何 DST 歧义下总量守恒。
-#[must_use]
-fn split_dwell_by_local_day(
-    prev_day: NaiveDate,
-    cur_day: NaiveDate,
-    prev_unix_us: i64,
-    cur_unix_us: i64,
-    dwell_us: u64,
-    at: StickPoint,
-    side: StickSide,
-) -> Vec<StickDayDelta> {
-    let piece = |day: String, us: u64| StickDayDelta {
-        day,
-        side,
-        active_us: us,
-        travel_r: 0.0,
-        bins: vec![StickBinDelta { bin: stick_bin(at), dwell_us: us }],
-    };
-    if prev_day == cur_day {
-        return vec![piece(format_day(prev_day), dwell_us)];
-    }
-    // 跨本地午夜：切点取 cur_day 的本地 00:00，clamp 进 [prev, cur] 后按比例分配。
-    let midnight = local_midnight_unix_us(cur_day, prev_unix_us)
-        .clamp(prev_unix_us, cur_unix_us);
-    let span = (i128::from(cur_unix_us) - i128::from(prev_unix_us)).max(1);
-    let first = ((i128::from(midnight) - i128::from(prev_unix_us)) * i128::from(dwell_us) / span)
-        as u64;
-    let second = dwell_us - first;
-    let mut out = Vec::with_capacity(2);
-    if first > 0 {
-        out.push(piece(format_day(prev_day), first));
-    }
-    if second > 0 {
-        out.push(piece(format_day(cur_day), second));
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use clrecoder_core::motion::{local_day_from_unix_us, local_midnight_unix_us};
 
     /// 基准 UTC µs：2026-06-15T00:00:00Z（测试只作相对时间/日历扫描起点）。
     const BASE_UNIX_US: i64 = 1_780_272_000_000_000;

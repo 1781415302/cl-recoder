@@ -1,8 +1,9 @@
 //! clrecoder-engine —— 键盘统计**纯函数**状态机（PLAN §1/§2.2/§4.3）。
 //!
 //! 职责边界：不依赖 windows crate、不做任何 IO。键盘统计只处理键盘事件（sc + down/up），
-//! 不碰鼠标/手柄按钮事件；[`stick_motion`] 是 motion-dpi §4.2 的纯摇杆 tracker
-//! （每个连接×side 一个实例，输出按日增量）。唯一依赖是 [`clrecoder_core`] 的修饰键位
+//! 不碰鼠标/手柄按钮事件；[`stick_motion`] 是 motion-dpi §4.2 的纯摇杆 tracker，
+//! [`trigger_motion`] 是扳机行程停留 tracker（每个连接×side 一个实例，输出按日增量）。
+//! 共享时间校验见私有 [`motion_interval`]。唯一依赖是 [`clrecoder_core`] 的修饰键位
 //! 掩码契约（`codes::modifier_bit` / `codes::mods`）与运动共享类型/日历助手（`motion`）。
 //!
 //! 统计语义（PLAN §4.3 五条规则 + correctness-v2 §4.2 来源维度，逐字实现）：
@@ -22,7 +23,9 @@
 //!
 //! "今天"不属于引擎状态——日期按调用方（aggregator）参数入桶，跨天自然开新桶。
 
+mod motion_interval;
 pub mod stick_motion;
+pub mod trigger_motion;
 
 use std::collections::HashSet;
 
