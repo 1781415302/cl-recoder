@@ -32,6 +32,7 @@ macro_rules! gui_log {
 mod commands;
 mod db;
 mod keylabel;
+mod live_input;
 mod overview_cache;
 mod state;
 // S3（§4.4）：原生窗口 UI 活动快照——active 的唯一权威，前端经事件 + get_ui_activity 消费。
@@ -187,6 +188,8 @@ fn main() {
             // 防止同角色两个进程争轮转；AppState::new 里的 gui_log! 因此可被持久化适配。
             app.manage(commands::diagnostics::init_gui_diagnostics());
             app.manage(state::AppState::new());
+            // S4b（§4.4）：共享 LiveInputClient——所有命令同一连接锁；最后 Arc 释放才 Drop。
+            app.manage(std::sync::Arc::new(crate::live_input::LiveInputClient::new()));
             // S3（§4.4）：UI 活动状态（初始 revision=0/inactive），事件 + get_ui_activity 共用。
             app.manage(ui_activity::UiActivityState::new());
             webview_recovery::create_initial(app.handle())?;
