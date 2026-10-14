@@ -1,5 +1,37 @@
 # 更新记录
 
+## v0.4.0（未发布）
+
+对应方案：实时输入展示、扳机热力与外设布局（`DEVPLAN-input-live-trigger`）；验收记录：[docs/ACCEPTANCE-input-live-trigger.md](docs/ACCEPTANCE-input-live-trigger.md)。
+
+### 实时输入
+
+- 键盘 / 鼠标 / 手柄分布图可显示当前按住状态与短按反馈（约 100ms）；统计暂停时仍可看实时动作，不写入历史。
+- 手柄图内展示左右摇杆当前位置与 LT/RT 行程百分比；实时态来自独立只读管道 `\\.\pipe\clrecoder-live-v1`，不改动既有 control 协议。
+- GUI 每 40ms 至多一笔快照请求；页面隐藏或卸载时停止请求；live 不可用时只提示实时不可用，不清空历史列表。
+
+### 扳机热力（历史）
+
+- 新增 LT/RT 累计停留热力条（0～100%、101 格），左右共同色标；与既有 gilrs 0.33 按压计数相互独立。
+- 热力仅历史：不接收实时位置；旧按钮次数无法重建连续热力，需新采集器开始记录。
+
+### 外设图与交互
+
+- 重做鼠标、手柄分布图外形与控件布局；键盘保持 ANSI-104，仅增加实时反馈。
+- 手柄模拟量按具体 XInput 连接选择；鼠标实时按物理来源（sourceKey）匹配；历史仍按原型号聚合。
+
+### 数据与升级
+
+- 统计库 schema 升至 **v4**（追加扳机热力表，不替换既有运动表）。v0.3.0 采集器不支持 v4 并会拒写，**GUI 与 collector 须同批升级**。
+- 升级前正常退出 GUI 与 collector，备份 `stats.db` 及未合并 WAL、`settings.json` 与旧程序后再替换。若已迁移 schema 4，回退旧 collector 必须恢复升级前数据库备份，不能仅换回旧 exe。
+- 新版 GUI 读 v3 库仍可看旧数据，扳机热力提示需更新采集器；导出格式版本适配 v4，旧字段语义不变。
+
+### 兼容保留
+
+- 控制协议、脚本、按钮编码、暂停/恢复、窗口活动、DPI、鼠标距离、摇杆 R 行程与热力、日期查询、WhatPulse、明细与导出均保持原口径。
+- WebView 软件渲染 / 恢复配置与 RTSS 相关行为不变。
+
+
 ## v0.3.0（未发布）
 
 对应方案：[docs/DEVPLAN-hardening-v4.md](docs/DEVPLAN-hardening-v4.md)；验收记录：[docs/ACCEPTANCE-hardening-v4.md](docs/ACCEPTANCE-hardening-v4.md)。
