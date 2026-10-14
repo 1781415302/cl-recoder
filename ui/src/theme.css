@@ -1560,6 +1560,16 @@ select {
   stroke-width: 1;
   pointer-events: none;
 }
+.peripheral-live-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+.gamepad-button .peripheral-label {
+  position: relative;
+  z-index: 2;
+}
 .trigger-travel-fill {
   fill: #187b6688;
   stroke: none;

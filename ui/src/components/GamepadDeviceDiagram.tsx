@@ -125,6 +125,14 @@ export function GamepadDeviceDiagram({
             className="peripheral-inset"
             d="M213 162h44v44h44v44h-44v44h-44v-44h-44v-44h44Z"
           />
+        </svg>
+        <svg
+          className="peripheral-live-overlay"
+          width={size.width}
+          height={size.height}
+          viewBox={`0 0 ${size.width} ${size.height}`}
+          aria-hidden="true"
+        >
           {/* LT/RT 行程填充（原始 0..1 → 整数百分比；不冒充历史 bin） */}
           {[
             { code: 6, pct: leftPct },

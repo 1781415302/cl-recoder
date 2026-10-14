@@ -70,10 +70,20 @@
 | 临时 v3→v4 DB 升级一致性 | 由 store 既有迁移测试覆盖（`trigger_v3_db_upgrade_appends_v4_and_preserves_old_rows` 等）；未触碰生产库 |
 | 生产候选 NSIS / 真机安装迁移 | **未执行**（无部署授权）；仅构建并运行候选 collector `--version` |
 
+### Windows 原生复核与显示修复
+
+2026-10-14，Windows MSVC 宿主：
+
+- `cargo test --workspace --locked`：通过；GUI 的三项 wine 失败在原生 Windows 未重现。
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`：通过。
+- `npm --prefix ui test`：112 / 112，通过；新增物理鼠标缺席不串源、失败/过期恢复不回放短按的回归用例。
+- `npm --prefix ui run build`：通过。
+- 浏览器 mock 渲染验证：摇杆点、方向线与扳机填充在按钮背景之上可见，标签保持清晰；实时叠加层不阻挡 RS 点击。此项不代表实物手柄验收。
+
 ### 风险与后续
 
-1. **Windows clippy 门**：`live_server.rs` 两处 `-D warnings` 失败需在允许改 L2/L3 的后续修复步处理，否则正式 `cargo clippy --workspace --all-targets --target windows-gnu -D warnings` 不能绿。
-2. **GUI wine 三失败**：与 v0.3.0 基线一致，不以 wine 通过冒充；须真机复核进程探测与 Ctrl 键标签。
+1. **Windows clippy 门**：原生 MSVC 全工作区检查已通过。
+2. **GUI wine 三失败**：原生 Windows 工作区测试已通过，未重现这些环境差异。
 3. **真机门 M1–M10**：全部未验收；不得以 unit/mock/wine 代替。
 4. **同批升级**：schema 4 后旧 collector 拒写；回退须恢复 DB 备份。未授权不得替换用户正在运行的采集器。
 5. 本步未 push、未 merge、未 release、未改用户主分支。

@@ -282,6 +282,55 @@ test("sameDevice：四字段一致；nickname 不参与", () => {
   assert.equal(sameDevice(a, { ...a, vid: 1 }), false);
 });
 
+test("投影：选中物理鼠标缺席时不回落到同型号另一来源", () => {
+  const mouse = deviceKey("mouse", 1, 2, "Mouse");
+  const input = {
+    state: "ready", receivedAtMs: 0,
+    reply: okReply({ snapshot: { sources: [{
+      kind: "mouse", sourceId: "b", sourceKey: "key-B", device: mouse,
+      digital: { heldCodes: [1], presses: [{ code: 1, pressSeq: "1", ageMs: 0 }] },
+    }] } }),
+  };
+  for (const device of [mouse, null]) {
+    const view = updateLiveProjection(createLiveProjectionState(), input,
+      { kind: "mouse", device, sourceKey: "key-A" }, 0);
+    assert.equal(view.state, "waiting");
+    assert.deepEqual([...view.heldCodes], []);
+    assert.deepEqual([...view.pulseCodes], []);
+    assert.deepEqual(view.selectedDevice, device);
+  }
+});
+
+test("投影：失败或过期恢复首帧只建基线，当前 held 立即显示", () => {
+  const keyboard = deviceKey("keyboard", 1, 2, "Keyboard");
+  const target = { kind: "keyboard", device: keyboard };
+  const ready = (seq, held, time, ageMs) => ({
+    state: "ready", receivedAtMs: time,
+    reply: okReply({ snapshot: { sources: [{
+      kind: "keyboard", sourceId: "k", device: keyboard,
+      digital: { heldCodes: held, presses: [{ code: 30, pressSeq: String(seq), ageMs }] },
+    }] } }),
+  });
+  for (const failure of [
+    { state: "unavailable", receivedAtMs: null, reply: null },
+    { state: "unavailable", receivedAtMs: null, reply: { snapshot: null, error: { code: "io", message: "失败" } } },
+    { state: "ready", receivedAtMs: 10, reply: { snapshot: null, error: null } },
+  ]) {
+    const state = createLiveProjectionState();
+    updateLiveProjection(state, ready(1, [], 0, 1000), target, 0);
+    updateLiveProjection(state, ready(2, [], 5, 0), target, 5);
+    assert.notEqual(nextPulseDelayMs(state, 5), null);
+    const failed = updateLiveProjection(state, failure, target, 10);
+    assert.equal(failed.state, "unavailable");
+    assert.equal(nextPulseDelayMs(state, 10), null);
+    const restored = updateLiveProjection(state, ready(3, [31], 1010, 800), target, 1010);
+    assert.deepEqual([...restored.pulseCodes], []);
+    assert.deepEqual([...restored.heldCodes], [31]);
+    const next = updateLiveProjection(state, ready(4, [], 1050, 0), target, 1050);
+    assert.deepEqual([...next.pulseCodes], [30]);
+  }
+});
+
 test("投影：首次建立基线不回放旧短按；held 立即显示", () => {
   const state = createLiveProjectionState();
   const kb = deviceKey("keyboard", 1, 2, "KB");

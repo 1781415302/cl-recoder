@@ -146,9 +146,7 @@ function matchKeyboardMouse(
     const byKey = sources.filter(
       (s) => s.kind === "mouse" && s.sourceKey === target.sourceKey,
     );
-    if (byKey.length > 0) {
-      return { matched: byKey, selectedDevice: byKey[0].device };
-    }
+    return { matched: byKey, selectedDevice: byKey[0]?.device ?? target.device };
   }
   if (target.device) {
     const byDev = sources.filter((s) => sameDevice(s.device, target.device!));
@@ -341,8 +339,8 @@ export function updateLiveProjection(
   }
 
   if (input.state === "unavailable") {
+    resetBaseline(state);
     const errMsg = input.reply?.error?.message ?? "实时输入不可用";
-    // 不清基线字段以外的目标身份；下次 ready 若 session 变会重建
     return emptyView("unavailable", errMsg, {
       selectedDevice: target.device,
       selectedSourceId: target.kind === "gamepad" ? target.sourceId : null,
@@ -353,6 +351,7 @@ export function updateLiveProjection(
   const reply = input.reply;
   const snapshot = reply?.snapshot ?? null;
   if (!snapshot) {
+    resetBaseline(state);
     return emptyView("unavailable", "实时输入不可用", {
       selectedDevice: target.device,
     });
