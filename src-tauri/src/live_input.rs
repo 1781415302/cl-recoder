@@ -73,7 +73,7 @@ impl LiveInputClient {
 
         #[cfg(windows)]
         {
-            return win::snapshot_named_pipe(&self.pipe_name, inner, budget_end);
+            win::snapshot_named_pipe(&self.pipe_name, inner, budget_end)
         }
         #[cfg(not(windows))]
         {
@@ -115,25 +115,25 @@ fn err_reply(code: LiveErrorCode, message: impl Into<String>) -> LiveSnapshotRep
     }
 }
 
-fn encode_request_line() -> Result<Vec<u8>, LiveSnapshotReply> {
+fn encode_request_line() -> Result<Vec<u8>, Box<LiveSnapshotReply>> {
     let req = LiveSnapshotRequest {
         protocol_version: LIVE_PROTOCOL_VERSION,
     };
     let mut line = serde_json::to_vec(&req).map_err(|e| {
-        err_reply(
+        Box::new(err_reply(
             LiveErrorCode::Protocol,
             format!("序列化实时请求失败: {e}"),
-        )
+        ))
     })?;
     line.push(b'\n');
     if line.len() > LIVE_MAX_REQUEST_BYTES {
-        return Err(err_reply(
+        return Err(Box::new(err_reply(
             LiveErrorCode::Protocol,
             format!(
                 "实时请求超长（{} 字节 > {LIVE_MAX_REQUEST_BYTES}）",
                 line.len()
             ),
-        ));
+        )));
     }
     Ok(line)
 }
@@ -274,7 +274,7 @@ fn snapshot_with_transport(
 ) -> LiveSnapshotReply {
     let line = match encode_request_line() {
         Ok(l) => l,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
 
     // 尝试复用缓存连接
@@ -649,12 +649,12 @@ mod win {
     ) -> LiveSnapshotReply {
         let line = match encode_request_line() {
             Ok(l) => l,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
 
         if let Some(mut conn) = inner.cached.take() {
-            if let PipeConn::Win(ref mut w) = conn {
-                match exchange_win(w, &line, budget_end) {
+            match &mut conn {
+                PipeConn::Win(w) => match exchange_win(w, &line, budget_end) {
                     Ok(reply) => {
                         inner.cached = Some(conn);
                         return reply;
@@ -667,9 +667,11 @@ mod win {
                         conn.cancel_close();
                         // 失效连接：预算内重连一次
                     }
+                },
+                #[cfg(test)]
+                PipeConn::Test(_) => {
+                    conn.cancel_close();
                 }
-            } else {
-                conn.cancel_close();
             }
         }
 
@@ -705,6 +707,7 @@ mod win {
     }
 
     /// 将 CreateFileW 风格错误码映射为种类（单测用）。
+    #[cfg(test)]
     pub(super) fn map_open_hresult(code: HRESULT) -> IoKind {
         if code == ERROR_FILE_NOT_FOUND.to_hresult() {
             IoKind::NotRunning
@@ -1002,11 +1005,8 @@ mod tests {
                 }
             }
             fn read_line_deadline(&mut self, _: usize, _: Instant) -> Result<Vec<u8>, IoFail> {
-                if self.id == 1 {
-                    Ok(ok_empty_line())
-                } else {
-                    Ok(ok_empty_line())
-                }
+                let _ = self.id;
+                Ok(ok_empty_line())
             }
             fn cancel_close(&mut self) {}
         }
@@ -1199,7 +1199,7 @@ mod tests {
                         let deadline = Instant::now() + Duration::from_secs(2);
                         loop {
                             let r = unsafe {
-                                GetOverlappedResult(server, &mut ov, &mut transferred, false)
+                                GetOverlappedResult(server, &ov, &mut transferred, false)
                             };
                             if r.is_ok() {
                                 break;
@@ -1268,7 +1268,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut n = 0u32;
-                    if unsafe { GetOverlappedResult(server, &mut ov_req, &mut n, false) }.is_ok() {
+                    if unsafe { GetOverlappedResult(server, &ov_req, &mut n, false) }.is_ok() {
                         break;
                     }
                     if Instant::now() >= deadline {
@@ -1291,7 +1291,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut wn = 0u32;
-                    if unsafe { GetOverlappedResult(server, &mut ovw, &mut wn, false) }.is_ok() {
+                    if unsafe { GetOverlappedResult(server, &ovw, &mut wn, false) }.is_ok() {
                         break;
                     }
                     if Instant::now() >= deadline {
@@ -1363,7 +1363,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut n = 0u32;
-                    if unsafe { GetOverlappedResult(server, &mut ov_req, &mut n, false) }.is_ok() {
+                    if unsafe { GetOverlappedResult(server, &ov_req, &mut n, false) }.is_ok() {
                         break;
                     }
                     if Instant::now() >= deadline {
@@ -1383,7 +1383,7 @@ mod tests {
                 let wait_deadline = Instant::now() + Duration::from_secs(3);
                 loop {
                     let mut n = 0u32;
-                    let r = unsafe { GetOverlappedResult(server, &mut ov, &mut n, false) };
+                    let r = unsafe { GetOverlappedResult(server, &ov, &mut n, false) };
                     if r.is_ok()
                         || r
                             .as_ref()
@@ -1395,13 +1395,13 @@ mod tests {
                     }
                     if Instant::now() >= wait_deadline {
                         let _ = unsafe {
-                            windows::Win32::System::IO::CancelIoEx(server, Some(&mut ov))
+                            windows::Win32::System::IO::CancelIoEx(server, Some(&ov))
                         };
                         // 再等到收尾
                         loop {
                             let mut n2 = 0u32;
                             let r2 =
-                                unsafe { GetOverlappedResult(server, &mut ov, &mut n2, false) };
+                                unsafe { GetOverlappedResult(server, &ov, &mut n2, false) };
                             if r2.is_ok()
                                 || r2.as_ref().err().map(|e| {
                                     e.code()
