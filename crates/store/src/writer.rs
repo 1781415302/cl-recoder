@@ -9,6 +9,8 @@
 //!   ——flush 失败绝不丢计数、绝不 panic（PLAN §9.4）；
 //!   motion-dpi §4.4：新两类运动增量（mouse_motion/stick_motion）与旧统计**同一个事务**，
 //!   任一部分失败全回滚；空批次提前返回判定纳入运动字段（纯热度批也必须落库）；
+//!   input-live-trigger §4.5：[`Writer::flush_with_triggers`] 在同事务追加扳机热力行，
+//!   原 [`Writer::flush`] 委托空扳机切片；FlushBatch 字段不扩展；
 //! - [`Writer::register_mouse_source`] / [`Writer::update_mouse_source_state`] /
 //!   [`Writer::manual_dpi`]：来源元数据/手动配置（不是增量，幂等可重试；SQL 在 [`crate::motion`]）；
 //! - [`Writer::rebuild_wp_tables`] / [`rebuild_wp_tables_with`]：WhatPulse 导入单事务整体重建
@@ -25,8 +27,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::motion::{
-    self as motion_sql, dpi_origin_to_text, stick_side_to_text, validate_mouse_motion_write,
-    validate_finite_nonneg, MouseConfigRow, MouseMotionWrite, StickMotionWrite,
+    self as motion_sql, dpi_origin_to_text, stick_side_to_text, trigger_side_to_text,
+    validate_mouse_motion_write, validate_finite_nonneg, MouseConfigRow, MouseMotionWrite,
+    StickMotionWrite, TriggerHeatWrite,
 };
 use crate::reader::{
     WpAppDailyRow, WpComboDailyRow, WpKeyDailyRow, WpMetaRow, WpMouseButtonDailyRow,
@@ -140,24 +143,32 @@ impl Writer {
         Ok(id)
     }
 
-    /// 单事务批量 upsert（PLAN §4.5）：
+    /// 单事务批量 upsert（PLAN §4.5）：原签名保留，委托 [`Self::flush_with_triggers`]
+    /// 并传空扳机切片。
+    pub fn flush(&self, b: &FlushBatch) -> Result<()> {
+        self.flush_with_triggers(b, &[])
+    }
+
+    /// 原统计及新扳机热力行在一个事务提交或回滚（§4.5）；两者都空才跳过。
+    ///
     /// `INSERT ... ON CONFLICT DO UPDATE count = count + excluded.count`
     /// （app_daily 的 foreground_secs/key_count/click_count 三列同语义累加；
     ///  mouse_move_daily 的 distance_inches 同语义累加）。
     ///
     /// motion-dpi §4.4：`mouse_motion`（按 来源×日×DPI 桶）与 `stick_motion`
     /// （motion 行 + 热度 bins，空 bin 不落行）在同一事务内追加——任何部分失败全回滚；
-    /// 空批次提前返回判定纳入两类运动字段（只有保持帧产生的热度也必须落库）。
+    /// 空批次提前返回判定纳入运动字段与扳机切片（纯扳机批 / 纯热度批也必须落库）。
     ///
     /// 同时把本批涉及设备的 `last_seen` 刷新一次（"节流：每 flush 一次"的落地处）。
     /// 失败语义：任一步出错整批回滚并返回 Err；调用方保留聚合桶、下个 tick 重试——绝不丢计数。
-    pub fn flush(&self, b: &FlushBatch) -> Result<()> {
+    pub fn flush_with_triggers(&self, b: &FlushBatch, triggers: &[TriggerHeatWrite]) -> Result<()> {
         if b.input.is_empty()
             && b.combos.is_empty()
             && b.apps.is_empty()
             && b.mouse_move.is_empty()
             && b.mouse_motion.is_empty()
             && b.stick_motion.is_empty()
+            && triggers.is_empty()
         {
             return Ok(());
         }
@@ -271,6 +282,36 @@ impl Writer {
                         )));
                     }
                     stmt.execute(params![w.device_id, w.day, side, bin_id, count_to_i64(bin.dwell_us)?])?;
+                }
+            }
+        }
+        // 扳机热力行（§6.1"空 bin 不写行"：dwell_us=0 跳过；同键累加）
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(device_id, day, trigger, bin) DO UPDATE SET
+                   dwell_us = dwell_us + excluded.dwell_us",
+            )?;
+            for w in triggers {
+                let side = trigger_side_to_text(w.side);
+                for bin in &w.bins {
+                    if bin.dwell_us == 0 {
+                        continue;
+                    }
+                    let bin_id = i64::from(bin.bin);
+                    if bin_id > 100 {
+                        return Err(StoreError::InvalidMotionField(format!(
+                            "扳机热力格号 {bin_id} 超出 0..=100"
+                        )));
+                    }
+                    stmt.execute(params![
+                        w.device_id,
+                        w.day,
+                        side,
+                        bin_id,
+                        count_to_i64(bin.dwell_us)?
+                    ])?;
                 }
             }
         }
@@ -427,13 +468,13 @@ pub fn rebuild_wp_tables_with(conn: &Connection, b: &WpImportBatch) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::{MouseMotionWrite, StickMotionWrite};
+    use crate::motion::{MouseMotionWrite, StickMotionWrite, TriggerHeatWrite};
     use crate::testutil::TempDb;
     use clrecoder_core::codes::{mods, DeviceKind};
     use clrecoder_core::event::DeviceKey;
     use clrecoder_core::motion::{
         DpiOrigin, DpiProbeStatus, MotionConnectionId, MotionStamp, MouseSourceDescriptor,
-        MouseSourceState, StickBinDelta, StickSide,
+        MouseSourceState, StickBinDelta, StickSide, TriggerBinDelta, TriggerSide,
     };
 
     fn open_writer(tag: &str) -> (TempDb, Writer) {
@@ -1100,5 +1141,130 @@ mod tests {
         assert!(r1.connected);
         assert_eq!(r1.auto_dpi, Some(800));
         assert_eq!(r1.effective_dpi, Some(800));
+        assert_eq!(r1.source_key, "k1");
+    }
+
+    /// S3：纯扳机批可写（空 FlushBatch + 非空 triggers 不得被当成空批跳过）。
+    #[test]
+    fn trigger_flush_pure_trigger_batch_writes() {
+        let (_db, w) = open_writer("trigger-pure-batch");
+        let gp = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Gamepad,
+                vid: 3,
+                pid: 4,
+                name: "GP".into(),
+            })
+            .unwrap();
+        w.flush_with_triggers(
+            &FlushBatch::default(),
+            &[TriggerHeatWrite {
+                device_id: gp,
+                day: MOTION_DAY.into(),
+                side: TriggerSide::Left,
+                bins: vec![
+                    TriggerBinDelta { bin: 25, dwell_us: 40_000 },
+                    TriggerBinDelta { bin: 50, dwell_us: 0 }, // 空格不落行
+                ],
+            }],
+        )
+        .unwrap();
+        // 同键累加
+        w.flush_with_triggers(
+            &FlushBatch::default(),
+            &[TriggerHeatWrite {
+                device_id: gp,
+                day: MOTION_DAY.into(),
+                side: TriggerSide::Left,
+                bins: vec![TriggerBinDelta { bin: 25, dwell_us: 10_000 }],
+            }],
+        )
+        .unwrap();
+        {
+            let conn = w.lock_conn();
+            let rows: Vec<(String, i64, i64)> = conn
+                .prepare(
+                    "SELECT trigger, bin, dwell_us FROM gamepad_trigger_heat_daily
+                     WHERE device_id=?1 ORDER BY trigger, bin",
+                )
+                .unwrap()
+                .query_map(params![gp], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert_eq!(rows, vec![("left".into(), 25, 50_000)]);
+        }
+        // flush 空扳机切片仍可写普通批（须先释放 lock_conn，避免自死锁）
+        w.flush(&FlushBatch {
+            stick_motion: vec![StickMotionWrite {
+                device_id: gp,
+                day: MOTION_DAY.into(),
+                side: StickSide::Left,
+                active_us: 1_000,
+                travel_r: 0.0,
+                bins: vec![],
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// S3：混合批中扳机 FK 失败 → 整批回滚（含合法 input 前半）。
+    #[test]
+    fn trigger_flush_mixed_batch_rolls_back_on_trigger_error() {
+        let (_db, w) = open_writer("trigger-mixed-rollback");
+        let dev = w
+            .get_or_create_device(&DeviceKey {
+                kind: DeviceKind::Keyboard,
+                vid: 0,
+                pid: 0,
+                name: "K".into(),
+            })
+            .unwrap();
+        let err = w
+            .flush_with_triggers(
+                &FlushBatch {
+                    input: vec![(dev, MOTION_DAY.into(), 0x1E, 7)],
+                    ..Default::default()
+                },
+                &[TriggerHeatWrite {
+                    device_id: 999, // 不存在 → FK
+                    day: MOTION_DAY.into(),
+                    side: TriggerSide::Right,
+                    bins: vec![TriggerBinDelta { bin: 100, dwell_us: 1_000 }],
+                }],
+            )
+            .unwrap_err();
+        let _ = err;
+        {
+            let conn = w.lock_conn();
+            for table in ["input_daily", "gamepad_trigger_heat_daily"] {
+                let n: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 0, "{table} 必须整批回滚");
+            }
+        }
+        // 越界 bin 同样回滚（先释放 lock_conn）
+        let err = w
+            .flush_with_triggers(
+                &FlushBatch {
+                    input: vec![(dev, MOTION_DAY.into(), 0x1E, 1)],
+                    ..Default::default()
+                },
+                &[TriggerHeatWrite {
+                    device_id: dev,
+                    day: MOTION_DAY.into(),
+                    side: TriggerSide::Left,
+                    bins: vec![TriggerBinDelta { bin: 101, dwell_us: 1 }],
+                }],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("扳机热力格号"), "{err}");
+        let conn = w.lock_conn();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM input_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

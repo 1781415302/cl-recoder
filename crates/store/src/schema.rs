@@ -1,5 +1,6 @@
 //! schema v1 完整 DDL 与幂等迁移（PLAN §4.5 逐字对齐）+ v2 增量（昵称/鼠标移动距离）
-//! + v3 增量（motion-dpi §6.1：鼠标运动来源/逐日 DPI 桶、手柄摇杆运动/热度四张新表）。
+//! + v3 增量（motion-dpi §6.1：鼠标运动来源/逐日 DPI 桶、手柄摇杆运动/热度四张新表）
+//! + v4 增量（input-live-trigger §6.1：手柄扳机热力表）。
 //!
 //! [`migrate`]：建 devices/input_daily/combo_daily/app_daily 与 wp_* 七张导入镜像表 +
 //! 索引 idx_input_daily_day；连接级 PRAGMA journal_mode=WAL、synchronous=NORMAL、foreign_keys=ON；
@@ -13,8 +14,8 @@ use rusqlite::Connection;
 
 use crate::{Result, StoreError};
 
-/// 当前 schema 版本（v3 = motion-dpi 四张运动表，§6.1）。
-pub const SCHEMA_VERSION: i64 = 3;
+/// 当前 schema 版本（v4 = motion-dpi 四表 + 扳机热力表，§6.1）。
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// schema v1 完整 DDL——PLAN §4.5 逐字拷贝（仅去掉块首的 PRAGMA 行：PRAGMA 由 [`migrate`]
 /// 以连接级调用执行，不能放进事务内批处理——SQLite 不允许事务内切换 WAL）。
@@ -117,6 +118,21 @@ CREATE TABLE gamepad_heat_daily(
 CREATE INDEX idx_gamepad_heat_day ON gamepad_heat_daily(day);
 ";
 
+/// schema v4 增量（input-live-trigger §6.1 逐字拷贝——唯一新增业务表）：
+/// 手柄扳机逐日热力表（101 格 0..=100；空 bin 不落行；FK/CHECK 持久合同）。
+/// 旧表/旧行一律不删除；不改既有业务表及用户配置。
+pub(crate) const SCHEMA_V4_SQL: &str = "
+CREATE TABLE gamepad_trigger_heat_daily(
+  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  day TEXT NOT NULL,
+  trigger TEXT NOT NULL CHECK(trigger IN('left','right')),
+  bin INTEGER NOT NULL CHECK(bin BETWEEN 0 AND 100),
+  dwell_us INTEGER NOT NULL CHECK(dwell_us>0),
+  PRIMARY KEY(device_id,day,trigger,bin)
+);
+CREATE INDEX idx_gamepad_trigger_heat_day ON gamepad_trigger_heat_daily(day);
+";
+
 /// 连接级 PRAGMA（PLAN §4.5）：
 /// - `journal_mode=WAL`：持久化在库文件中，两进程并发读写的数据集成点（§9.1-1）；
 /// - `synchronous=NORMAL`、`foreign_keys=ON`：连接级，每次打开连接都要重设。
@@ -166,6 +182,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             1 => tx.execute_batch(SCHEMA_V1_SQL)?,
             2 => tx.execute_batch(SCHEMA_V2_SQL)?,
             3 => tx.execute_batch(SCHEMA_V3_SQL)?,
+            4 => tx.execute_batch(SCHEMA_V4_SQL)?,
             // 不可达防御：循环条件保证 next <= SCHEMA_VERSION，且过新版本已在循环前拒绝。
             _ => return Err(StoreError::SchemaTooNew { found: next, supported: SCHEMA_VERSION }),
         }
@@ -210,7 +227,7 @@ mod tests {
     use rusqlite::params;
 
     /// §8-S4 验收点：建表幂等——两次 migrate 均成功，版本记录为当前版本，
-    /// 全部业务表 + 索引存在（v1 七张 wp + v2 mouse_move_daily + v3 四张运动表）。
+    /// 全部业务表 + 索引存在（v1 七张 wp + v2 mouse_move_daily + v3 四张运动表 + v4 扳机热力）。
     #[test]
     fn migrate_is_idempotent_and_creates_all_objects() {
         let db = TempDb::new("schema-idempotent");
@@ -227,7 +244,7 @@ mod tests {
             .unwrap();
         assert_eq!(applied.len(), 25, "RFC3339 秒级带时区偏移: {applied}");
 
-        const TABLES: [&str; 16] = [
+        const TABLES: [&str; 17] = [
             "devices",
             "input_daily",
             "combo_daily",
@@ -244,6 +261,7 @@ mod tests {
             "mouse_motion_daily",
             "gamepad_motion_daily",
             "gamepad_heat_daily",
+            "gamepad_trigger_heat_daily",
         ];
         for name in TABLES {
             let n: i64 = conn
@@ -382,8 +400,8 @@ mod tests {
         (db, conn)
     }
 
-    /// §8-S2 验收点：v2 生产库升级 v3——migrate 只追加 v3 四张表与两个索引，
-    /// 旧表/旧行原样（不删除、不回写），重复迁移幂等。
+    /// §8-S2/S3 验收点：v2 生产库升级到当前版本——migrate 追加 v3 四表 + v4 扳机表，
+    /// 旧表/旧行原样（不删除、不回写），重复迁移幂等；轨迹 [1,2,3,4]。
     #[test]
     fn motion_dpi_v2_db_upgrade_appends_v3_and_preserves_old_rows() {
         let (_db, conn) = open_v2_db("schema-v2-upgrade");
@@ -413,21 +431,24 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        // 版本推进到 3，且 1/2 两条历史记录保留
+        // 版本推进到 4，且 1/2/3/4 历史记录保留
         let versions: Vec<i64> = {
             let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version").unwrap();
             stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
         };
-        assert_eq!(versions, vec![1, 2, SCHEMA_VERSION]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions.last().copied(), Some(SCHEMA_VERSION));
 
-        // v3 四张表 + 两个索引存在
+        // v3 四张表 + v4 扳机表 + 索引存在
         for (kind, name) in [
             ("table", "mouse_motion_sources"),
             ("table", "mouse_motion_daily"),
             ("table", "gamepad_motion_daily"),
             ("table", "gamepad_heat_daily"),
+            ("table", "gamepad_trigger_heat_daily"),
             ("index", "idx_mouse_motion_day"),
             ("index", "idx_gamepad_heat_day"),
+            ("index", "idx_gamepad_trigger_heat_day"),
         ] {
             let n: i64 = conn
                 .query_row(
@@ -657,7 +678,7 @@ mod tests {
         .unwrap();
     }
 
-    /// hardening-v4 §4.5(b)：迁移后插入 version=99，`migrate` 返回 SchemaTooNew{99,3} 且不修改任何表。
+    /// hardening-v4 §4.5(b)：迁移后插入 version=99，`migrate` 返回 SchemaTooNew{99,SCHEMA_VERSION} 且不修改任何表。
     #[test]
     fn migrate_rejects_schema_too_new_without_changes() {
         let db = TempDb::new("schema-too-new");
@@ -684,7 +705,6 @@ mod tests {
         match migrate(&conn) {
             Err(StoreError::SchemaTooNew { found, supported }) => {
                 assert_eq!((found, supported), (99, SCHEMA_VERSION));
-                assert_eq!(supported, 3);
             }
             other => panic!("期望 SchemaTooNew，实际 {other:?}"),
         }
@@ -695,14 +715,14 @@ mod tests {
         assert_eq!(rows_before, rows_after);
     }
 
-    /// `check_schema_not_newer`：新库 / v3 / v99 分别 Ok / Ok / Err。
+    /// `check_schema_not_newer`：新库 / 当前版本 / v99 分别 Ok / Ok / Err。
     #[test]
     fn check_schema_not_newer_cases() {
         let db = TempDb::new("schema-check-newer");
         let conn = Connection::open(db.as_ref()).unwrap();
         assert!(check_schema_not_newer(&conn).is_ok(), "新库");
         migrate(&conn).unwrap();
-        assert!(check_schema_not_newer(&conn).is_ok(), "v3");
+        assert!(check_schema_not_newer(&conn).is_ok(), "current");
         conn.execute(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'x')",
             [],
@@ -716,7 +736,209 @@ mod tests {
         .unwrap();
         assert!(matches!(
             check_schema_not_newer(&ro),
-            Err(StoreError::SchemaTooNew { found: 99, supported: 3 })
+            Err(StoreError::SchemaTooNew { found: 99, supported }) if supported == SCHEMA_VERSION
         ));
+    }
+
+
+    /// 手工搭出真实 v3 库（无 v4 表、版本记录止于 3）。
+    fn open_v3_db(tag: &str) -> (TempDb, Connection) {
+        let db = TempDb::new(tag);
+        let conn = Connection::open(db.as_ref()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(
+               version INTEGER PRIMARY KEY,
+               applied_at TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V1_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V2_SQL).unwrap();
+        conn.execute_batch(SCHEMA_V3_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO schema_migrations(version, applied_at)
+             VALUES (1, '2026-01-01T00:00:00+00:00'),
+                    (2, '2026-01-02T00:00:00+00:00'),
+                    (3, '2026-01-03T00:00:00+00:00');",
+        )
+        .unwrap();
+        (db, conn)
+    }
+
+    /// S3 验收：v3→v4 升级旧行逐项相等、幂等、仅追加扳机表与索引。
+    #[test]
+    fn trigger_v3_db_upgrade_appends_v4_and_preserves_old_rows() {
+        let (_db, conn) = open_v3_db("schema-v3-upgrade");
+        conn.execute(
+            "INSERT INTO devices(kind, vid, pid, name, nickname, first_seen, last_seen)
+             VALUES ('gamepad', 3, 4, '手柄', 'GP', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO devices(kind, vid, pid, name, first_seen, last_seen)
+             VALUES ('mouse', 1, 2, '鼠标', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mouse_motion_sources(source_key, device_id, physical, manual_dpi, first_seen, last_seen)
+             VALUES ('k1', 2, 1, 800, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mouse_motion_daily(source_id, day, dpi, dpi_origin, counts)
+             VALUES (1, '2026-09-28', 800, 'manual', 12.5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gamepad_motion_daily(device_id, day, stick, active_us, travel_r)
+             VALUES (1, '2026-09-28', 'left', 1500, 0.5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gamepad_heat_daily(device_id, day, stick, bin, dwell_us)
+             VALUES (1, '2026-09-28', 'left', 312, 1500)",
+            [],
+        )
+        .unwrap();
+
+        // 升级前确认无 v4 表
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gamepad_trigger_heat_daily'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "真实 v3 fixture 不得已有 v4 表");
+
+        migrate(&conn).unwrap();
+
+        let versions: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(versions, vec![1, 2, 3, 4]);
+
+        for (kind, name) in [
+            ("table", "gamepad_trigger_heat_daily"),
+            ("index", "idx_gamepad_trigger_heat_day"),
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    [kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "缺 {kind} {name}");
+        }
+
+        // 旧行逐项相等
+        let (nick, key, counts, active, dwell): (Option<String>, String, f64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT nickname FROM devices WHERE id=1),
+                        (SELECT source_key FROM mouse_motion_sources WHERE id=1),
+                        (SELECT counts FROM mouse_motion_daily WHERE source_id=1),
+                        (SELECT active_us FROM gamepad_motion_daily WHERE device_id=1),
+                        (SELECT dwell_us FROM gamepad_heat_daily WHERE device_id=1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(nick.as_deref(), Some("GP"));
+        assert_eq!(key, "k1");
+        assert_eq!(counts, 12.5);
+        assert_eq!((active, dwell), (1500, 1500));
+
+        // 幂等
+        migrate(&conn).unwrap();
+        let versions2: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+        };
+        assert_eq!(versions2, vec![1, 2, 3, 4]);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM gamepad_heat_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// S3 验收：v4 扳机表 CHECK/FK/PRIMARY KEY 逐项锚定。
+    #[test]
+    fn trigger_v4_ddl_constraints_hold() {
+        let db = TempDb::new("schema-v4-constraints");
+        let conn = Connection::open(db.as_ref()).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO devices(kind, vid, pid, name, first_seen, last_seen)
+             VALUES ('gamepad', 3, 4, '手柄', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        // trigger CHECK
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, '2026-09-28', 'center', 50, 1)",
+                [],
+            )
+            .is_err());
+        // bin BETWEEN 0 AND 100
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, '2026-09-28', 'left', 101, 1)",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, '2026-09-28', 'left', -1, 1)",
+                [],
+            )
+            .is_err());
+        // dwell_us > 0
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, '2026-09-28', 'left', 50, 0)",
+                [],
+            )
+            .is_err());
+        // FK
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (999, '2026-09-28', 'left', 50, 1)",
+                [],
+            )
+            .is_err());
+        // 边界可写
+        conn.execute(
+            "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+             VALUES (1, '2026-09-28', 'left', 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+             VALUES (1, '2026-09-28', 'right', 100, 2)",
+            [],
+        )
+        .unwrap();
+        // PRIMARY KEY 冲突
+        assert!(conn
+            .execute(
+                "INSERT INTO gamepad_trigger_heat_daily(device_id, day, trigger, bin, dwell_us)
+                 VALUES (1, '2026-09-28', 'left', 0, 9)",
+                [],
+            )
+            .is_err());
     }
 }
