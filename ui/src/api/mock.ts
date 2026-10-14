@@ -14,6 +14,7 @@ import type {
   ImportReport,
   KeyDailyRowLabeled,
   LegacyMouseSummary,
+  LiveSnapshotReply,
   MouseMotionDay,
   MouseMotionSummary,
   MouseSourceRow,
@@ -886,4 +887,144 @@ export async function mockGetGamepadMotion(deviceId: number, from: string, to: s
     trig.dwellSeconds = trig.dwellSeconds.map((v) => Math.round(v * 1000) / 1000);
   }
   return { availability: "ready", deviceId, gridSize: 25, left, right, triggers };
+}
+
+
+/* ===== 实时输入快照 mock（input-live-trigger §4.6 S7；确定性相位，无硬件/真实 IPC） ===== */
+
+/** 调用计数：驱动 held→释放→短按→摇杆/扳机→断连 的确定性相位 */
+let liveCallCount = 0;
+
+/** 测试接缝：重置相位（仅测试） */
+export function __resetMockLiveInputForTests(): void {
+  liveCallCount = 0;
+}
+
+const LIVE_KB_DEVICE = {
+  kind: "keyboard" as const,
+  vid: 0x046d,
+  pid: 0xc31c,
+  name: "Logitech K845 机械键盘",
+};
+const LIVE_MOUSE_DEVICE = {
+  kind: "mouse" as const,
+  vid: 0x046d,
+  pid: 0xc092,
+  name: "Logitech G102 游戏鼠标",
+};
+const LIVE_PAD_DEVICE = {
+  kind: "gamepad" as const,
+  vid: 0,
+  pid: 0,
+  name: "XInput 手柄",
+};
+const LIVE_MOUSE_SOURCE_KEY = "\\?\hid#vid_046d&pid_c092&mi_00";
+
+/**
+ * mockLiveInputSnapshot —— 确定性模拟 held、释放、短按、摇杆、扳机、断连。
+ * 同一 DTO 供 client 在非 Tauri / VITE_CLRECODER_MOCK 下使用。
+ */
+export async function mockLiveInputSnapshot(): Promise<LiveSnapshotReply> {
+  liveCallCount += 1;
+  const phase = (liveCallCount - 1) % 10;
+  const sampleSeq = String(liveCallCount);
+
+  // phase 8/9：模拟断连 / 不可用
+  if (phase >= 8) {
+    return {
+      protocolVersion: 1,
+      snapshot: null,
+      error: { code: "not_running", message: "实时输入不可用，请更新并启动采集器" },
+    };
+  }
+
+  const kbHeld = phase < 2 ? [0x1d, 0x1e] : phase === 2 ? [0x1d] : [];
+  const kbPresses =
+    phase === 3
+      ? [{ code: 0x39, pressSeq: String(liveCallCount), ageMs: 12 }]
+      : kbHeld.map((code, i) => ({
+          code,
+          pressSeq: String(10 + i),
+          ageMs: 200,
+        }));
+
+  const mouseHeld = phase === 4 ? [1] : [];
+  const mousePresses =
+    phase === 5
+      ? [{ code: 6, pressSeq: String(liveCallCount), ageMs: 8 }]
+      : mouseHeld.map((code) => ({ code, pressSeq: "3", ageMs: 100 }));
+
+  const padReady = phase !== 7;
+  const stickT = phase * 0.12;
+  const analog = padReady
+    ? {
+        leftStick: { x: Math.cos(stickT) * 0.7, y: Math.sin(stickT) * 0.7 },
+        rightStick: { x: 0.2, y: -0.4 },
+        leftTrigger: Math.min(1, phase * 0.15),
+        rightTrigger: Math.min(1, 0.1 + phase * 0.1),
+      }
+    : null;
+
+  return {
+    protocolVersion: 1,
+    snapshot: {
+      sessionId: "mock-session-1",
+      sampleSeq,
+      resetEpoch: "0",
+      statisticsPaused: phase === 6,
+      captureState: "active",
+      rawInputAgeMs: 16,
+      sources: [
+        {
+          kind: "keyboard",
+          sourceId: "kb-src-1",
+          device: LIVE_KB_DEVICE,
+          digital: { heldCodes: kbHeld, presses: kbPresses },
+        },
+        {
+          kind: "mouse",
+          sourceId: "ms-src-1",
+          device: LIVE_MOUSE_DEVICE,
+          sourceKey: LIVE_MOUSE_SOURCE_KEY,
+          digital: { heldCodes: mouseHeld, presses: mousePresses },
+        },
+        {
+          kind: "gamepad",
+          sourceId: "pad-slot-0",
+          device: LIVE_PAD_DEVICE,
+          slot: 0,
+          connectionId: "1",
+          availability: padReady ? "ready" : "unavailable",
+          ageMs: padReady ? 20 : 800,
+          digital: {
+            heldCodes: phase === 1 ? [1] : [],
+            presses:
+              phase === 1
+                ? [{ code: 1, pressSeq: "5", ageMs: 50 }]
+                : [],
+          },
+          analog,
+          unsupportedCodes: [11],
+        },
+        {
+          kind: "gamepad",
+          sourceId: "pad-slot-1",
+          device: LIVE_PAD_DEVICE,
+          slot: 1,
+          connectionId: "2",
+          availability: "ready",
+          ageMs: 30,
+          digital: { heldCodes: [], presses: [] },
+          analog: {
+            leftStick: { x: 0, y: 0 },
+            rightStick: { x: 0, y: 0 },
+            leftTrigger: 0,
+            rightTrigger: 0,
+          },
+          unsupportedCodes: [],
+        },
+      ],
+    },
+    error: null,
+  };
 }
