@@ -1,4 +1,4 @@
-// 运动展示纯函数与控件几何（motion-dpi §4.6 S7）——热力归一化 / 里程与 DPI 文案 / 鼠标·手柄控件几何。
+// 运动展示纯函数与控件几何（motion-dpi §4.6 + input-live-trigger §4.7 S8）——热力归一化 / 里程与 DPI 文案 / 鼠标·手柄控件几何 / 外壳与扳机热力。
 //
 // 边界：纯模块，零运行时 import（type 擦除后产物无 import/require/DOM/时钟，由 motion-presentation 测试锚定，
 // 同 deviceLayouts.ts 惯例）；只做展示层换算，不查询 API；控件几何是本轮固定的参考模板
@@ -173,6 +173,8 @@ export interface MotionControlSpec {
   h: number;
   /** 实际点击区域（≥44×44、两两不重叠；可比视觉略大以吸收边距） */
   hit: { x: number; y: number; w: number; h: number };
+  /** 可选 SVG path（画布坐标）；有则皮肤用 path，不另硬编码几何 */
+  visualPath?: string;
 }
 
 export interface MotionCanvasSize {
@@ -491,6 +493,128 @@ export function motionControlSpecs(
   const list = CONTROL_LISTS[kind];
   if (!list) throw new Error(`未知控件种类: ${String(kind)}`);
   return list;
+}
+
+/* ===== 外设外壳与扳机热力（input-live-trigger §4.7 S8） ===== */
+
+export interface PeripheralShellSpec {
+  bodyPath: string;
+  seamPaths: readonly string[];
+  stickWells: readonly {
+    side: "left" | "right";
+    code: 12 | 13;
+    cx: number;
+    cy: number;
+    radius: number;
+  }[];
+}
+
+const MOUSE_SHELL: PeripheralShellSpec = Object.freeze({
+  bodyPath:
+    "M160 14C77 14 34 64 34 144v126c0 54 42 76 126 76s126-22 126-76V144C286 64 243 14 160 14Z",
+  seamPaths: Object.freeze([
+    "M34 184h252M160 14v170",
+    "M102 315q58 20 116 0",
+  ]),
+  stickWells: Object.freeze([]),
+});
+
+const GAMEPAD_SHELL: PeripheralShellSpec = Object.freeze({
+  bodyPath:
+    "M104 65C77 70 63 94 55 131L33 260c-8 43 4 66 27 66 26 0 43-22 68-66l23-31c34 33 91 60 159 60s125-27 159-60l23 31c25 44 42 66 68 66 23 0 35-23 27-66l-22-129c-8-37-22-61-49-66-67-12-131 20-206 20S171 53 104 65Z",
+  seamPaths: Object.freeze([
+    "M77 270q10 23 21 3M543 270q-10 23-21 3M165 117q145 23 290 0",
+  ]),
+  stickWells: Object.freeze([
+    Object.freeze({
+      side: "left" as const,
+      code: 12 as const,
+      cx: 130,
+      cy: 178,
+      radius: 34,
+    }),
+    Object.freeze({
+      side: "right" as const,
+      code: 13 as const,
+      cx: 365,
+      cy: 258,
+      radius: 32,
+    }),
+  ]),
+});
+
+const SHELL_SPECS: Record<"mouse" | "gamepad", PeripheralShellSpec> = {
+  mouse: MOUSE_SHELL,
+  gamepad: GAMEPAD_SHELL,
+};
+
+/** 外设外壳几何：同一 kind 恒返回同一冻结模板 */
+export function peripheralShellSpec(
+  kind: "mouse" | "gamepad",
+): PeripheralShellSpec {
+  const spec = SHELL_SPECS[kind];
+  if (!spec) throw new Error(`未知外壳种类: ${String(kind)}`);
+  return spec;
+}
+
+/** 扳机热力单格（§4.7）：bin=0..100 对应行程 0%..100%；intensity=sqrt(seconds/scaleMax) */
+export interface TriggerHeatCell {
+  bin: number;
+  percent: number;
+  seconds: number;
+  intensity: number;
+}
+
+const TRIGGER_BINS = 101;
+
+/** 扳机热力格序列：输入恰 101 个秒数与 LT/RT 共同最大值；max<=0 全零强度。 */
+export function triggerHeatCells(
+  values: readonly number[],
+  scaleMaxSeconds: number,
+): TriggerHeatCell[] {
+  if (values.length !== TRIGGER_BINS) {
+    throw new Error(
+      `扳机热力数据必须恰好 ${TRIGGER_BINS} 格（0%～100%），实际 ${values.length} 格——上游合同错误，不补造数据`,
+    );
+  }
+  const scale =
+    typeof scaleMaxSeconds === "number" &&
+    Number.isFinite(scaleMaxSeconds) &&
+    scaleMaxSeconds > 0
+      ? scaleMaxSeconds
+      : 0;
+  const cells: TriggerHeatCell[] = [];
+  for (let bin = 0; bin < values.length; bin++) {
+    const seconds = values[bin];
+    let intensity = 0;
+    if (
+      scale > 0 &&
+      typeof seconds === "number" &&
+      Number.isFinite(seconds) &&
+      seconds > 0
+    ) {
+      intensity = Math.min(1, Math.sqrt(seconds / scale));
+    }
+    cells.push({ bin, percent: bin, seconds, intensity });
+  }
+  return cells;
+}
+
+/** 摇杆点画布坐标（§4.7）：先径向裁到单位圆（对角仍保持方向），再 cx+x*r / cy-y*r（Y 向上）。 */
+export function stickTipPosition(
+  well: { cx: number; cy: number; radius: number },
+  x: number,
+  y: number,
+): { x: number; y: number } {
+  const rawX = Number.isFinite(x) ? x : 0;
+  const rawY = Number.isFinite(y) ? y : 0;
+  const len = Math.hypot(rawX, rawY);
+  const px = len > 1 ? rawX / len : rawX;
+  const py = len > 1 ? rawY / len : rawY;
+  return {
+    x: well.cx + px * well.radius,
+    y: well.cy - py * well.radius,
+  };
 }
 
 /* ===== 鼠标来源选择类型（MouseSourcePicker 用；§4.6 原样） ===== */
