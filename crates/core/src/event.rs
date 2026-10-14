@@ -294,6 +294,8 @@ mod tests {
             stamp: MotionStamp { mono_us: 77_000, unix_us: 1_780_272_000_077_000 },
             left: StickPoint { x: -0.5, y: 1.0 },
             right: StickPoint { x: 0.0, y: -1.0 },
+            left_trigger: 0.0,
+            right_trigger: 1.0,
             control: MotionControlSnapshot { epoch: 3, paused: false },
         });
         let disconnected =

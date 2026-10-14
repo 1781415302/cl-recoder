@@ -192,6 +192,10 @@ pub struct GamepadMotionFrame {
     pub left: StickPoint,
     /// 右摇杆点
     pub right: StickPoint,
+    /// 左扳机行程（raw/255，0..1）
+    pub left_trigger: f64,
+    /// 右扳机行程（raw/255，0..1）
+    pub right_trigger: f64,
     /// 捕获时的暂停控制快照
     pub control: MotionControlSnapshot,
 }
@@ -253,7 +257,6 @@ pub struct TriggerBinDelta {
 
 /// 扳机按日增量（§4.2）：tracker 回吐的稀疏格增量，按本地日拆分。
 ///
-/// 帧字段扩展（`GamepadMotionFrame` 加 LT/RT）属 S5，本模块此处只落地类型/常量。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TriggerDayDelta {
     /// 归属日（`YYYY-MM-DD` 本地时区）
@@ -433,6 +436,8 @@ mod tests {
             stamp: MotionStamp { mono_us: 999, unix_us: 1_780_272_000_000_000 },
             left: StickPoint { x: 0.5, y: -0.5 },
             right: StickPoint { x: 0.0, y: 1.0 },
+            left_trigger: 0.25,
+            right_trigger: 64.0 / 255.0,
             control: MotionControlSnapshot { epoch: 2, paused: false },
         };
         let s = serde_json::to_string(&frame).unwrap();
@@ -441,6 +446,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["left"]["x"], serde_json::json!(0.5));
         assert_eq!(v["right"]["y"], serde_json::json!(1.0));
+        assert_eq!(v["left_trigger"], serde_json::json!(0.25));
+        assert_eq!(v["right_trigger"], serde_json::json!(64.0 / 255.0));
         assert_eq!(v["control"]["epoch"], serde_json::json!(2));
 
         let travel = MouseTravelDelta {

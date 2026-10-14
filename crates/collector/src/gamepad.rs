@@ -1,6 +1,6 @@
 //! 手柄采集线程（PLAN §4.6 gamepad.rs 契约，gilrs xinput 后端 + motion-dpi §4.3 运动帧）。
 //!
-//! - `spawn(tx, motion)`：独立线程轮询 [`Gilrs::next_event`]（**非阻塞**）+ `sleep(8ms)`
+//! - `spawn(tx, motion, live)`：独立线程轮询 [`Gilrs::next_event`]（**非阻塞**）+ `sleep(8ms)`
 //!   （≈125Hz）——**维持原按钮/扳机循环与节拍不变**；同一循环内每 ≥20ms 经
 //!   [`XInputMotionSampler`] 直接 `XInputGetState` 采样完整四轴（与 gilrs 已 deadzone
 //!   过滤的轴缓存隔离，见 [`crate::xinput_motion`]），运动帧与按钮事件经同一 `tx` 送
@@ -58,26 +58,47 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 /// 采样同线程驱动。事件以 [`AggEvent::Input`] / [`AggEvent::GamepadMotion`] 投入 `tx`；
 /// 接收端（aggregator）关闭后线程自行退出；`producer_stop`（§4.3.1）后确定性退出
 /// ——main 退出屏障 join 本线程即覆盖按钮与摇杆两个生产路径。
-pub fn spawn(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) -> JoinHandle<()> {
+pub fn spawn(
+    tx: Sender<AggEvent>,
+    motion: Arc<MotionRuntime>,
+    live: Option<Arc<crate::live_input::LiveInputRuntime>>,
+) -> JoinHandle<()> {
     thread::Builder::new()
         .name("gamepad".to_string())
-        .spawn(move || run(tx, motion))
+        .spawn(move || run(tx, motion, live))
         .expect("创建 gamepad 采集线程失败")
 }
 
 /// 线程主体：轮询循环 panic 时记录并重建 gilrs 上下文继续（PLAN §9.4 catch_unwind 兜底）；
 /// 通道关闭（aggregator 已停止）或 `producer_stop` 则正常退出。
-fn run(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) {
+fn run(
+    tx: Sender<AggEvent>,
+    motion: Arc<MotionRuntime>,
+    live: Option<Arc<crate::live_input::LiveInputRuntime>>,
+) {
     loop {
         // §4.3.1：停机请求后不再重建上下文
         if motion.stop_requested() {
+            if let Some(l) = &live {
+                l.clear_gamepads();
+            }
             return;
         }
         // Gilrs 持有平台句柄（非 UnwindSafe），跨 catch_unwind 传递需断言；重建即全新
         // 状态（含摇杆 sampler——连接代际换代际），安全。
-        match catch_unwind(AssertUnwindSafe(|| poll_loop(tx.clone(), &motion))) {
-            Ok(()) => return,
+        match catch_unwind(AssertUnwindSafe(|| {
+            poll_loop(tx.clone(), &motion, live.as_deref())
+        })) {
+            Ok(()) => {
+                if let Some(l) = &live {
+                    l.clear_gamepads();
+                }
+                return;
+            }
             Err(_) => {
+                if let Some(l) = &live {
+                    l.clear_gamepads();
+                }
                 log::error!("gamepad 轮询线程 panic，{}ms 后重建上下文继续", RESTART_DELAY.as_millis());
                 thread::sleep(RESTART_DELAY);
             }
@@ -89,7 +110,11 @@ fn run(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) {
 /// 完整四轴 → sleep 8ms → 重复。
 /// 返回即线程退出（通道关闭 / aggregator 已停止 / `producer_stop`，§4.3.1）；
 /// 其余错误一律降级继续。
-fn poll_loop(tx: Sender<AggEvent>, motion: &Arc<MotionRuntime>) {
+fn poll_loop(
+    tx: Sender<AggEvent>,
+    motion: &Arc<MotionRuntime>,
+    live: Option<&crate::live_input::LiveInputRuntime>,
+) {
     // §4.3.1：init 重试检查 producer_stop——停机请求后不再重建，直接退出。
     let Some(mut gilrs) = init_gilrs(motion) else { return };
     // 启动时枚举一次已连接手柄（gilrs 对启动即插入的 pads 不补发 Connected）。
@@ -128,7 +153,7 @@ fn poll_loop(tx: Sender<AggEvent>, motion: &Arc<MotionRuntime>) {
             last_sample = Some(Instant::now());
             let stamp = motion.stamp();
             let control = motion.control();
-            for ev in sampler.sample(stamp, control, motion) {
+            for ev in sampler.sample(stamp, control, motion, live) {
                 if tx.send(ev).is_err() {
                     return; // 通道关闭：aggregator 已停止
                 }

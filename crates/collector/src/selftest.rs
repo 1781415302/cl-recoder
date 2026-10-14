@@ -233,6 +233,8 @@ pub fn run_inject(db: &Path) -> i32 {
                 stamp: MotionStamp { mono_us, unix_us: GP_BASE_UNIX_US + mono_us as i64 },
                 left: StickPoint { x: left.0, y: left.1 },
                 right: StickPoint { x: right.0, y: right.1 },
+                left_trigger: 0.0,
+                right_trigger: 0.0,
                 control: MotionControlSnapshot { epoch: 0, paused: false },
             })
         };
@@ -333,8 +335,8 @@ pub fn run_live(seconds: u64, db: &Path) -> i32 {
     let (tx2, rx2) = crossbeam_channel::unbounded::<AggEvent>();
     let agg = engine_loop::spawn(rx2, writer, Arc::clone(&flags), Arc::clone(&fg), status);
     let motion = MotionRuntime::offline(Arc::clone(&flags));
-    let raw = crate::raw_input::spawn(tx1.clone(), Arc::clone(&motion));
-    let _pad = crate::gamepad::spawn(tx1.clone(), Arc::clone(&motion));
+    let raw = crate::raw_input::spawn(tx1.clone(), Arc::clone(&motion), None);
+    let _pad = crate::gamepad::spawn(tx1.clone(), Arc::clone(&motion), None);
     let _apps = crate::apps::spawn(tx1.clone(), Arc::clone(&fg));
     drop(tx1); // 采集线程各自持有克隆；main 只作泵
 
@@ -578,6 +580,8 @@ mod tests {
             stamp: MotionStamp { mono_us: 20_000, unix_us: GP_BASE_UNIX_US + 20_000 },
             left: StickPoint { x: 1.0, y: 0.0 },
             right: StickPoint { x: 0.0, y: -1.0 },
+            left_trigger: 0.0,
+            right_trigger: 0.0,
             control: MotionControlSnapshot { epoch: 0, paused: false },
         }));
         assert_eq!(
