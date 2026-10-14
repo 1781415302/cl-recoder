@@ -63,7 +63,9 @@ use windows::Win32::System::Threading::CreateMutexW;
 
 use crate::apps::{EXE_UNKNOWN, FgState};
 use crate::ipc_server::{Flags, RuntimeStatus};
+use crate::live_input::LiveInputRuntime;
 use crate::motion_runtime::MotionRuntime;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 
 /// 单实例互斥体名（§5.1）。`Local\` 前缀 = 每交互会话一份——采集器按会话采集交互输入，
 /// 快速用户切换下各会话实例互不干扰（pipe 名为全局名，多会话并存属未定义部署形态）。
@@ -257,10 +259,13 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
     let (tx, rx) = crossbeam_channel::unbounded::<AggEvent>();
     let aggregator = engine_loop::spawn(rx, Arc::clone(&writer), Arc::clone(&flags), Arc::clone(&fg), Arc::clone(&status));
     let motion = MotionRuntime::start(Arc::clone(&writer), Arc::clone(&flags), tx.clone());
-    let raw_input_runner = raw_input::spawn(tx.clone(), Arc::clone(&motion));
-    let gamepad_handle = gamepad::spawn(tx.clone(), Arc::clone(&motion));
+    // input-live-trigger S5：构造 LiveInputRuntime + live-v1 pipe；生产者传 Some(runtime)。
+    let live = Arc::new(LiveInputRuntime::new(live_session_id()));
+    let raw_input_runner = raw_input::spawn(tx.clone(), Arc::clone(&motion), Some(Arc::clone(&live)));
+    let gamepad_handle = gamepad::spawn(tx.clone(), Arc::clone(&motion), Some(Arc::clone(&live)));
     let _apps = apps::spawn(tx, Arc::clone(&fg));
     let ipc = ipc_server::spawn(Arc::clone(&flags), Arc::clone(&status));
+    let live_srv = live_server::spawn(Arc::clone(&flags), live);
     // 显式 Info 事件代码（§4.1 受控类别）：service.started——有界日志的启动锚点
     if let Some(d) = &diagnostics {
         d.record(
@@ -308,6 +313,8 @@ fn run_service(db_override: Option<PathBuf>) -> i32 {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = ipc.join();
+    // live-v1 服务：accept 循环已轮询 shutdown（CancelIoEx），此处确定性 join。
+    let _ = live_srv.join();
     // 显式 Info 事件代码：service.stopped（§4.1）；同步写返回即落盘，随后 exit 不丢日志
     if let Some(d) = &diagnostics {
         d.record(Level::Info, "service.stopped", "collector 已优雅退出");
@@ -408,6 +415,16 @@ fn init_diagnostics_with(dir: PathBuf) -> Option<Arc<DiagnosticLog>> {
 fn init_logger() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
         .try_init();
+}
+
+/// 实时会话 ID（§4.1：PID:启动 unix µs；每次 collector 启动不同）。
+fn live_session_id() -> String {
+    let pid = unsafe { GetCurrentProcessId() };
+    let unix_us = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    };
+    format!("{pid}:{unix_us}")
 }
 
 /// 用法说明（stderr）。

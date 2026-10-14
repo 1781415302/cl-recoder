@@ -64,8 +64,12 @@ use windows::Win32::System::Power::{
     RegisterSuspendResumeNotification, UnregisterSuspendResumeNotification, HPOWERNOTIFY,
 };
 use windows::Win32::System::RemoteDesktop::{
-    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+    WTSFreeMemory, WTSQuerySessionInformationW, WTSRegisterSessionNotification,
+    WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION, WTSINFOEXW, WTSSessionInfoEx,
+    WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK,
 };
+use clrecoder_core::live_input::LiveCaptureState;
+use crate::live_input::{LiveCaptureToken, LiveInputRuntime, LiveMousePacket};
 use windows::Win32::UI::WindowsAndMessaging::{
     DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
     WM_POWERBROADCAST, WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT,
@@ -92,10 +96,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, PostThreadMessageW, SetTimer, SetWindowLongPtrW, TranslateMessage,
     GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA, GWLP_WNDPROC, HWND_MESSAGE, MSG, RI_KEY_BREAK,
-    RI_KEY_E0, RI_KEY_E1, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_HWHEEL,
-    RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_DOWN,
-    RI_MOUSE_WHEEL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_QUIT,
-    WM_TIMER,
+    RI_KEY_E0, RI_KEY_E1, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
+    RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
+    RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
+    RI_MOUSE_RIGHT_BUTTON_UP, RI_MOUSE_WHEEL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
+    WM_INPUT_DEVICE_CHANGE, WM_QUIT, WM_TIMER,
 };
 
 /// RAWMOUSE 按下边沿位掩码（左/右/中/X1/X2 的 down 标志；up 标志与滚轮标志不在此列）。
@@ -117,6 +122,45 @@ const TRAVEL_FLUSH_TIMER_ID: usize = 1;
 const WTS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// WTS 会话通知注册最多重试次数（不含首次）。
 const WTS_RETRY_MAX: u32 = 60;
+/// 会话锁定态查询失败后的重试间隔（§4.3：定时器每 1 秒重试）。
+const SESSION_QUERY_RETRY: Duration = Duration::from_secs(1);
+
+/// 查询当前会话是否未锁定（Win10/11：SessionFlags 1=unlock、0=lock）。
+/// `None` = 查询失败；不实现 Win7 反转。
+fn query_session_unlocked() -> Option<bool> {
+    let mut buf: windows::core::PWSTR = windows::core::PWSTR::null();
+    let mut bytes = 0u32;
+    // SAFETY: WTS_CURRENT_SESSION；成功后须 WTSFreeMemory。
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            None,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buf,
+            &mut bytes,
+        )
+    };
+    if ok.is_err() || buf.is_null() || bytes == 0 {
+        if !buf.is_null() {
+            unsafe { WTSFreeMemory(buf.0 as *mut _) };
+        }
+        return None;
+    }
+    // SAFETY: 缓冲区为 WTSINFOEXW；Level1.SessionFlags 为锁定态。
+    let flags = unsafe {
+        let info = &*(buf.0 as *const WTSINFOEXW);
+        let level1 = info.Data.WTSInfoExLevel1;
+        level1.SessionFlags
+    };
+    unsafe { WTSFreeMemory(buf.0 as *mut _) };
+    if flags == WTS_SESSIONSTATE_UNLOCK as i32 {
+        Some(true)
+    } else if flags == WTS_SESSIONSTATE_LOCK as i32 {
+        Some(false)
+    } else {
+        None
+    }
+}
 
 /// 会话/电源通知是否应清空键盘按下状态（hardening-v4 §4.1 判定表，纯函数）。
 ///
@@ -150,6 +194,8 @@ struct SessionNotify {
     wts_last_attempt: Option<Instant>,
     /// 挂起/恢复通知句柄（注册失败为 None）
     power: Option<HPOWERNOTIFY>,
+    /// 上次会话锁定态查询时刻（§4.3：unknown 时每 1s 重试）
+    session_query_last: Option<Instant>,
 }
 
 /// 记录 collector 显式诊断代码（限频由 DiagnosticLog 按代码执行；sink 未就绪时静默）。
@@ -196,7 +242,11 @@ impl RawInputRunner {
 /// 事件经 crossbeam channel 送 aggregator；线程体 panic / 初始化失败自动重启
 /// （1s 间隔、限频日志，§9.4 catch_unwind 兜底记录后继续）；重启前检查 `producer_stop`
 /// （§4.3.1），停机请求后不再重建。
-pub fn spawn(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) -> RawInputRunner {
+pub fn spawn(
+    tx: Sender<AggEvent>,
+    motion: Arc<MotionRuntime>,
+    live: Option<Arc<LiveInputRuntime>>,
+) -> RawInputRunner {
     let thread_id = Arc::new(AtomicU32::new(0));
     let handle = {
         let thread_id = Arc::clone(&thread_id);
@@ -205,7 +255,7 @@ pub fn spawn(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) -> RawInputRunner
             .spawn(move || {
                 // SAFETY: 仅读取当前线程 ID（无副作用），用于 stop_and_join 的 WM_QUIT 定向投递。
                 thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-                run(tx, motion);
+                run(tx, motion, live);
             })
             .expect("raw_input 线程创建失败（内存耗尽等进程级错误）")
     };
@@ -214,15 +264,16 @@ pub fn spawn(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) -> RawInputRunner
 
 /// 线程主体：消息循环 panic / 初始化失败 → 限频日志 + 1s 后重建窗口重试；
 /// 收到 WM_QUIT（[`RawInputRunner::stop_and_join`]）或 `producer_stop`（§4.3.1）才退出。
-fn run(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>) {
+fn run(tx: Sender<AggEvent>, motion: Arc<MotionRuntime>, live: Option<Arc<LiveInputRuntime>>) {
     let mut failures: u64 = 0;
     loop {
         // §4.3.1：注册失败/重试均须检查 producer_stop——停机请求后不再重建采集窗口
         if motion.stop_requested() {
             return;
         }
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| message_loop(&tx, &motion)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            message_loop(&tx, &motion, live.as_ref().map(Arc::clone))
+        }));
         match outcome {
             Ok(Ok(())) => return,
             Ok(Err(e)) => log_retry(
@@ -257,10 +308,14 @@ fn log_retry(failures: &mut u64, message: &str) {
 
 /// 建 message-only 窗口 → 注册三组 RIDEV_INPUTSINK|RIDEV_DEVNOTIFY → 枚举当前鼠标
 /// 预注册运动来源 → 25ms 批发定时器 → GetMessageW 消息循环；WM_QUIT 退出前排尾桶。
-fn message_loop(tx: &Sender<AggEvent>, motion: &Arc<MotionRuntime>) -> Result<(), String> {
+fn message_loop(
+    tx: &Sender<AggEvent>,
+    motion: &Arc<MotionRuntime>,
+    live: Option<Arc<LiveInputRuntime>>,
+) -> Result<(), String> {
     // 状态盒有意泄漏：窗口随线程退出被系统销毁时仍可能触发窗口过程，回收即悬垂；
     // 状态体量仅设备缓存 + 累计器（KB 级），进程驻留全程成本可忽略。
-    let state = Box::into_raw(Box::new(RawInputState::new(tx, Arc::clone(motion))));
+    let state = Box::into_raw(Box::new(RawInputState::new(tx, Arc::clone(motion), live)));
     let hwnd = unsafe { create_message_only_window(state) }
         .map_err(|e| format!("创建 message-only 窗口失败：{e}"))?;
     // 窗口退出清理守卫（§4.3）：注册失败 / WM_QUIT 正常退出 / unwind 三条路径都经 Drop
@@ -350,6 +405,8 @@ impl Drop for WindowGuard {
         // SAFETY: state 由 message_loop 以 Box::into_raw 产生且永不回收；Drop 在创建线程内
         // 执行，窗口过程不会并发访问（同线程）。
         unsafe { (*self.state).unregister_session_notifications(self.hwnd) };
+        // §4.3：窗口退出清 raw 来源并将实时门置 unknown（重建成功/注册/会话查询后才开放）。
+        unsafe { (*self.state).on_window_teardown() };
         // SAFETY: hwnd 由本线程 create_message_only_window 创建；Drop（正常结束或 unwind）
         // 都发生在创建线程内，满足 DestroyWindow 的线程归属约束。失败仅丢弃（重试路径
         // 自会再建新窗口）。
@@ -432,9 +489,12 @@ unsafe extern "system" fn raw_input_wndproc(
             // Safety: 指针由 message_loop 以 Box::into_raw 存入且不回收，本线程独占访问
             let state = &mut *ptr;
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let now = Instant::now();
                 state.on_flush_tick();
                 // hardening-v4 §4.1：WTS 注册失败时在本分支内以 ≥5s 间隔重试
-                state.retry_wts_registration(hwnd, Instant::now());
+                state.retry_wts_registration(hwnd, now);
+                // §4.3：RAW 心跳 + unknown 会话查询重试
+                state.on_live_timer(now);
             }))
             .is_err()
             {
@@ -507,10 +567,16 @@ struct RawInputState {
     buf: Vec<u64>,
     /// 会话/电源通知注册状态（hardening-v4 §4.1）
     session: SessionNotify,
+    /// 实时状态机（生产 Some；selftest None——不启动 live 门/不发布）
+    live: Option<Arc<LiveInputRuntime>>,
 }
 
 impl RawInputState {
-    fn new(tx: &Sender<AggEvent>, motion: Arc<MotionRuntime>) -> Self {
+    fn new(
+        tx: &Sender<AggEvent>,
+        motion: Arc<MotionRuntime>,
+        live: Option<Arc<LiveInputRuntime>>,
+    ) -> Self {
         Self {
             tx: tx.clone(),
             sources: SourceRegistry::new(),
@@ -520,6 +586,7 @@ impl RawInputState {
             motion_sources: HashMap::new(),
             buf: Vec::new(),
             session: SessionNotify::default(),
+            live,
         }
     }
 
@@ -548,6 +615,8 @@ impl RawInputState {
                     "raw_input.session_registered",
                     &format!("WTS 会话通知已注册（重试 {} 次）", self.session.wts_retries),
                 );
+                // §4.3：WTS 注册成功后、开启实时采集前查询当前会话锁定态。
+                self.refresh_live_capture_from_session(Instant::now(), false);
             }
             Err(e) => log::warn!(
                 "注册 WTS 会话通知失败（第 {} 次重试，≥5s 后再试，最多 {WTS_RETRY_MAX} 次）：{e}",
@@ -587,7 +656,8 @@ impl RawInputState {
         }
     }
 
-    /// 会话/电源通知：判定为复位事件时发 `KeyboardSourcesReset`（暂停态同样执行）。
+    /// 会话/电源通知：判定为复位事件时发 `KeyboardSourcesReset`（暂停态同样执行）；
+    /// 同时按 §4.3 推进实时会话门（统计策略不变）。
     fn on_session_event(&mut self, msg: u32, wparam: usize) {
         if session_event_resets_keyboard(msg, wparam) {
             let _ = self.tx.send(AggEvent::KeyboardSourcesReset);
@@ -596,11 +666,115 @@ impl RawInputState {
                 "raw_input.session_reset",
                 &format!("会话/电源事件（msg=0x{msg:X}, wParam={wparam}）已清空键盘按下状态"),
             );
+            self.on_live_session_event(msg, wparam);
+        }
+    }
+
+    /// 窗口退出：清 raw 实时来源并将门置 unknown。
+    fn on_window_teardown(&mut self) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        live.clear_raw_sources();
+        live.set_capture_state(LiveCaptureState::Unknown);
+    }
+
+    /// 25ms 定时器：RAW 心跳 + 会话 unknown 时每 1s 重试查询。
+    fn on_live_timer(&mut self, now: Instant) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        if let Some(token) = live.capture_token() {
+            live.touch_raw_input(token, now);
+        }
+        if !self.session.wts_registered {
+            return;
+        }
+        // 仅当仍为 unknown 时重试查询（已 active/suspended 由事件驱动）。
+        // 通过 capture_token 粗判：Unknown/Suspended 时 token 为 None；但 Suspended 不重试开门。
+        // 用 session_query_last 节流；若上次查询失败保持 unknown，1s 后再试。
+        let due = self
+            .session
+            .session_query_last
+            .is_none_or(|t| now.saturating_duration_since(t) >= SESSION_QUERY_RETRY);
+        if due && live.capture_token().is_none() {
+            // 可能是 Unknown（允许重试开门）或 Suspended（查询若已解锁则开门）。
+            // LOCK 事件已 Suspended；此处重试覆盖「注册后查询失败保持 unknown」。
+            self.refresh_live_capture_from_session(now, false);
+        }
+    }
+
+    /// LOCK/APMSUSPEND 关门；UNLOCK/RESUME/CONNECT 先显式复位再重查，确认后开门。
+    fn on_live_session_event(&mut self, msg: u32, wparam: usize) {
+        if self.live.is_none() {
+            return;
+        }
+        let Ok(w) = u32::try_from(wparam) else {
+            return;
+        };
+        let close = match msg {
+            WM_WTSSESSION_CHANGE => w == WTS_SESSION_LOCK,
+            WM_POWERBROADCAST => w == PBT_APMSUSPEND,
+            _ => false,
+        };
+        if close {
+            if let Some(live) = &self.live {
+                live.set_capture_state(LiveCaptureState::Suspended);
+            }
+            return;
+        }
+        let reopen = match msg {
+            WM_WTSSESSION_CHANGE => matches!(
+                w,
+                WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT
+            ),
+            WM_POWERBROADCAST => matches!(w, PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND),
+            _ => false,
+        };
+        if !reopen {
+            return;
+        }
+        // 先显式复位（即使随后仍 active 也清旧态——CONNECT 合同）。
+        if let Some(live) = &self.live {
+            live.set_capture_state(LiveCaptureState::Unknown);
+        }
+        let force_clear = msg == WM_WTSSESSION_CHANGE
+            && matches!(w, WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT);
+        self.refresh_live_capture_from_session(Instant::now(), force_clear);
+    }
+
+    /// 查询 `WTSSessionInfoEx`：SessionFlags 0=lock / 1=unlock（Win10/11）。
+    /// 未成功注册 WTS 时不开放实时门；查询失败保持 unknown。
+    fn refresh_live_capture_from_session(&mut self, now: Instant, force_clear_if_active: bool) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        if !self.session.wts_registered {
+            return;
+        }
+        self.session.session_query_last = Some(now);
+        match query_session_unlocked() {
+            Some(true) => {
+                live.set_capture_state(LiveCaptureState::Active);
+                if force_clear_if_active {
+                    // CONNECT：即使结果仍为 active 也要清旧状态——再调一次推进 epoch。
+                    live.set_capture_state(LiveCaptureState::Active);
+                }
+            }
+            Some(false) => {
+                live.set_capture_state(LiveCaptureState::Suspended);
+            }
+            None => {
+                // 查询失败：保持 unknown（显式写入，覆盖先前复位）。
+                live.set_capture_state(LiveCaptureState::Unknown);
+            }
         }
     }
 
     /// 处理一条 WM_INPUT（lparam = HRAWINPUT）。任何失败仅丢弃当条事件。
     fn on_wm_input(&mut self, lparam: LPARAM) {
+        // §4.3：令牌必须在原生取样/解包前捕获。
+        let live_token = self.live.as_ref().and_then(|l| l.capture_token());
         let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
         let hraw = HRAWINPUT(lparam.0 as *mut core::ffi::c_void);
         if self.buf.is_empty() {
@@ -655,7 +829,7 @@ impl RawInputState {
                 }
                 // Safety: 仅读取与 dwType 匹配的成员，且 n 已验证覆盖 header+RAWKEYBOARD
                 let kb = unsafe { &raw.data.keyboard };
-                self.handle_keyboard(raw.header.hDevice, kb);
+                self.handle_keyboard(raw.header.hDevice, kb, live_token);
             }
             t if t == RIM_TYPEMOUSE.0 => {
                 if n < header_size + std::mem::size_of::<RAWMOUSE>() as u32 {
@@ -663,7 +837,7 @@ impl RawInputState {
                 }
                 // Safety: 仅读取与 dwType 匹配的成员，且 n 已验证覆盖 header+RAWMOUSE
                 let mouse = unsafe { &raw.data.mouse };
-                self.handle_mouse(raw.header.hDevice, mouse);
+                self.handle_mouse(raw.header.hDevice, mouse, live_token);
             }
             _ => {} // 未注册的 RIM 类型（HID 等）：防御性忽略
         }
@@ -673,7 +847,12 @@ impl RawInputState {
     /// 自动重复、判定组合键）；MakeCode==0 且 VKey!=0 先 MapVirtualKeyW 预处理；
     /// 0xFF 溢出码与垃圾码在 core 归一化中丢弃（§4.1）。事件携带来源注册器分配的
     /// 连接 ID（§4.3：有效句柄即使型号解析失败也独立来源）。
-    fn handle_keyboard(&mut self, hdevice: HANDLE, kb: &RAWKEYBOARD) {
+    fn handle_keyboard(
+        &mut self,
+        hdevice: HANDLE,
+        kb: &RAWKEYBOARD,
+        live_token: Option<LiveCaptureToken>,
+    ) {
         // §4.1：make 取 RAWKEYBOARD.MakeCode 的低 8 位（windows 绑定中该字段为 u16）
         let sc =
             normalize_keyboard_event((kb.MakeCode & 0xFF) as u8, kb.Flags, kb.VKey, |vk| unsafe {
@@ -687,6 +866,9 @@ impl RawInputState {
             .sources
             .source_for(hdevice.0 as isize, DeviceKind::Keyboard);
         let device = self.devices.resolve(hdevice, DeviceKind::Keyboard);
+        if let (Some(live), Some(token)) = (self.live.as_ref(), live_token) {
+            live.keyboard_edge(token, source, &device, sc, down, Instant::now());
+        }
         let _ = self.tx.send(AggEvent::Input(RawEvent::Keyboard {
             source,
             device,
@@ -698,7 +880,12 @@ impl RawInputState {
     /// RAWMOUSE → 运动增量 counts + 按下边沿 `MouseClick` + 滚轮刻度（§4.6 累计器）。
     /// 滚轮**按来源**独立累计（§4.3/F5：两只鼠标的零头互不合并）；相对移动按
     /// motion-dpi §4.3 入移动桶（每包 hypot 一次，25ms 批发）。
-    fn handle_mouse(&mut self, hdevice: HANDLE, mouse: &RAWMOUSE) {
+    fn handle_mouse(
+        &mut self,
+        hdevice: HANDLE,
+        mouse: &RAWMOUSE,
+        live_token: Option<LiveCaptureToken>,
+    ) {
         let source = self
             .sources
             .source_for(hdevice.0 as isize, DeviceKind::Mouse);
@@ -712,6 +899,17 @@ impl RawInputState {
                 mouse.usFlags,
             )
         };
+        // 实时包：按钮 down→up 排列；非零 raw 滚轮 delta 产生一次方向 pulse（不增历史次数）。
+        if let Some(token) = live_token {
+            if let Some(live) = self.live.clone() {
+                let packet = live_mouse_packet(flags, data as i16);
+                if !packet.edges.is_empty() || !packet.wheel_codes.is_empty() {
+                    let device = self.devices.resolve(hdevice, DeviceKind::Mouse);
+                    let source_key = self.mouse_live_source_key(hdevice);
+                    live.mouse_packet(token, source, &device, &source_key, packet, Instant::now());
+                }
+            }
+        }
         // 运动增量（motion-dpi §4.3）：相对包每包只算一次 hypot(dx,dy)；
         // 绝对输入不混成 counts；不再发送旧 RawEvent::MouseMove（保留给旧合成 fixture）。
         const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
@@ -760,6 +958,14 @@ impl RawInputState {
                 self.send_mouse_clicks(&device, button, ticks.unsigned_abs());
             }
         }
+    }
+
+    /// 实时鼠标 sourceKey：优先复用 motion_sources 描述，否则只读解析。
+    fn mouse_live_source_key(&mut self, hdevice: HANDLE) -> String {
+        if let Some(ms) = self.motion_sources.get(&(hdevice.0 as isize)) {
+            return ms.descriptor.source_key.clone();
+        }
+        self.devices.mouse_source(hdevice).source_key
     }
 
     /// WM_INPUT_DEVICE_CHANGE 分支（§4.3）：wParam 携带 GIDC_ARRIVAL/GIDC_REMOVAL、
@@ -821,6 +1027,9 @@ impl RawInputState {
             ids.len()
         );
         for id in ids {
+            if let Some(live) = &self.live {
+                live.remove_raw_source(id);
+            }
             let _ = self.tx.send(AggEvent::SourceRemoved { source: id });
         }
     }
@@ -1068,6 +1277,53 @@ impl WheelAccumulator {
 
 /// RAWMOUSE `usButtonFlags` → 本次 WM_INPUT 中"按下"的按键（按下边沿；up 标志忽略）。
 /// 顺序固定为 Left/Right/Middle/X1/X2（与掩码位序一致）。
+/// 构造实时鼠标包：按钮边沿 down→up；非零 raw 滚轮 delta → 一次方向 pulse。
+fn live_mouse_packet(flags: u16, wheel_data: i16) -> LiveMousePacket {
+    let mut edges = Vec::new();
+    // down first
+    for (down_bit, up_bit, code) in [
+        (RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, MouseButton::Left as u16),
+        (RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, MouseButton::Right as u16),
+        (RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, MouseButton::Middle as u16),
+        (RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, MouseButton::X1 as u16),
+        (RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, MouseButton::X2 as u16),
+    ] {
+        if flags & down_bit as u16 != 0 {
+            edges.push((code, true));
+        }
+        let _ = up_bit; // paired below
+    }
+    for (down_bit, up_bit, code) in [
+        (RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, MouseButton::Left as u16),
+        (RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, MouseButton::Right as u16),
+        (RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, MouseButton::Middle as u16),
+        (RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, MouseButton::X1 as u16),
+        (RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, MouseButton::X2 as u16),
+    ] {
+        let _ = down_bit;
+        if flags & up_bit as u16 != 0 {
+            edges.push((code, false));
+        }
+    }
+    let mut wheel_codes = Vec::new();
+    if flags & RI_MOUSE_WHEEL as u16 != 0 && wheel_data != 0 {
+        wheel_codes.push(if wheel_data > 0 {
+            MouseButton::WheelUp as u16
+        } else {
+            MouseButton::WheelDown as u16
+        });
+    }
+    if flags & RI_MOUSE_HWHEEL as u16 != 0 && wheel_data != 0 {
+        // 水平滚轮与垂直互斥于同一包的 usButtonData；HWHEEL 时 data 为水平 delta。
+        wheel_codes.push(if wheel_data > 0 {
+            MouseButton::WheelRight as u16
+        } else {
+            MouseButton::WheelLeft as u16
+        });
+    }
+    LiveMousePacket { edges, wheel_codes }
+}
+
 fn mouse_down_edges(flags: u16) -> Vec<MouseButton> {
     let mut down = Vec::with_capacity(2);
     if flags & RI_MOUSE_LEFT_BUTTON_DOWN as u16 != 0 {
@@ -1151,7 +1407,7 @@ mod tests {
     fn motion_dpi_arrival_registers_mouse_before_any_movement() {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let runtime = MotionRuntime::offline(Arc::new(crate::ipc_server::Flags::default()));
-        let mut state = RawInputState::new(&tx, Arc::clone(&runtime));
+        let mut state = RawInputState::new(&tx, Arc::clone(&runtime), None);
         state.on_device_change_with(WPARAM(GIDC_ARRIVAL as usize), LPARAM(42), |s| {
             s.register_motion_source_with(
                 42,
@@ -1500,10 +1756,10 @@ mod tests {
     #[test]
     fn correctness_v2_keyboard_events_carry_registry_source() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = RawInputState::new(&tx, test_motion());
+        let mut state = RawInputState::new(&tx, test_motion(), None);
         let h = handle(0x77);
         let expected = state.sources.source_for(h.0 as isize, DeviceKind::Keyboard);
-        state.handle_keyboard(h, &keyboard(0x1E, 0)); // 'A' down
+        state.handle_keyboard(h, &keyboard(0x1E, 0), None); // 'A' down
         match rx.try_recv().unwrap() {
             AggEvent::Input(RawEvent::Keyboard {
                 source,
@@ -1533,15 +1789,15 @@ mod tests {
     #[test]
     fn correctness_v2_two_mice_wheel_thresholds_are_independent() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = RawInputState::new(&tx, test_motion());
+        let mut state = RawInputState::new(&tx, test_motion(), None);
         let a = handle(0xA1);
         let b = handle(0xB2);
         // 合计 120 但分属不同来源——不得合成一格
-        state.handle_mouse(a, &wheel(60));
-        state.handle_mouse(b, &wheel(60));
+        state.handle_mouse(a, &wheel(60), None);
+        state.handle_mouse(b, &wheel(60), None);
         assert!(rx.try_recv().is_err(), "不同来源的滚轮零头不得合并投递");
         // 来源 A 补 60：自身达 120 → 恰好 1 格 WheelUp
-        state.handle_mouse(a, &wheel(60));
+        state.handle_mouse(a, &wheel(60), None);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AggEvent::Input(RawEvent::MouseClick {
@@ -1550,7 +1806,7 @@ mod tests {
             })
         ));
         // 来源 B 仍欠 60：补 60 才出格
-        state.handle_mouse(b, &wheel(60));
+        state.handle_mouse(b, &wheel(60), None);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AggEvent::Input(RawEvent::MouseClick {
@@ -1568,15 +1824,15 @@ mod tests {
     fn motion_dpi_two_mice_travel_buckets_are_independent_no_legacy_mouse_move() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let a = handle(0xC1);
         let b = handle(0xD2);
         // 各自注册物理来源（同一 DeviceKey 型号、不同 source_key）
         state.register_motion_source_with(a.0 as isize, physical_desc("k-a"));
         state.register_motion_source_with(b.0 as isize, physical_desc("k-b"));
         // 合计分属不同来源——不得合并成一条
-        state.handle_mouse(a, &mouse(0, 0, 10, 0));
-        state.handle_mouse(b, &mouse(0, 0, 10, 0));
+        state.handle_mouse(a, &mouse(0, 0, 10, 0), None);
+        state.handle_mouse(b, &mouse(0, 0, 10, 0), None);
         assert!(drain_travel(&rx).is_empty(), "25ms 批发前不投递");
         // 25ms 批发：两条独立增量（各 10 counts），无 MouseMove
         state.on_flush_tick();
@@ -1616,12 +1872,12 @@ mod tests {
     #[test]
     fn correctness_v2_device_removal_drops_remainder_notifies_and_reallocates() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = RawInputState::new(&tx, test_motion());
+        let mut state = RawInputState::new(&tx, test_motion(), None);
         let h = handle(0xE1);
         let id_kb = state.sources.source_for(h.0 as isize, DeviceKind::Keyboard);
         let id_mouse = state.sources.source_for(h.0 as isize, DeviceKind::Mouse);
         // 鼠标滚 60（不足一格）后拔出
-        state.handle_mouse(h, &wheel(60));
+        state.handle_mouse(h, &wheel(60), None);
         state.on_device_removed(h);
         // 键盘与鼠标两个 kind 来源逐个发 SourceRemoved（升序）
         let mut removed = Vec::new();
@@ -1637,11 +1893,11 @@ mod tests {
         assert_eq!(removed, expected, "每个 kind 来源各发一条 SourceRemoved");
 
         // 句柄复用：再次出现必须新 ID，且鼠标累计从零开始（60 不足一格，不继承旧零头）
-        state.handle_mouse(h, &wheel(60));
+        state.handle_mouse(h, &wheel(60), None);
         assert!(rx.try_recv().is_err(), "新来源必须从零累计");
         let id_new = state.sources.source_for(h.0 as isize, DeviceKind::Mouse);
         assert_ne!(id_new, id_mouse, "移除后再次出现必须新 ID");
-        state.handle_mouse(h, &wheel(60));
+        state.handle_mouse(h, &wheel(60), None);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AggEvent::Input(RawEvent::MouseClick {
@@ -1655,12 +1911,12 @@ mod tests {
     #[test]
     fn correctness_v2_unknown_handle_removal_is_noop() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut state = RawInputState::new(&tx, test_motion());
+        let mut state = RawInputState::new(&tx, test_motion(), None);
         let h = handle(0xF1);
         let id = state.sources.source_for(h.0 as isize, DeviceKind::Mouse);
         state.on_device_removed(handle(0x999)); // 从未注册的句柄
         assert!(rx.try_recv().is_err(), "未知句柄移除不得发 SourceRemoved");
-        state.handle_mouse(h, &wheel(120));
+        state.handle_mouse(h, &wheel(120), None);
         assert!(
             matches!(
                 rx.try_recv().unwrap(),
@@ -1687,10 +1943,10 @@ mod tests {
     fn motion_dpi_relative_packet_counts_hypot_once() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA01);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
-        state.handle_mouse(h, &mouse(0, 0, 3, 4));
+        state.handle_mouse(h, &mouse(0, 0, 3, 4), None);
         assert!(drain_travel(&rx).is_empty(), "批发前不投递");
         state.on_flush_tick();
         let travels = drain_travel(&rx);
@@ -1711,7 +1967,7 @@ mod tests {
     fn motion_dpi_absolute_packets_are_excluded_from_counts() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA02);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
         // 绝对包带位移（模拟数位板/远程桌面绝对坐标）：usFlags 置 MOUSE_MOVE_ABSOLUTE
@@ -1729,9 +1985,9 @@ mod tests {
             lLastY: 300,
             ulExtraInformation: 0,
         };
-        state.handle_mouse(h, &absolute);
+        state.handle_mouse(h, &absolute, None);
         // 零位移相对包
-        state.handle_mouse(h, &mouse(0, 0, 0, 0));
+        state.handle_mouse(h, &mouse(0, 0, 0, 0), None);
         state.on_flush_tick();
         assert!(
             drain_travel(&rx).is_empty(),
@@ -1745,14 +2001,14 @@ mod tests {
     fn motion_dpi_dpi_snapshot_change_splits_bucket_first_flush_old() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA03);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
         motion.apply_manual("k1", Some(800));
-        state.handle_mouse(h, &mouse(0, 0, 10, 0)); // 800 桶 +10
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None); // 800 桶 +10
                                                     // DPI 快照变化（GUI 配置刷新 ≤500ms 后批读生效）
         motion.apply_manual("k1", Some(1600));
-        state.handle_mouse(h, &mouse(0, 0, 10, 0)); // 旧桶先发（+10 @800），新桶 +10 @1600
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None); // 旧桶先发（+10 @800），新桶 +10 @1600
         state.on_flush_tick();
         let mut travels = drain_travel(&rx);
         assert_eq!(travels.len(), 2, "旧桶先发，新桶随批发发出");
@@ -1768,15 +2024,15 @@ mod tests {
     fn motion_dpi_two_physical_sources_same_model_keep_separate_dpi_buckets() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let a = handle(0xA04);
         let b = handle(0xA05);
         state.register_motion_source_with(a.0 as isize, physical_desc("k-a"));
         state.register_motion_source_with(b.0 as isize, physical_desc("k-b"));
         motion.apply_manual("k-a", Some(800));
         motion.apply_manual("k-b", Some(1600));
-        state.handle_mouse(a, &mouse(0, 0, 10, 0));
-        state.handle_mouse(b, &mouse(0, 0, 10, 0));
+        state.handle_mouse(a, &mouse(0, 0, 10, 0), None);
+        state.handle_mouse(b, &mouse(0, 0, 10, 0), None);
         state.on_flush_tick();
         let mut travels = drain_travel(&rx);
         assert_eq!(travels.len(), 2);
@@ -1804,15 +2060,15 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let flags = Arc::new(Flags::default());
         let motion = MotionRuntime::offline(Arc::clone(&flags));
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA06);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
 
         // epoch 0 活动期：+10
-        state.handle_mouse(h, &mouse(0, 0, 10, 0));
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None);
         // 暂停（epoch 1）：包不累计，但 epoch 变化先发旧有效桶
         flags.set_paused(true);
-        state.handle_mouse(h, &mouse(0, 0, 10, 0));
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None);
         state.on_flush_tick();
         let travels = drain_travel(&rx);
         assert_eq!(travels.len(), 1, "暂停包不累计，epoch 变化先发旧桶");
@@ -1820,13 +2076,13 @@ mod tests {
         assert!((travels[0].counts - 10.0).abs() < 1e-9);
 
         // 暂停期再来的包：不累计（epoch 1）
-        state.handle_mouse(h, &mouse(0, 0, 10, 0));
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None);
         state.on_flush_tick();
         assert!(drain_travel(&rx).is_empty(), "paused 包不得累计");
 
         // 恢复（epoch 2）：短暂停再恢复也换桶——新桶从零开始，携带新 epoch
         flags.set_paused(false);
-        state.handle_mouse(h, &mouse(0, 0, 6, 8)); // hypot=10
+        state.handle_mouse(h, &mouse(0, 0, 6, 8), None); // hypot=10
         state.on_flush_tick();
         let travels = drain_travel(&rx);
         assert_eq!(travels.len(), 1);
@@ -1843,18 +2099,18 @@ mod tests {
     fn motion_dpi_capture_day_change_splits_bucket() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA07);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
         // 今日（真实时钟）捕获
-        state.handle_mouse(h, &mouse(0, 0, 10, 0));
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None);
         // 注入两天后的采样时刻（假 clock）→ 捕获日变化
         let now_unix = motion.stamp().unix_us;
         motion.set_stamp_override_for_tests(Some(MotionStamp {
             mono_us: 0,
             unix_us: now_unix + 48 * 3_600_000_000,
         }));
-        state.handle_mouse(h, &mouse(0, 0, 10, 0));
+        state.handle_mouse(h, &mouse(0, 0, 10, 0), None);
         state.on_flush_tick();
         let travels = drain_travel(&rx);
         assert_eq!(travels.len(), 2, "日变化先发旧日桶，新日桶随批发");
@@ -1881,7 +2137,7 @@ mod tests {
     fn motion_dpi_device_removal_drains_tail_once_and_reports_disconnect() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA08);
         state.register_motion_source_with(h.0 as isize, physical_desc("k1"));
         let conn = state
@@ -1889,7 +2145,7 @@ mod tests {
             .get(&(h.0 as isize))
             .unwrap()
             .connection;
-        state.handle_mouse(h, &mouse(0, 0, 7, 0)); // 尾桶 +7
+        state.handle_mouse(h, &mouse(0, 0, 7, 0), None); // 尾桶 +7
 
         state.on_device_removed(h);
         // 尾桶恰好一条（先于断连状态）
@@ -1908,7 +2164,7 @@ mod tests {
             .unwrap()
             .connection;
         assert_ne!(conn2, conn, "断连重连必须新连接代际");
-        state.handle_mouse(h, &mouse(0, 0, 5, 0));
+        state.handle_mouse(h, &mouse(0, 0, 5, 0), None);
         state.on_flush_tick();
         let travels = drain_travel(&rx);
         assert_eq!(travels.len(), 1);
@@ -1921,10 +2177,10 @@ mod tests {
     fn motion_dpi_lazy_registration_on_first_travel_packet() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         let h = handle(0xA09);
         assert!(!state.motion_sources.contains_key(&(h.0 as isize)));
-        state.handle_mouse(h, &mouse(0, 0, 3, 4)); // 懒注册 + 累计
+        state.handle_mouse(h, &mouse(0, 0, 3, 4), None); // 懒注册 + 累计
         assert!(
             state.motion_sources.contains_key(&(h.0 as isize)),
             "首条输入懒注册"
@@ -1956,7 +2212,7 @@ mod tests {
     fn motion_dpi_startup_enumeration_registers_mice_without_movement() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let motion = test_motion();
-        let mut state = RawInputState::new(&tx, Arc::clone(&motion));
+        let mut state = RawInputState::new(&tx, Arc::clone(&motion), None);
         // 注入枚举结果：两台可解析物理鼠标 + 一台假句柄（解析失败 → virtual:unknown）
         state.register_motion_source_with(0xA10, physical_desc("k1"));
         state.register_motion_source_with(0xA11, physical_desc("k2"));

@@ -81,11 +81,13 @@ use clrecoder_core::day;
 use clrecoder_core::event::{AggEvent, DeviceKey, RawEvent};
 use clrecoder_core::motion::{
     DpiOrigin, EffectiveDpi, GamepadMotionFrame, MotionConnectionId, MouseSourceDescriptor,
-    MouseSourceState, MouseTravelDelta, StickBinDelta, StickDayDelta, StickSide,
+    MouseSourceState, MouseTravelDelta, StickBinDelta, StickDayDelta, StickSide, TriggerBinDelta,
+    TriggerDayDelta, TriggerSide,
 };
 use clrecoder_engine::stick_motion::StickMotionTracker;
+use clrecoder_engine::trigger_motion::TriggerMotionTracker;
 use clrecoder_engine::Engine;
-use clrecoder_store::motion::{MouseMotionWrite, StickMotionWrite};
+use clrecoder_store::motion::{MouseMotionWrite, StickMotionWrite, TriggerHeatWrite};
 use clrecoder_store::writer::{FlushBatch, Writer};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
@@ -145,6 +147,15 @@ struct StickAccum {
     active_us: u64,
     travel_r: f64,
     bins: HashMap<u16, u64>,
+}
+
+/// 扳机热力桶键（input-live-trigger §4.2）：型号×捕获日×扳机侧。
+type TriggerBucketKey = (DeviceKey, String, TriggerSide);
+
+/// 扳机热力累计：各格停留微秒（稀疏；dwell=0 不入桶）。
+#[derive(Debug, Default, Clone)]
+struct TriggerAccum {
+    bins: HashMap<u8, u64>,
 }
 
 /// 启动 aggregator 线程（PLAN §4.6 逐字契约）。
@@ -223,8 +234,10 @@ fn aggregate_loop(
         mouse_motion: HashMap::new(),
         motion_register_fail_streak: 0,
         stick_trackers: HashMap::new(),
+        trigger_trackers: HashMap::new(),
         motion_epoch_observed: 0,
         stick_motion: HashMap::new(),
+        trigger_motion: HashMap::new(),
         ledger: AppTimeLedger::new(),
         wall_now: Local::now,
         today: day::today_local(),
@@ -330,11 +343,15 @@ struct Aggregator {
     /// 摇杆 tracker：连接 → [左, 右]（motion-dpi §4.3：连接独立 tracker；暂停 epoch
     /// 变化/断连 reset——不跨短暂停连接坐标、不跨断点连线）
     stick_trackers: HashMap<MotionConnectionId, [StickMotionTracker; 2]>,
-    /// 摇杆已观察的控制快照 epoch（§4.3.1：当前 epoch 变化 reset 全部摇杆 tracker）
+    /// 扳机 tracker：连接 → [左, 右]（input-live-trigger §4.2）
+    trigger_trackers: HashMap<MotionConnectionId, [TriggerMotionTracker; 2]>,
+    /// 摇杆已观察的控制快照 epoch（§4.3.1：当前 epoch 变化 reset 全部摇杆及扳机 tracker）
     motion_epoch_observed: u64,
     /// `gamepad_motion_daily`/`gamepad_heat_daily` 桶：型号×日×side → 累计
     /// （按 DeviceKey 而非数据库 id 分桶：注册失败压缩保留，成功后 flush 绑定 id）
     stick_motion: HashMap<StickBucketKey, StickAccum>,
+    /// `gamepad_trigger_heat_daily` 桶：型号×日×扳机侧 → 稀疏格累计
+    trigger_motion: HashMap<TriggerBucketKey, TriggerAccum>,
     /// 前台时长的亚秒余数账本（correctness-v2 §4.4）：按 `(day, exe)` 累计不足整秒零头、
     /// 凑满整秒经 [`AppTimeLedger::account_interval`] 产出并入 `AppAcc.secs`。与统计桶
     /// 生命周期分离——flush 成功不清账、失败回并桶时也不回滚/清账（§5.3-5）。
@@ -399,9 +416,10 @@ impl Aggregator {
             // 手柄运动事件（motion-dpi §4.3，S5）：同样不增加 events_seen/按钮总量
             AggEvent::GamepadMotion(frame) => self.on_gamepad_motion(frame),
             AggEvent::GamepadMotionDisconnected { connection } => {
-                // 断连/读取失败/上下文重建：清该连接全部摇杆 tracker（不跨断点连线）。
+                // 断连/读取失败/上下文重建：清该连接全部摇杆及扳机 tracker（不跨断点连线）。
                 // 未知连接为 no-op（防御兜底，绝不 panic）。
                 self.stick_trackers.remove(&connection);
+                self.trigger_trackers.remove(&connection);
             }
         }
     }
@@ -516,22 +534,42 @@ impl Aggregator {
         if current.epoch != self.motion_epoch_observed {
             self.motion_epoch_observed = current.epoch;
             self.stick_trackers.clear();
+            self.trigger_trackers.clear();
         }
         if frame.control.epoch != current.epoch || frame.control.paused || current.paused {
             self.stick_trackers.remove(&frame.connection);
+            self.trigger_trackers.remove(&frame.connection);
             return;
         }
-        let mut deltas: Vec<StickDayDelta> = Vec::new();
+        let mut stick_deltas: Vec<StickDayDelta> = Vec::new();
+        let mut trigger_deltas: Vec<TriggerDayDelta> = Vec::new();
         {
-            let pair = self
+            let sticks = self
                 .stick_trackers
                 .entry(frame.connection)
                 .or_insert_with(|| [StickMotionTracker::new(), StickMotionTracker::new()]);
-            deltas.extend(pair[0].feed(frame.stamp, StickSide::Left, frame.left));
-            deltas.extend(pair[1].feed(frame.stamp, StickSide::Right, frame.right));
+            stick_deltas.extend(sticks[0].feed(frame.stamp, StickSide::Left, frame.left));
+            stick_deltas.extend(sticks[1].feed(frame.stamp, StickSide::Right, frame.right));
+            let triggers = self
+                .trigger_trackers
+                .entry(frame.connection)
+                .or_insert_with(|| [TriggerMotionTracker::new(), TriggerMotionTracker::new()]);
+            trigger_deltas.extend(triggers[0].feed(
+                frame.stamp,
+                TriggerSide::Left,
+                frame.left_trigger,
+            ));
+            trigger_deltas.extend(triggers[1].feed(
+                frame.stamp,
+                TriggerSide::Right,
+                frame.right_trigger,
+            ));
         }
-        for delta in deltas {
+        for delta in stick_deltas {
             self.accumulate_stick(&frame.device, delta);
+        }
+        for delta in trigger_deltas {
+            self.accumulate_trigger(&frame.device, delta);
         }
     }
 
@@ -544,6 +582,19 @@ impl Aggregator {
             .or_default();
         entry.active_us = entry.active_us.saturating_add(delta.active_us);
         entry.travel_r += delta.travel_r;
+        for b in delta.bins {
+            if b.dwell_us > 0 {
+                *entry.bins.entry(b.bin).or_insert(0) += b.dwell_us;
+            }
+        }
+    }
+
+    /// 扳机增量入桶（型号×捕获日×side）。稀疏格 dwell>0 才累计。
+    fn accumulate_trigger(&mut self, device: &DeviceKey, delta: TriggerDayDelta) {
+        let entry = self
+            .trigger_motion
+            .entry((device.clone(), delta.day, delta.side))
+            .or_default();
         for b in delta.bins {
             if b.dwell_us > 0 {
                 *entry.bins.entry(b.bin).or_insert(0) += b.dwell_us;
@@ -713,12 +764,14 @@ impl Aggregator {
         let mouse_move = std::mem::take(&mut self.mouse_move);
         let mouse_motion = std::mem::take(&mut self.mouse_motion);
         let stick_motion = std::mem::take(&mut self.stick_motion);
+        let trigger_motion = std::mem::take(&mut self.trigger_motion);
         if inputs.is_empty()
             && combos.is_empty()
             && apps.is_empty()
             && mouse_move.is_empty()
             && mouse_motion.is_empty()
             && stick_motion.is_empty()
+            && trigger_motion.is_empty()
         {
             return; // 不脏：无写库（§4.6"若脏"）
         }
@@ -774,6 +827,34 @@ impl Aggregator {
                 }
             }
         }
+        // 扳机行装配（型号注册 + bins 按格号升序）
+        let mut trigger_rows: Vec<(TriggerBucketKey, TriggerHeatWrite)> =
+            Vec::with_capacity(trigger_motion.len());
+        let mut trigger_kept: HashMap<TriggerBucketKey, TriggerAccum> = HashMap::new();
+        for (key, acc) in trigger_motion {
+            match self.device_id(&key.0) {
+                Some(id) => {
+                    let mut bins: Vec<TriggerBinDelta> = acc
+                        .bins
+                        .iter()
+                        .map(|(bin, dwell_us)| TriggerBinDelta { bin: *bin, dwell_us: *dwell_us })
+                        .collect();
+                    bins.sort_by_key(|b| b.bin);
+                    trigger_rows.push((
+                        key.clone(),
+                        TriggerHeatWrite {
+                            device_id: id,
+                            day: key.1.clone(),
+                            side: key.2,
+                            bins,
+                        },
+                    ));
+                }
+                None => {
+                    trigger_kept.insert(key, acc);
+                }
+            }
+        }
         let batch = FlushBatch {
             input: inputs
                 .iter()
@@ -794,7 +875,9 @@ impl Aggregator {
             mouse_motion: rows.iter().map(|(_, w)| w.clone()).collect(),
             stick_motion: stick_rows.iter().map(|(_, w)| w.clone()).collect(),
         };
-        if let Err(e) = self.writer.flush(&batch) {
+        let trigger_writes: Vec<TriggerHeatWrite> =
+            trigger_rows.iter().map(|(_, w)| w.clone()).collect();
+        if let Err(e) = self.writer.flush_with_triggers(&batch, &trigger_writes) {
             self.flush_fail_streak += 1;
             if self.flush_fail_streak == 1 || self.flush_fail_streak.is_multiple_of(FLUSH_LOG_EVERY) {
                 log::error!(
@@ -839,11 +922,28 @@ impl Aggregator {
                     }
                 }
             }
+            for (key, w) in trigger_rows {
+                let entry = self.trigger_motion.entry(key).or_default();
+                for b in w.bins {
+                    if b.dwell_us > 0 {
+                        *entry.bins.entry(b.bin).or_insert(0) += b.dwell_us;
+                    }
+                }
+            }
+            for (key, acc) in trigger_kept {
+                let entry = self.trigger_motion.entry(key).or_default();
+                for (bin, dwell_us) in acc.bins {
+                    if dwell_us > 0 {
+                        *entry.bins.entry(bin).or_insert(0) += dwell_us;
+                    }
+                }
+            }
         } else {
             self.flush_fail_streak = 0;
             // 成功：注册失败保留的部分继续留在桶内（下个 tick 重试绑定）
             self.mouse_motion = kept;
             self.stick_motion = stick_kept;
+            self.trigger_motion = trigger_kept;
         }
     }
 
@@ -898,7 +998,7 @@ mod tests {
     use clrecoder_core::event::InputSourceId;
     use clrecoder_core::motion::{
         local_day_from_unix_us, GamepadMotionFrame, MotionConnectionId, MotionControlSnapshot,
-        MotionStamp, StickPoint, StickSide,
+        MotionStamp, StickPoint, StickSide, TriggerSide,
     };
 
     // ---------------- correctness-v2 §4.4：前台时长 ledger 接线（S4/F4） ----------------
@@ -1290,8 +1390,10 @@ mod tests {
             mouse_motion: HashMap::new(),
             motion_register_fail_streak: 0,
             stick_trackers: HashMap::new(),
+            trigger_trackers: HashMap::new(),
             motion_epoch_observed: 0,
             stick_motion: HashMap::new(),
+            trigger_motion: HashMap::new(),
             ledger: AppTimeLedger::new(),
             wall_now: wall_noon,
             today: day::today_local(),
@@ -1927,12 +2029,27 @@ mod tests {
         right: (f64, f64),
         control: MotionControlSnapshot,
     ) -> AggEvent {
+        gp_frame_triggers(connection, mono_us, left, right, 0.0, 0.0, control)
+    }
+
+    /// 带扳机行程的手柄帧（验收：raw64→bin25、释放不累计等）。
+    fn gp_frame_triggers(
+        connection: u64,
+        mono_us: u64,
+        left: (f64, f64),
+        right: (f64, f64),
+        left_trigger: f64,
+        right_trigger: f64,
+        control: MotionControlSnapshot,
+    ) -> AggEvent {
         AggEvent::GamepadMotion(GamepadMotionFrame {
             device: pad_device(),
             connection: MotionConnectionId(connection),
             stamp: MotionStamp { mono_us, unix_us: GP_BASE_UNIX_US + mono_us as i64 },
             left: StickPoint { x: left.0, y: left.1 },
             right: StickPoint { x: right.0, y: right.1 },
+            left_trigger,
+            right_trigger,
             control,
         })
     }
@@ -2097,7 +2214,11 @@ mod tests {
         agg.handle_event(AggEvent::GamepadMotionDisconnected { connection: MotionConnectionId(1) });
         assert!(
             !agg.stick_trackers.contains_key(&MotionConnectionId(1)),
-            "断连必须清该连接全部 tracker"
+            "断连必须清该连接全部摇杆 tracker"
+        );
+        assert!(
+            !agg.trigger_trackers.contains_key(&MotionConnectionId(1)),
+            "断连必须清该连接全部扳机 tracker"
         );
         // 重连（新连接代际 2）：位置跳到对侧——不得与断点连线
         agg.handle_event(gp_frame(2, 40_000, (-1.0, 0.0), (0.0, 0.0), MotionControlSnapshot::default()));
@@ -2208,6 +2329,112 @@ mod tests {
         agg.flush_buckets();
         assert_eq!(agg.flush_fail_streak, 0);
         assert!(agg.stick_motion.is_empty(), "重试成功后清桶");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// input-live-trigger §4.2 例：raw64 在 t=0/20ms 保持，40ms 释放到 0，60ms 仍 0；
+    /// 仅 bin25 累计 40000µs；按钮次数仍为 0（运动路径不写 input 桶）。
+    #[test]
+    fn input_live_trigger_raw64_hold_release_bins_bin25_40000us() {
+        let (mut agg, db) = agg_with_frozen_cursor("trig-raw64", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let ctrl = MotionControlSnapshot::default();
+        let lt = 64.0 / 255.0;
+        agg.handle_event(gp_frame_triggers(1, 0, (0.0, 0.0), (0.0, 0.0), lt, 0.0, ctrl));
+        agg.handle_event(gp_frame_triggers(1, 20_000, (0.0, 0.0), (0.0, 0.0), lt, 0.0, ctrl));
+        agg.handle_event(gp_frame_triggers(1, 40_000, (0.0, 0.0), (0.0, 0.0), 0.0, 0.0, ctrl));
+        agg.handle_event(gp_frame_triggers(1, 60_000, (0.0, 0.0), (0.0, 0.0), 0.0, 0.0, ctrl));
+        let left = agg
+            .trigger_motion
+            .iter()
+            .find(|(k, _)| k.2 == TriggerSide::Left)
+            .map(|(_, a)| a)
+            .expect("左扳机应有桶");
+        assert_eq!(left.bins.get(&25), Some(&40_000), "bin25 累计 40000µs");
+        assert_eq!(left.bins.len(), 1);
+        assert!(agg.inputs.is_empty(), "扳机热力不得增加按钮次数");
+        drop(agg);
+        cleanup_db(&db);
+    }
+
+    /// pause 旧 epoch / 断连：扳机 tracker 与桶失败回并精确一次（同事务）。
+    #[test]
+    fn input_live_trigger_pause_disconnect_and_flush_merge_back_once() {
+        let (mut agg, db) = agg_with_frozen_cursor("trig-pause-flush", Duration::ZERO);
+        agg.paused_observed = false;
+        agg.flags.paused.store(false, Ordering::Release);
+        let active = MotionControlSnapshot { epoch: 0, paused: false };
+        let lt = 1.0; // bin100
+        for i in 0..4u64 {
+            agg.handle_event(gp_frame_triggers(
+                1,
+                i * 20_000,
+                (0.0, 0.0),
+                (0.0, 0.0),
+                lt,
+                0.0,
+                active,
+            ));
+        }
+        {
+            let left = agg
+                .trigger_motion
+                .iter()
+                .find(|(k, _)| k.2 == TriggerSide::Left)
+                .map(|(_, a)| a)
+                .expect("左扳机");
+            assert_eq!(left.bins.get(&100), Some(&60_000));
+        }
+        // 短暂停：epoch 变化清全部扳机 tracker
+        agg.flags.set_paused(true);
+        agg.flags.set_paused(false);
+        let resumed = MotionControlSnapshot { epoch: 2, paused: false };
+        agg.handle_event(gp_frame_triggers(
+            1, 80_000, (0.0, 0.0), (0.0, 0.0), lt, 0.0, resumed,
+        ));
+        assert!(
+            agg.trigger_trackers.contains_key(&MotionConnectionId(1)),
+            "恢复首帧重锚"
+        );
+        // 旧 epoch 帧跳过
+        agg.handle_event(gp_frame_triggers(
+            1,
+            100_000,
+            (0.0, 0.0),
+            (0.0, 0.0),
+            lt,
+            0.0,
+            MotionControlSnapshot { epoch: 1, paused: false },
+        ));
+        // 断连清 tracker
+        agg.handle_event(AggEvent::GamepadMotionDisconnected {
+            connection: MotionConnectionId(1),
+        });
+        assert!(!agg.trigger_trackers.contains_key(&MotionConnectionId(1)));
+        // flush 失败回并精确一次
+        let ghost = 7_654_322i64;
+        agg.inputs.insert((ghost, gp_day(), 0x1E), 1);
+        let before = agg
+            .trigger_motion
+            .iter()
+            .find(|(k, _)| k.2 == TriggerSide::Left)
+            .map(|(_, a)| a.bins.get(&100).copied().unwrap_or(0))
+            .unwrap_or(0);
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 1);
+        let after = agg
+            .trigger_motion
+            .iter()
+            .find(|(k, _)| k.2 == TriggerSide::Left)
+            .map(|(_, a)| a.bins.get(&100).copied().unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(after, before, "失败回并必须精确一次、不丢不翻倍");
+        agg.inputs.remove(&(ghost, gp_day(), 0x1E));
+        agg.flush_buckets();
+        assert_eq!(agg.flush_fail_streak, 0);
+        assert!(agg.trigger_motion.is_empty(), "重试成功后清扳机桶");
         drop(agg);
         cleanup_db(&db);
     }
