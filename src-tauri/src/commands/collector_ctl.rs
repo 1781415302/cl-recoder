@@ -340,7 +340,7 @@ fn exchange_with_timeout(
 }
 
 /// typed 控制请求（§4.2 新私有入口）：500ms 守护 + typed 错误。
-fn ctl_request_typed(req: &CtlRequest) -> Result<CtlResponse, CtlError> {
+pub(crate) fn ctl_request_typed(req: &CtlRequest) -> Result<CtlResponse, CtlError> {
     let line = encode_request_line(req).map_err(|m| CtlError {
         kind: PipeFailureKind::Protocol,
         message: m,
@@ -405,7 +405,7 @@ fn status_dto_from_failure(
 // ---------------------------------------------------------------------------
 
 /// PS 字符串单引号转义（'' 表示字面单引号）。
-fn ps_quote(s: &str) -> String {
+pub(crate) fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -620,7 +620,7 @@ fn normalize_win_path(p: &str) -> String {
 }
 
 /// `path` 是否位于 `dir` 之下（按分隔符边界，大小写不敏感）。
-fn win_path_is_under(path: &str, dir: &str) -> bool {
+pub(crate) fn win_path_is_under(path: &str, dir: &str) -> bool {
     let (p, d) = (normalize_win_path(path), normalize_win_path(dir));
     !d.is_empty() && p.len() > d.len() && p.starts_with(&d) && p.as_bytes()[d.len()] == b'\\'
 }
@@ -758,7 +758,7 @@ fn collector_exe_path() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 /// `schtasks /Run` 拉起计划任务（无 UAC；任务 /RL HIGHEST 以最高权限运行）。
-fn run_scheduled_task_now() -> bool {
+pub(crate) fn run_scheduled_task_now() -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("schtasks")
@@ -770,7 +770,7 @@ fn run_scheduled_task_now() -> bool {
 }
 
 /// 轮询等待 collector 管道就绪（启动后进程初始化需要时间，不能只看命令退出码）。
-fn wait_collector_running(timeout: Duration) -> bool {
+pub(crate) fn wait_collector_running(timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if matches!(

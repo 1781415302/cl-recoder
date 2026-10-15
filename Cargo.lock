@@ -555,6 +555,7 @@ dependencies = [
  "clrecoder-core",
  "clrecoder-diagnostics",
  "clrecoder-store",
+ "clrecoder-update",
  "dirs 6.0.0",
  "rusqlite",
  "serde",

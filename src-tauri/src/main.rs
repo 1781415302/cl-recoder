@@ -62,6 +62,21 @@ fn show_main(app: &tauri::AppHandle) {
     webview_recovery::show(app);
 }
 
+
+/// 退出 GUI 的共用收尾（托盘「退出」与更新流水线 `launched` 共用，PLAN §4.5）。
+/// 顺序固定：webview_recovery::stopping → service.stopped → cleanup_before_exit → exit(0)。
+pub(crate) fn quit_gui_for_update(app: &tauri::AppHandle) {
+    webview_recovery::stopping(app);
+    commands::diagnostics::record_gui_event(
+        clrecoder_diagnostics::Level::Info,
+        "service.stopped",
+        "GUI 已退出",
+    );
+    app.cleanup_before_exit();
+    app.exit(0);
+}
+
+
 /// 探测 collector 是否处于暂停（`None` = 管道不可达，即未运行，§5.1）。
 fn query_paused() -> Option<bool> {
     match commands::collector_ctl::ctl_request(&clrecoder_core::ipc::CtlRequest::Status) {
@@ -189,6 +204,12 @@ fn main() {
             // 防止同角色两个进程争轮转；AppState::new 里的 gui_log! 因此可被持久化适配。
             app.manage(commands::diagnostics::init_gui_diagnostics());
             app.manage(state::AppState::new());
+            // PLAN §4.7：托管更新运行态；诊断初始化之后消费 update-pending 标记。
+            {
+                let update_rt = commands::update::UpdateRuntime::default();
+                commands::update::process_startup_marker(&update_rt);
+                app.manage(update_rt);
+            }
             // S4b（§4.4）：共享 LiveInputClient——所有命令同一连接锁；最后 Arc 释放才 Drop。
             app.manage(std::sync::Arc::new(crate::live_input::LiveInputClient::new()));
             // S3（§4.4）：UI 活动状态（初始 revision=0/inactive），事件 + get_ui_activity 共用。
@@ -271,15 +292,9 @@ fn main() {
                     ID_TOGGLE_PAUSE => spawn_toggle_pause(app.clone(), pause_for_menu.clone()),
                     ID_AUTOSTART => toggle_gui_autostart(app, &autostart_for_menu),
                     ID_QUIT => {
-                        webview_recovery::stopping(app);
-                        commands::diagnostics::record_gui_event(
-                            clrecoder_diagnostics::Level::Info,
-                            "service.stopped",
-                            "GUI 已退出",
-                        );
                         // 退出仅结束 GUI；采集器是独立进程继续统计（§1 故障隔离）。
-                        app.cleanup_before_exit();
-                        app.exit(0);
+                        // 与更新流水线 launched 共用 quit_gui_for_update（PLAN §4.5）。
+                        quit_gui_for_update(app);
                     }
                     _ => {}
                 })
