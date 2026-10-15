@@ -142,6 +142,7 @@ fn query_session_unlocked() -> Option<bool> {
     };
     if ok.is_err() || buf.is_null() || bytes == 0 {
         if !buf.is_null() {
+            // SAFETY: 缓冲区为 WTSINFOEXW；Level1.SessionFlags 为锁定态。
             unsafe { WTSFreeMemory(buf.0 as *mut _) };
         }
         return None;
@@ -152,6 +153,7 @@ fn query_session_unlocked() -> Option<bool> {
         let level1 = info.Data.WTSInfoExLevel1;
         level1.SessionFlags
     };
+    // SAFETY: buf 由 WTSQuerySessionInformationW 成功分配，必须用 WTSFreeMemory 归还。
     unsafe { WTSFreeMemory(buf.0 as *mut _) };
     if flags == WTS_SESSIONSTATE_UNLOCK as i32 {
         Some(true)
@@ -316,16 +318,20 @@ fn message_loop(
     // 状态盒有意泄漏：窗口随线程退出被系统销毁时仍可能触发窗口过程，回收即悬垂；
     // 状态体量仅设备缓存 + 累计器（KB 级），进程驻留全程成本可忽略。
     let state = Box::into_raw(Box::new(RawInputState::new(tx, Arc::clone(motion), live)));
+    // SAFETY: hwnd 为本线程刚创建的合法窗口；定时器随窗口销毁自动移除。
     let hwnd = unsafe { create_message_only_window(state) }
         .map_err(|e| format!("创建 message-only 窗口失败：{e}"))?;
     // 窗口退出清理守卫（§4.3）：注册失败 / WM_QUIT 正常退出 / unwind 三条路径都经 Drop
     // 在本线程 DestroyWindow——旧窗口在 1s 重试重建后不再继续投递旧来源事件。
     let _window_guard = WindowGuard { hwnd, state };
+    // SAFETY: hwnd 为本线程刚创建的合法窗口；定时器随窗口销毁自动移除。
     unsafe { register_devices(hwnd) }.map_err(|e| format!("注册 Raw Input 设备失败：{e}"))?;
     // hardening-v4 §4.1：设备注册成功后注册会话/电源通知；失败不致命（降级为旧行为）。
+    // SAFETY: hwnd 为本线程刚创建的合法窗口；定时器随窗口销毁自动移除。
     unsafe { &mut *state }.register_session_notifications(hwnd);
     // motion-dpi §4.3：注册后枚举当前鼠标预注册运动来源（无需移动即出现 DPI 入口）；
     // 枚举/解析失败仅跳过——首条 WM_INPUT 懒注册兜底。
+    // SAFETY: hwnd 为本线程刚创建的合法窗口；定时器随窗口销毁自动移除。
     enumerate_current_mice(unsafe { &mut *state });
     // SAFETY: hwnd 为本线程刚创建的合法窗口；定时器随窗口销毁自动移除。
     unsafe { SetTimer(Some(hwnd), TRAVEL_FLUSH_TIMER_ID, TRAVEL_FLUSH_MS, None) };
@@ -339,17 +345,21 @@ fn message_loop(
     let mut msg = MSG::default();
     loop {
         // GetMessageW 返回 0=WM_QUIT（进程关停）；-1=错误（如句柄失效）
+        // SAFETY: msg 刚由 GetMessageW 成功取出；在本线程消息泵内分发。
         let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if got.0 == 0 {
             log::info!("raw_input 收到 WM_QUIT，消息循环退出");
             // motion-dpi §4.3.1：窗口线程排出已捕获的尾桶后退出（不双计——桶即清零）
+            // SAFETY: msg 刚由 GetMessageW 成功取出；在本线程消息泵内分发。
             unsafe { &mut *state }.drain_all_travel();
             return Ok(());
         }
         if got.0 == -1 {
+            // SAFETY: msg 刚由 GetMessageW 成功取出；在本线程消息泵内分发。
             let err = unsafe { windows::Win32::Foundation::GetLastError() };
             return Err(format!("GetMessageW 失败（Win32 错误码 {}）", err.0));
         }
+        // SAFETY: msg 刚由 GetMessageW 成功取出；在本线程消息泵内分发。
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -360,6 +370,7 @@ fn message_loop(
 /// 注册 Raw Input 后枚举当前鼠标（RIM_TYPEMOUSE）并预注册运动来源
 /// （motion-dpi §4.3）。只读枚举；失败静默跳过（懒注册兜底）。
 fn enumerate_current_mice(state: &mut RawInputState) {
+    // SAFETY: 只读枚举；首次调用 pvRIDI=None 探测数量，cbSize 取本 crate 类型布局。
     unsafe {
         // SAFETY: 只读枚举；首次调用 pvRIDI=None 探测数量，cbSize 取本 crate 类型布局。
         let cb_size = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
@@ -406,6 +417,7 @@ impl Drop for WindowGuard {
         // 执行，窗口过程不会并发访问（同线程）。
         unsafe { (*self.state).unregister_session_notifications(self.hwnd) };
         // §4.3：窗口退出清 raw 来源并将实时门置 unknown（重建成功/注册/会话查询后才开放）。
+        // SAFETY: hwnd 由本线程 create_message_only_window 创建；Drop（正常结束或 unwind）。
         unsafe { (*self.state).on_window_teardown() };
         // SAFETY: hwnd 由本线程 create_message_only_window 创建；Drop（正常结束或 unwind）
         // 都发生在创建线程内，满足 DestroyWindow 的线程归属约束。失败仅丢弃（重试路径
@@ -782,6 +794,7 @@ impl RawInputState {
         }
         let mut copied = (self.buf.len() * std::mem::size_of::<u64>()) as u32;
         // 常规路径：u64 对齐复用缓冲一次取回（键盘/鼠标 RAWINPUT ≤ 48 字节）
+        // SAFETY: hraw 来自本条 WM_INPUT；缓冲/探测路径下 pcbSize 指向本栈变量且缓冲容量匹配。
         let mut n = unsafe {
             GetRawInputData(
                 hraw,
@@ -794,6 +807,7 @@ impl RawInputState {
         if n == u32::MAX {
             // 防御兜底（理论不发生）：缓冲不足时先查实际大小、扩容后重试一次
             let mut needed = 0u32;
+            // SAFETY: hraw 来自本条 WM_INPUT；缓冲/探测路径下 pcbSize 指向本栈变量且缓冲容量匹配。
             let q = unsafe { GetRawInputData(hraw, RID_INPUT, None, &mut needed, header_size) };
             if q == u32::MAX || needed == 0 {
                 return;
@@ -803,6 +817,7 @@ impl RawInputState {
                 self.buf.resize(words, 0);
                 copied = (self.buf.len() * std::mem::size_of::<u64>()) as u32;
             }
+            // SAFETY: hraw 来自本条 WM_INPUT；缓冲/探测路径下 pcbSize 指向本栈变量且缓冲容量匹配。
             n = unsafe {
                 GetRawInputData(
                     hraw,
@@ -821,6 +836,7 @@ impl RawInputState {
         }
         // u64 对齐缓冲上重建 RAWINPUT 视图；仅读取与 dwType 匹配的联合体成员，
         // 保证读取范围不超过本次拷回的字节数
+        // SAFETY: buf 刚被 GetRawInputData 按 RAWINPUT 布局写满，对齐与容量已满足 header+data。
         let raw = unsafe { &*(self.buf.as_ptr().cast::<RAWINPUT>()) };
         match raw.header.dwType {
             t if t == RIM_TYPEKEYBOARD.0 => {
@@ -828,6 +844,7 @@ impl RawInputState {
                     return;
                 }
                 // Safety: 仅读取与 dwType 匹配的成员，且 n 已验证覆盖 header+RAWKEYBOARD
+                // SAFETY: raw 已判定为对应 RIM_TYPE*；data 联合体该臂在本匹配分支内有效。
                 let kb = unsafe { &raw.data.keyboard };
                 self.handle_keyboard(raw.header.hDevice, kb, live_token);
             }
@@ -836,6 +853,7 @@ impl RawInputState {
                     return;
                 }
                 // Safety: 仅读取与 dwType 匹配的成员，且 n 已验证覆盖 header+RAWMOUSE
+                // SAFETY: raw 已判定为对应 RIM_TYPE*；data 联合体该臂在本匹配分支内有效。
                 let mouse = unsafe { &raw.data.mouse };
                 self.handle_mouse(raw.header.hDevice, mouse, live_token);
             }
@@ -855,6 +873,7 @@ impl RawInputState {
     ) {
         // §4.1：make 取 RAWKEYBOARD.MakeCode 的低 8 位（windows 绑定中该字段为 u16）
         let sc =
+            // SAFETY: 仅按 vk/扫码做布局无关映射；无句柄，输入为数值码。
             normalize_keyboard_event((kb.MakeCode & 0xFF) as u8, kb.Flags, kb.VKey, |vk| unsafe {
                 MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX)
             });
@@ -889,6 +908,7 @@ impl RawInputState {
         let source = self
             .sources
             .source_for(hdevice.0 as isize, DeviceKind::Mouse);
+        // SAFETY: mouse 为 RIM_TYPEMOUSE 的 RAWMOUSE；Anonymous 臂与 header 在本函数栈上有效。
         let (flags, data, last_x, last_y, mouse_flags) = unsafe {
             let a = &mouse.Anonymous.Anonymous;
             (

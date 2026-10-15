@@ -162,6 +162,7 @@ impl HidEndpoint {
         let event = match unsafe { CreateEventW(None, false, false, None) } {
             Ok(event) => event,
             Err(e) => {
+                // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
                 unsafe {
                     let _ = CloseHandle(handle);
                 }

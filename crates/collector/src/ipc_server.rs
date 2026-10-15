@@ -728,6 +728,7 @@ mod tests {
     ///
     /// `Err` 返回值用于「写/读中途断开」的场景（如超长行被服务端断开）。
     unsafe fn transact(request: &str, deadline: Instant) -> windows::core::Result<String> {
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(deadline) };
         let result = (|| {
             let mut request = request.as_bytes().to_vec();
@@ -776,6 +777,7 @@ mod tests {
 
         // → {"cmd":"status"}
         // ← {"ok":true,"data":{...}} —— 与 §4.4 示例逐字一致（值由 test_status 固定）
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
         assert_eq!(
             response,
@@ -783,6 +785,7 @@ mod tests {
         );
 
         // → {"cmd":"set_paused","paused":true}  ← {"ok":true,"data":null}
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"set_paused","paused":true}"#, deadline) }
             .expect("set_paused 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
@@ -792,11 +795,13 @@ mod tests {
         );
 
         // → {"cmd":"bogus"}  ← {"ok":false,"error":"unknown command"}
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"bogus"}"#, deadline) }.expect("bogus 往返");
         assert_eq!(response, r#"{"ok":false,"error":"unknown command"}"#);
 
         // → {"cmd":"shutdown"}  ← {"ok":true,"data":null}，随后服务线程退出
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         assert!(
@@ -815,10 +820,12 @@ mod tests {
         let server = spawn(flags.clone(), status.clone());
         let deadline = Instant::now() + Duration::from_secs(10);
 
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"set_paused","paused":true}"#, deadline) }
             .expect("set_paused 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
 
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
         assert!(
             response.contains(r#""paused":true"#),
@@ -835,6 +842,7 @@ mod tests {
 
         // record_event 后计数与时间戳出现（S9 engine_loop 的调用面）
         status.record_event();
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
         assert!(
             response.contains(r#""events_seen":1"#),
@@ -846,9 +854,11 @@ mod tests {
         );
 
         // 恢复统计
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"set_paused","paused":false}"#, deadline) }
             .expect("set_paused(false) 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("status 往返");
         assert!(
             response.contains(r#""paused":false"#),
@@ -856,6 +866,7 @@ mod tests {
         );
 
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         server.join().expect("服务线程应随 shutdown 正常退出");
@@ -903,20 +914,24 @@ mod tests {
         let server = spawn(flags.clone(), status.clone());
         let deadline = Instant::now() + Duration::from_secs(10);
 
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact("not json", deadline) }.expect("非法 JSON 往返");
         assert_eq!(response, r#"{"ok":false,"error":"invalid request"}"#);
 
         // 已知命令但缺参数 → invalid request（不是 unknown command）
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"set_paused"}"#, deadline) }.expect("缺参 set_paused 往返");
         assert_eq!(response, r#"{"ok":false,"error":"invalid request"}"#);
 
         // 超长行：8KB + 1 字节无换行 → 断开且无响应（读端得到空串或连接错误）
         let overlong = "x".repeat(MAX_REQUEST_BYTES + 1);
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&overlong, deadline) }.unwrap_or_default();
         assert_eq!(response, "", "超长行必须断开且不响应");
 
         // 服务端仍活着：正常请求可继续往返
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("恢复后 status");
         assert!(
             response.contains(r#""ok":true"#),
@@ -924,6 +939,7 @@ mod tests {
         );
 
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
         server.join().expect("服务线程应随 shutdown 正常退出");
@@ -939,10 +955,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
 
         // 卡死客户端：连入后不发任何数据（worker 阻塞在 ReadFile）
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let stalled = unsafe { open_client(deadline) };
 
         // 后续连接不受影响：status / shutdown 照常往返
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"status"}"#, deadline) }.expect("stall 下 status 往返");
         assert!(
             response.contains(r#""ok":true"#),
@@ -950,6 +968,7 @@ mod tests {
         );
 
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(r#"{"cmd":"shutdown"}"#, deadline) }.expect("stall 下 shutdown 往返");
         assert_eq!(response, r#"{"ok":true,"data":null}"#);
 
@@ -1022,6 +1041,7 @@ mod tests {
         let status = Arc::new(RuntimeStatus::new("0.1.0"));
         let server = spawn(flags.clone(), status.clone());
 
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let client = unsafe { open_client(Instant::now() + Duration::from_secs(10)) };
         // SAFETY: client 已连入；查询其内核对象 DACL。
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -1042,6 +1062,7 @@ mod tests {
         assert!(!dacl.is_null(), "必须有 DACL");
 
         // 恰一条 ACE（受保护 DACL 不允许继承项混入）
+        // SAFETY: dacl 来自刚成功的 GetSecurityInfo，在 LocalFree(sd) 之前有效。
         let ace_count = unsafe { (*dacl).AceCount };
         assert_eq!(
             ace_count, 1,
@@ -1059,6 +1080,7 @@ mod tests {
         assert_eq!(ace.Header.AceType, 0, "必须为允许型（ACCESS_ALLOWED_ACE）");
 
         // ACE SID 必须等于当前用户 SID（运行时解析的正是同一来源：进程令牌）
+        // SAFETY: 测试辅助：读取当前进程 TokenUser SID 字节；内部 token/buf 在返回前释放。
         let current = unsafe { current_user_sid_bytes() };
         assert!(!current.is_empty(), "当前用户 SID 必须可解析");
         // SAFETY: current 持有完整 SID 结构；ace.SidStart 的地址即 ACE 内 SID 的起始。
@@ -1088,6 +1110,7 @@ mod tests {
         unsafe {
             let _ = CloseHandle(client);
         }
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe {
             transact(
                 r#"{"cmd":"shutdown"}"#,

@@ -12,6 +12,7 @@
 //! 采集器故障隔离（§1）：退出/隐藏 GUI 绝不影响采集进程；托盘"暂停-恢复"只通过
 //! 控制管道（§4.4）转发，管道不可达时打开主窗口给引导态而非报错。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 /// GUI 侧调试日志（§9.2 / §4.1-S1 适配）：stderr 部分沿用原诊断习惯——仅设置
 /// `CLRECODER_DEBUG` 环境变量时输出（与 collector 的 debug_log! 同策略）；同时把消息

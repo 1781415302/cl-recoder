@@ -365,6 +365,7 @@ mod win {
             if self.handle.is_invalid() {
                 return;
             }
+            // SAFETY: self.handle/self.event 为本连接独占句柄；调用方保证无栈上悬垂 OVERLAPPED（wait_overlapped 已收尾 IRP）后 CancelIoEx+CloseHandle。
             unsafe {
                 // 取消该句柄上所有未决 IO，再关闭；调用方保证无栈上悬垂 OVERLAPPED
                 // （wait_overlapped 返回前已等到 IRP 收尾）。
@@ -388,6 +389,7 @@ mod win {
                     ..Default::default()
                 };
                 let mut transferred = 0u32;
+                // SAFETY: handle 有效；源缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let submit = unsafe {
                     WriteFile(
                         self.handle,
@@ -428,6 +430,7 @@ mod win {
                     ..Default::default()
                 };
                 let mut transferred = 0u32;
+                // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let submit = unsafe {
                     ReadFile(
                         self.handle,
@@ -505,6 +508,7 @@ mod win {
             Ok(()) => {
                 // 同步完成：transferred 已由 API 填好，再查一次确认
                 let mut transferred = 0u32;
+                // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                 unsafe { GetOverlappedResult(handle, ov, &mut transferred, false) }.map_err(
                     |e| IoKind::Io(format!("同步完成查询失败: {e}")),
                 )?;
@@ -527,9 +531,11 @@ mod win {
             } else {
                 slice_ms.max(1)
             };
+            // SAFETY: 等待对象为本路径持有的有效事件句柄；超时切片内句柄不被关闭。
             let _ = unsafe { WaitForSingleObject(ov.hEvent, wait_ms) };
 
             let mut transferred = 0u32;
+            // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
             match unsafe { GetOverlappedResult(handle, ov, &mut transferred, false) } {
                 Ok(()) => {
                     return if cancelled {
@@ -550,6 +556,7 @@ mod win {
             }
 
             if !cancelled && Instant::now() >= deadline {
+                // SAFETY: handle 有效；ov 指向该句柄上未决 IRP（或 None 取消全部）；随后仍须 GetOverlappedResult/等待收尾。
                 let _ = unsafe { CancelIoEx(handle, Some(ov)) };
                 cancelled = true;
                 continue;
@@ -566,6 +573,7 @@ mod win {
             return Err(IoKind::Timeout);
         }
         let wide = HSTRING::from(name);
+        // SAFETY: wide/name 在调用期间存活；成功句柄由本路径 CloseHandle 或移交包装类型。
         let open = || unsafe {
             CreateFileW(
                 &wide,
@@ -594,6 +602,7 @@ mod win {
                         return Err(IoKind::Timeout);
                     }
                     let wait_ms = remain.as_millis().min(u32::MAX as u128) as u32;
+                    // SAFETY: wide/name 在调用期间存活；仅等待现有实例，不持有返回句柄。
                     if !unsafe { WaitNamedPipeW(&wide, wait_ms) }.as_bool() {
                         return if Instant::now() >= deadline {
                             Err(IoKind::Timeout)
@@ -623,14 +632,18 @@ mod win {
         };
 
         let mode = PIPE_READMODE_BYTE;
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         if let Err(e) = unsafe { SetNamedPipeHandleState(handle, Some(&mode), None, None) } {
+            // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
             unsafe {
                 let _ = CloseHandle(handle);
             }
             return Err(IoKind::Io(format!("设置管道模式失败: {e}")));
         }
 
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         let event = unsafe { CreateEventW(None, false, false, None) }.map_err(|e| {
+            // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
             unsafe {
                 let _ = CloseHandle(handle);
             }
@@ -1159,6 +1172,7 @@ mod tests {
 
         fn open_server(name: &str) -> HANDLE {
             let wide = HSTRING::from(name);
+            // SAFETY: name/HSTRING 与 SECURITY_ATTRIBUTES 在调用期间存活；返回句柄由本路径 Disconnect/CloseHandle 释放。
             let server = unsafe {
                 CreateNamedPipeW(
                     &wide,
@@ -1177,12 +1191,14 @@ mod tests {
 
         fn accept_one(server: HANDLE, accepting: Option<&AtomicBool>) {
             use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
+            // SAFETY: handle 为已创建的管道实例；ov.hEvent 为本连接专用且在 Wait/GetOverlappedResult 期间有效。
             let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
             let mut ov = OVERLAPPED {
                 hEvent: event,
                 ..Default::default()
             };
             // 先标记「已提交 listen」，再等连接完成——客户端须在 pending 后才 CreateFile。
+            // SAFETY: handle 为已创建的管道实例；ov.hEvent 为本连接专用且在 Wait/GetOverlappedResult 期间有效。
             let submitted = unsafe { ConnectNamedPipe(server, Some(&mut ov)) };
             if let Some(flag) = accepting {
                 // 复用同一 flag：false→pending 已提交；测试用第二 flag 更清晰，见 wait_listening
@@ -1198,6 +1214,7 @@ mod tests {
                         let mut transferred = 0u32;
                         let deadline = Instant::now() + Duration::from_secs(2);
                         loop {
+                            // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                             let r = unsafe {
                                 GetOverlappedResult(server, &ov, &mut transferred, false)
                             };
@@ -1222,6 +1239,7 @@ mod tests {
                     }
                 }
             }
+            // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
             unsafe {
                 let _ = CloseHandle(event);
             }
@@ -1250,6 +1268,7 @@ mod tests {
             let responder = thread::spawn(move || {
                 let server = bits_to_handle(server_bits);
                 accept_one(server, Some(&accepting2));
+                // SAFETY: 匿名手动/自动重置事件；成功句柄由本结构/函数在退出路径 CloseHandle。
                 let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
                 let mut transferred = 0u32;
                 let mut req_buf = vec![0u8; 256];
@@ -1257,6 +1276,7 @@ mod tests {
                     hEvent: event,
                     ..Default::default()
                 };
+                // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let _ = unsafe {
                     ReadFile(
                         server,
@@ -1268,6 +1288,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut n = 0u32;
+                    // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                     if unsafe { GetOverlappedResult(server, &ov_req, &mut n, false) }.is_ok() {
                         break;
                     }
@@ -1285,12 +1306,14 @@ mod tests {
                     ..Default::default()
                 };
                 let mut wtrans = 0u32;
+                // SAFETY: handle 有效；源缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let _ = unsafe {
                     WriteFile(server, Some(&reply), Some(&mut wtrans), Some(&mut ovw))
                 };
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut wn = 0u32;
+                    // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                     if unsafe { GetOverlappedResult(server, &ovw, &mut wn, false) }.is_ok() {
                         break;
                     }
@@ -1307,6 +1330,7 @@ mod tests {
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
+                // SAFETY: handle/server 为本路径持有的管道实例；断开后关闭关联 event 与句柄，之后不再使用。
                 unsafe {
                     let _ = DisconnectNamedPipe(server);
                     let _ = CloseHandle(event);
@@ -1339,6 +1363,7 @@ mod tests {
                 accept_one(server, Some(&accepting2));
                 // 读挂起：客户端写完后我们故意不回复，并阻塞在读下一笔（或空转）
                 // 直到客户端因超时关闭连接。
+                // SAFETY: 匿名手动/自动重置事件；成功句柄由本结构/函数在退出路径 CloseHandle。
                 let event = unsafe { CreateEventW(None, false, false, None) }.unwrap();
                 let mut buf = vec![0u8; 1];
                 let mut ov = OVERLAPPED {
@@ -1352,6 +1377,7 @@ mod tests {
                     hEvent: event,
                     ..Default::default()
                 };
+                // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let _ = unsafe {
                     ReadFile(
                         server,
@@ -1363,6 +1389,7 @@ mod tests {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
                     let mut n = 0u32;
+                    // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                     if unsafe { GetOverlappedResult(server, &ov_req, &mut n, false) }.is_ok() {
                         break;
                     }
@@ -1372,6 +1399,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(5));
                 }
                 // 不写响应；再挂起一次读，等待客户端关连接导致失败
+                // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
                 let _ = unsafe {
                     ReadFile(
                         server,
@@ -1383,6 +1411,7 @@ mod tests {
                 let wait_deadline = Instant::now() + Duration::from_secs(3);
                 loop {
                     let mut n = 0u32;
+                    // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                     let r = unsafe { GetOverlappedResult(server, &ov, &mut n, false) };
                     if r.is_ok()
                         || r
@@ -1394,6 +1423,7 @@ mod tests {
                         break;
                     }
                     if Instant::now() >= wait_deadline {
+                        // SAFETY: handle 有效；ov 指向该句柄上未决 IRP（或 None 取消全部）；随后仍须 GetOverlappedResult/等待收尾。
                         let _ = unsafe {
                             windows::Win32::System::IO::CancelIoEx(server, Some(&ov))
                         };
@@ -1401,6 +1431,7 @@ mod tests {
                         loop {
                             let mut n2 = 0u32;
                             let r2 =
+                                // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
                                 unsafe { GetOverlappedResult(server, &ov, &mut n2, false) };
                             if r2.is_ok()
                                 || r2.as_ref().err().map(|e| {
@@ -1419,6 +1450,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(10));
                 }
                 finished2.store(true, Ordering::SeqCst);
+                // SAFETY: handle/server 为本路径持有的管道实例；断开后关闭关联 event 与句柄，之后不再使用。
                 unsafe {
                     let _ = DisconnectNamedPipe(server);
                     let _ = CloseHandle(event);

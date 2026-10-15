@@ -196,6 +196,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
     let name = PCWSTR::from_raw(name_wide.as_ptr());
 
     let open = || -> windows::core::Result<HANDLE> {
+        // SAFETY: wide/name 在调用期间存活；成功句柄由本路径 CloseHandle 或移交包装类型。
         unsafe {
             CreateFileW(
                 name,
@@ -214,6 +215,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
         Err(e) => {
             let code = e.code();
             if code == ERROR_PIPE_BUSY.to_hresult() {
+                // SAFETY: wide/name 在调用期间存活；仅等待现有实例，不持有返回句柄。
                 if !unsafe { WaitNamedPipeW(name, CTL_TIMEOUT.as_millis() as u32) }.as_bool() {
                     return Err(CtlError {
                         kind: PipeFailureKind::Busy,
@@ -235,6 +237,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
 
     // HANDLE → 属主 File：后续读写全走 std::io；File Drop = CloseHandle（不重复关闭）
     let mut file =
+        // SAFETY: handle 为刚打开的管道句柄；mode 指向本栈 PIPE_READMODE_* 值。
         unsafe { std::fs::File::from_raw_handle(handle.0 as std::os::windows::io::RawHandle) };
 
     let result = (|| -> Result<CtlResponse, CtlError> {
@@ -295,6 +298,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
 fn set_pipe_byte_mode(handle: windows::Win32::Foundation::HANDLE) -> windows::core::Result<()> {
     use windows::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_BYTE};
     let mode = PIPE_READMODE_BYTE;
+    // SAFETY: handle 为刚打开的管道句柄；mode 指向本栈 PIPE_READMODE_* 值。
     unsafe { SetNamedPipeHandleState(handle, Some(&mode), None, None) }
 }
 

@@ -85,6 +85,7 @@ fn run_server(pipe_name: &str, flags: &Arc<Flags>, live: &Arc<LiveInputRuntime>)
         }
     };
 
+    // SAFETY: 匿名手动/自动重置事件；成功句柄由本结构/函数在退出路径 CloseHandle。
     let event = match unsafe { CreateEventW(None, true, false, None) } {
         Ok(e) => e,
         Err(err) => {
@@ -150,6 +151,7 @@ enum AcceptOutcome {
 /// 有界 overlapped `ConnectNamedPipe`；关停经 CancelIoEx，不自连生产管。
 fn accept_client(handle: HANDLE, event: HANDLE, flags: &Flags) -> AcceptOutcome {
     // 手动重置事件：每次提交前 Reset
+    // SAFETY: event 由本线程创建且尚未关闭；提交 overlapped 前重置。
     unsafe {
         let _ = ResetEvent(event);
     }
@@ -157,6 +159,7 @@ fn accept_client(handle: HANDLE, event: HANDLE, flags: &Flags) -> AcceptOutcome 
         hEvent: event,
         ..Default::default()
     };
+    // SAFETY: handle 为已创建的管道实例；ov.hEvent 为本连接专用且在 Wait/GetOverlappedResult 期间有效。
     let submit = unsafe { ConnectNamedPipe(handle, Some(&mut ov)) };
     match submit {
         Ok(()) => return AcceptOutcome::Connected,
@@ -177,8 +180,10 @@ fn accept_client(handle: HANDLE, event: HANDLE, flags: &Flags) -> AcceptOutcome 
             let _ = cancel_and_wait(handle, &mut ov);
             return AcceptOutcome::Shutdown;
         }
+        // SAFETY: 等待对象为本路径持有的有效事件句柄；超时切片内句柄不被关闭。
         let _ = unsafe { WaitForSingleObject(event, WAIT_SLICE.as_millis() as u32) };
         let mut transferred = 0u32;
+        // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
         match unsafe { GetOverlappedResult(handle, &ov, &mut transferred, false) } {
             Ok(()) => return AcceptOutcome::Connected,
             Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => {
@@ -339,6 +344,7 @@ fn read_request_line(
         if Instant::now() >= deadline {
             return Err(IoFail::Timeout);
         }
+        // SAFETY: event 由本线程创建且尚未关闭；提交 overlapped 前重置。
         unsafe {
             let _ = ResetEvent(event);
         }
@@ -347,6 +353,7 @@ fn read_request_line(
             ..Default::default()
         };
         let mut transferred = 0u32;
+        // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
         let submit = unsafe {
             ReadFile(
                 handle,
@@ -390,6 +397,7 @@ fn write_all(
         if Instant::now() >= deadline {
             return Err(IoFail::Timeout);
         }
+        // SAFETY: event 由本线程创建且尚未关闭；提交 overlapped 前重置。
         unsafe {
             let _ = ResetEvent(event);
         }
@@ -399,6 +407,7 @@ fn write_all(
         };
         let chunk = &buf[offset..];
         let mut transferred = 0u32;
+        // SAFETY: handle 有效；源缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
         let submit = unsafe {
             WriteFile(
                 handle,
@@ -427,6 +436,7 @@ fn wait_overlapped(
     match submit {
         Ok(()) => {
             let mut transferred = 0u32;
+            // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
             unsafe { GetOverlappedResult(handle, ov, &mut transferred, false) }.map_err(|e| {
                 IoFail::Io(format!("同步完成查询失败: {e}"))
             })?;
@@ -439,6 +449,7 @@ fn wait_overlapped(
     let mut cancelled = false;
     loop {
         if !cancelled && flags.shutdown.load(Ordering::Acquire) {
+            // SAFETY: handle 有效；ov 指向该句柄上未决 IRP（或 None 取消全部）；随后仍须 GetOverlappedResult/等待收尾。
             let _ = unsafe { CancelIoEx(handle, Some(ov)) };
             cancelled = true;
         }
@@ -451,9 +462,11 @@ fn wait_overlapped(
         } else {
             slice_ms.max(1)
         };
+        // SAFETY: 等待对象为本路径持有的有效事件句柄；超时切片内句柄不被关闭。
         let _ = unsafe { WaitForSingleObject(ov.hEvent, wait_ms) };
 
         let mut transferred = 0u32;
+        // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
         match unsafe { GetOverlappedResult(handle, ov, &mut transferred, false) } {
             Ok(()) => {
                 return if cancelled {
@@ -482,6 +495,7 @@ fn wait_overlapped(
         }
 
         if !cancelled && Instant::now() >= deadline {
+            // SAFETY: handle 有效；ov 指向该句柄上未决 IRP（或 None 取消全部）；随后仍须 GetOverlappedResult/等待收尾。
             let _ = unsafe { CancelIoEx(handle, Some(ov)) };
             cancelled = true;
             continue;
@@ -493,16 +507,19 @@ fn wait_overlapped(
 }
 
 fn cancel_and_wait(handle: HANDLE, ov: &mut OVERLAPPED) -> Result<(), ()> {
+    // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
     let _ = unsafe { CancelIoEx(handle, Some(ov)) };
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         let mut transferred = 0u32;
+        // SAFETY: handle 与 ov 对应同一次未完成/已完成 IRP；ov.hEvent 仍有效；transferred 为本栈变量。
         match unsafe { GetOverlappedResult(handle, ov, &mut transferred, false) } {
             Ok(()) => return Ok(()),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => {
                 if Instant::now() >= deadline {
                     return Err(());
                 }
+                // SAFETY: 等待对象为本路径持有的有效事件句柄；超时切片内句柄不被关闭。
                 let _ = unsafe { WaitForSingleObject(ov.hEvent, 25) };
             }
             Err(_) => return Ok(()), // 已失败/取消完成
@@ -582,6 +599,7 @@ mod tests {
             if Instant::now() >= deadline {
                 panic!("连接 live 测试管道超时");
             }
+            // SAFETY: wide/name 在调用期间存活；成功句柄由本路径 CloseHandle 或移交包装类型。
             match unsafe {
                 CreateFileW(
                     &wide,
@@ -595,6 +613,7 @@ mod tests {
             } {
                 Ok(h) => return h,
                 Err(err) if err.code() == HRESULT::from_win32(ERROR_PIPE_BUSY.0) => {
+                    // SAFETY: wide/name 在调用期间存活；仅等待现有实例，不持有返回句柄。
                     unsafe {
                         let _ = WaitNamedPipeW(&wide, 50);
                     }
@@ -611,6 +630,7 @@ mod tests {
         let mut offset = 0usize;
         while offset < buf.len() {
             let mut written = 0u32;
+            // SAFETY: handle 有效；源缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
             unsafe {
                 WriteFile(handle, Some(&buf[offset..]), Some(&mut written), None)?;
             }
@@ -630,6 +650,7 @@ mod tests {
                 return None;
             }
             let mut read = 0u32;
+            // SAFETY: handle 有效；目标缓冲在调用期间存活；若 OVERLAPPED 则 ov.hEvent 有效且直至结果取回。
             if unsafe { ReadFile(handle, Some(&mut chunk), Some(&mut read), None) }.is_err() {
                 return if acc.is_empty() { None } else { Some(acc) };
             }
@@ -649,14 +670,18 @@ mod tests {
     }
 
     unsafe fn transact(name: &str, request: &str, deadline: Instant) -> Option<String> {
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(name, deadline) };
         let result = (|| {
             let mut req = request.as_bytes().to_vec();
             req.push(b'\n');
+            // SAFETY: 测试辅助：handle 为已连接客户端；buf 在写完前存活。
             unsafe { write_all_sync(handle, &req) }.ok()?;
+            // SAFETY: 测试辅助：handle 为已连接客户端；读入堆缓冲直至换行或上限。
             let raw = unsafe { read_line_sync(handle, LIVE_MAX_RESPONSE_BYTES, deadline) }?;
             String::from_utf8(raw).ok()
         })();
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -669,6 +694,7 @@ mod tests {
         let (name, flags, _live, server) = start_server("roundtrip");
         let deadline = Instant::now() + Duration::from_secs(5);
 
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("往返应成功");
         let reply: LiveSnapshotReply =
@@ -680,6 +706,7 @@ mod tests {
         assert_eq!(snap.sample_seq, "1");
 
         // 同连接多笔：再开新连接（服务端 disconnect 后重新 accept）
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response2 = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("第二笔往返");
         let reply2: LiveSnapshotReply = serde_json::from_str(&response2).unwrap();
@@ -694,6 +721,7 @@ mod tests {
         let (name, flags, _live, server) = start_server("badver");
         let deadline = Instant::now() + Duration::from_secs(5);
         let response =
+            // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
             unsafe { transact(&name, r#"{"protocolVersion":99}"#, deadline) }.expect("应有结构化错误");
         let reply: LiveSnapshotReply = serde_json::from_str(&response).unwrap();
         assert!(reply.snapshot.is_none());
@@ -709,12 +737,16 @@ mod tests {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("overlong");
         let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(&name, deadline) };
         // 超长且无换行
         let overlong = vec![b'x'; LIVE_MAX_REQUEST_BYTES + 8];
+        // SAFETY: 测试辅助：handle 为已连接客户端；buf 在写完前存活。
         let _ = unsafe { write_all_sync(handle, &overlong) };
         // 读应失败或空（服务端断开不响应）
+        // SAFETY: 测试辅助：handle 为已连接客户端；读入堆缓冲直至换行或上限。
         let got = unsafe { read_line_sync(handle, 64, Instant::now() + Duration::from_millis(500)) };
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -724,6 +756,7 @@ mod tests {
         );
 
         // 服务端须恢复：随后正常往返
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("超长后应恢复");
         assert!(response.contains("snapshot"), "{response}");
@@ -735,14 +768,18 @@ mod tests {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("partial");
         let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(&name, deadline) };
         // 残包：不完整 JSON、无换行，随即关闭
+        // SAFETY: 测试辅助：handle 为已连接客户端；buf 在写完前存活。
         let _ = unsafe { write_all_sync(handle, b"{\"protocolVersion\":") };
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         unsafe {
             let _ = CloseHandle(handle);
         }
         // 给服务端时间回到 accept
         std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("残包断线后应恢复");
         let reply: LiveSnapshotReply = serde_json::from_str(&response).unwrap();
@@ -755,17 +792,21 @@ mod tests {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("unread");
         let deadline = Instant::now() + Duration::from_secs(8);
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(&name, deadline) };
         let mut req = br#"{"protocolVersion":1}"#.to_vec();
         req.push(b'\n');
+        // SAFETY: 测试辅助：handle 为已连接客户端；buf 在写完前存活。
         unsafe { write_all_sync(handle, &req) }.expect("写请求");
         // 故意不读响应：服务端写缓冲填满或写超时后应断开并重新监听
         // 保持句柄打开但不读，等待 >250ms
         std::thread::sleep(Duration::from_millis(LIVE_IO_TIMEOUT_MS + 200));
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         unsafe {
             let _ = CloseHandle(handle);
         }
         std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("不读响应超时后应恢复");
         assert!(response.contains("protocolVersion"), "{response}");
@@ -778,12 +819,15 @@ mod tests {
         let (name, flags, _live, server) = start_server("idle");
         let deadline = Instant::now() + Duration::from_secs(8);
         // 连入后不发数据 → 服务端 idle 250ms 取消
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(&name, deadline) };
         std::thread::sleep(Duration::from_millis(LIVE_IO_TIMEOUT_MS + 200));
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         unsafe {
             let _ = CloseHandle(handle);
         }
         std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: 测试辅助：open_client+读写+关闭完整往返；request 与 name 在调用期间存活。
         let response = unsafe { transact(&name, r#"{"protocolVersion":1}"#, deadline) }
             .expect("idle 超时后应重新监听");
         let reply: LiveSnapshotReply = serde_json::from_str(&response).unwrap();
@@ -811,6 +855,7 @@ mod tests {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("shut-idle");
         let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let handle = unsafe { open_client(&name, deadline) };
         // 已连接、未发请求（idle 读挂起）
         std::thread::sleep(Duration::from_millis(30));
@@ -826,6 +871,7 @@ mod tests {
         }
         server.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -836,10 +882,12 @@ mod tests {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("nmax");
         let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let client = unsafe { open_client(&name, deadline) };
 
         let mut flags_mode = windows::Win32::System::Pipes::NAMED_PIPE_MODE(0);
         let mut max_inst = 0u32;
+        // SAFETY: client 为本测试刚打开的有效管道句柄；输出指针指向本栈变量。
         unsafe {
             GetNamedPipeInfo(
                 client,
@@ -862,6 +910,7 @@ mod tests {
         let _ = (PIPE_SERVER_END, PIPE_TYPE_BYTE);
         // 第二实例应失败（nmax=1 且已有连接）
         let wide = HSTRING::from(&name);
+        // SAFETY: wide/name 在调用期间存活；成功句柄由本路径 CloseHandle 或移交包装类型。
         let second = unsafe {
             CreateFileW(
                 &wide,
@@ -878,6 +927,7 @@ mod tests {
             "第二客户端在 nMaxInstances=1 时应被拒"
         );
 
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(client);
         }
@@ -888,10 +938,12 @@ mod tests {
     fn live_server_dacl_current_user_sid() {
         let _guard = SERVER_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (name, flags, _live, server) = start_server("dacl");
+        // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let client = unsafe { open_client(&name, Instant::now() + Duration::from_secs(5)) };
 
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: client/handle 为已打开的内核对象句柄；sd/dacl 由系统分配，用毕 LocalFree。
         let err = unsafe {
             GetSecurityInfo(
                 client,
@@ -906,17 +958,22 @@ mod tests {
         };
         assert_eq!(err, WIN32_ERROR(0), "GetSecurityInfo 失败: {}", err.0);
         assert!(!dacl.is_null());
+        // SAFETY: current 持有完整 SID 字节；ace.SidStart 地址即 ACE 内 SID 起始，两者在比较期间均有效。
         let ace_count = unsafe { (*dacl).AceCount };
         assert_eq!(ace_count, 1, "显式 DACL 须恰一条 ACE");
 
         let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: current 持有完整 SID 字节；ace.SidStart 地址即 ACE 内 SID 起始，两者在比较期间均有效。
         unsafe {
             GetAce(dacl, 0, &mut ace_ptr).expect("GetAce");
         }
+        // SAFETY: current 持有完整 SID 字节；ace.SidStart 地址即 ACE 内 SID 起始，两者在比较期间均有效。
         let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
         assert_eq!(ace.Header.AceType, 0);
 
+        // SAFETY: 测试辅助：读取当前进程 TokenUser SID 字节；内部 token/buf 在返回前释放。
         let current = unsafe { current_user_sid_bytes() };
+        // SAFETY: current 持有完整 SID 字节；ace.SidStart 地址即 ACE 内 SID 起始，两者在比较期间均有效。
         unsafe {
             EqualSid(
                 PSID(&ace.SidStart as *const u32 as *mut core::ffi::c_void),
@@ -927,6 +984,7 @@ mod tests {
 
         let mut control = 0u16;
         let mut revision = 0u32;
+        // SAFETY: sd 由 GetSecurityInfo 返回且在本断言期间未 LocalFree。
         unsafe {
             GetSecurityDescriptorControl(sd, &mut control, &mut revision).unwrap();
         }
@@ -935,6 +993,7 @@ mod tests {
         // PIPE_REJECT_REMOTE_CLIENTS：创建时传入；此处用常量存在性 + nmax 测试覆盖参数合同
         assert_eq!(PIPE_REJECT_REMOTE_CLIENTS.0, 8);
 
+        // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
         unsafe {
             let _ = CloseHandle(client);
         }
@@ -951,14 +1010,17 @@ mod tests {
 
     unsafe fn current_user_sid_bytes() -> Vec<u8> {
         let mut token = HANDLE::default();
+        // SAFETY: token 有效；缓冲/None 探测路径下 len 由系统回填；写入期间 buf 不移动。
         unsafe {
             OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
         }
         let mut len = 0u32;
+        // SAFETY: token 有效；缓冲/None 探测路径下 len 由系统回填；写入期间 buf 不移动。
         unsafe {
             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
         }
         let mut buf = vec![0u64; len as usize / 8 + 1];
+        // SAFETY: token 有效；缓冲/None 探测路径下 len 由系统回填；写入期间 buf 不移动。
         unsafe {
             GetTokenInformation(
                 token,
@@ -969,11 +1031,15 @@ mod tests {
             )
             .unwrap();
         }
+        // SAFETY: user.User.Sid 指向刚写入的 TOKEN_USER 缓冲内有效 SID；长度为 GetLengthSid 返回值。
         unsafe {
             let _ = CloseHandle(token);
         }
+        // SAFETY: user.User.Sid 指向刚写入的 TOKEN_USER 缓冲内有效 SID；长度为 GetLengthSid 返回值。
         let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        // SAFETY: user.User.Sid 指向刚写入的 TOKEN_USER 缓冲内有效 SID；长度为 GetLengthSid 返回值。
         let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+        // SAFETY: user.User.Sid 指向刚写入的 TOKEN_USER 缓冲内有效 SID；长度为 GetLengthSid 返回值。
         unsafe { std::slice::from_raw_parts(user.User.Sid.0 as *const u8, sid_len) }.to_vec()
     }
 }
