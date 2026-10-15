@@ -24,6 +24,7 @@ use clrecoder_update::{
 use super::collector_ctl::{
     ctl_request_typed, ps_quote, run_scheduled_task_now, wait_collector_running, win_path_is_under,
 };
+use super::collector_health::PipeFailureKind;
 
 /// GUI 侧更新运行态（`app.manage`；PLAN §6）。
 pub struct UpdateRuntime {
@@ -423,31 +424,76 @@ fn run_installer_elevated(installer: &Path) -> Result<(), (UpdateErrorCode, Stri
     }
 }
 
+/// 一次 Status 探测的可达性分类（P0-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectorReachability {
+    /// Ok 且 resp.ok —— 采集器在跑
+    Running,
+    /// Err(NotFound) —— 管道不存在，视为已退出/未运行
+    Gone,
+    /// 其它一切（Busy/Timeout/Io/Protocol/AccessDenied、Ok 但 !ok 等）
+    Unknown,
+}
+
+/// 将一次 `ctl_request_typed(Status)` 的抽象结果分类（纯函数，可单测）。
+///
+/// `Ok(true)` = Running；`Err(NotFound)` = Gone；其余 = Unknown。
+#[must_use]
+pub(crate) fn classify_collector_status(
+    result: Result<bool, PipeFailureKind>,
+) -> CollectorReachability {
+    match result {
+        Ok(true) => CollectorReachability::Running,
+        Err(PipeFailureKind::NotFound) => CollectorReachability::Gone,
+        Ok(false) | Err(_) => CollectorReachability::Unknown,
+    }
+}
+
+fn probe_collector_status() -> CollectorReachability {
+    classify_collector_status(match ctl_request_typed(&CtlRequest::Status) {
+        Ok(resp) => Ok(resp.ok),
+        Err(e) => Err(e.kind),
+    })
+}
+
 fn wait_collector_unreachable(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        let reachable = matches!(
-            ctl_request_typed(&CtlRequest::Status),
-            Ok(resp) if resp.ok
-        );
-        if !reachable {
-            return true;
+        match probe_collector_status() {
+            CollectorReachability::Gone => return true,
+            CollectorReachability::Running | CollectorReachability::Unknown => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
         }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
 fn stop_collector_gracefully() -> Result<bool, (UpdateErrorCode, String)> {
-    // 管道本就不可达 → 未运行
-    let running = matches!(
-        ctl_request_typed(&CtlRequest::Status),
-        Ok(resp) if resp.ok
-    );
-    if !running {
-        return Ok(false);
+    // 先探测：Unknown 间隔 300ms 重试，最多 5 次
+    let mut reach = CollectorReachability::Unknown;
+    for attempt in 0..5 {
+        reach = probe_collector_status();
+        match reach {
+            CollectorReachability::Running | CollectorReachability::Gone => break,
+            CollectorReachability::Unknown => {
+                if attempt + 1 < 5 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    match reach {
+        CollectorReachability::Gone => return Ok(false),
+        CollectorReachability::Unknown => {
+            return Err((
+                UpdateErrorCode::CollectorStopFailed,
+                "无法确认采集器状态，更新已中止".into(),
+            ));
+        }
+        CollectorReachability::Running => {}
     }
     match ctl_request_typed(&CtlRequest::Shutdown) {
         Ok(resp) if resp.ok => {}
@@ -843,5 +889,35 @@ mod tests {
         assert_eq!(v["receivedBytes"], 10);
         assert_eq!(v["collectorRestored"], false);
         assert!(v.get("received_bytes").is_none());
+    }
+
+    #[test]
+    fn classify_collector_status_running_gone_unknown() {
+        assert_eq!(
+            classify_collector_status(Ok(true)),
+            CollectorReachability::Running
+        );
+        assert_eq!(
+            classify_collector_status(Err(PipeFailureKind::NotFound)),
+            CollectorReachability::Gone
+        );
+        // Ok 但 !resp.ok → Unknown
+        assert_eq!(
+            classify_collector_status(Ok(false)),
+            CollectorReachability::Unknown
+        );
+        for kind in [
+            PipeFailureKind::Busy,
+            PipeFailureKind::Timeout,
+            PipeFailureKind::Io,
+            PipeFailureKind::Protocol,
+            PipeFailureKind::AccessDenied,
+        ] {
+            assert_eq!(
+                classify_collector_status(Err(kind)),
+                CollectorReachability::Unknown,
+                "{kind:?}"
+            );
+        }
     }
 }
