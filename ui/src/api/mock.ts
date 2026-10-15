@@ -641,11 +641,11 @@ export const motionState: {
   failNextSetDpi: false,
   sources: [
     // id 1：同型号第一只——manual 800 + auto 1600 有效（available），含 unknown 桶 → partial coverage
-    { id: 1, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_00", physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
+    { id: 1, deviceId: 3, sourceKey: "\\\\?\\hid#vid_046d&pid_c092&mi_00", physical: true, manualDpi: 800, autoDpi: 1600, autoUntilMs: Date.now() + 30 * 60_000, published: true, probeStatus: "available", buckets: [{ dpi: 1600, base: 120_000 }, { dpi: 0, base: 20_000 }] },
     // id 2：同型号第二只（不同接口路径）——探测失败（unavailable），manual 1200 后备可离线编辑
-    { id: 2, deviceId: 3, sourceKey: "\\?\hid#vid_046d&pid_c092&mi_01", physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
+    { id: 2, deviceId: 3, sourceKey: "\\\\?\\hid#vid_046d&pid_c092&mi_01", physical: true, manualDpi: 1200, autoDpi: null, autoUntilMs: 0, published: true, probeStatus: "unavailable", buckets: [{ dpi: 1200, base: 80_000 }] },
     // id 3：另一型号——离线、无配置、无运动桶 → 合法空（raw=0/meters=null/coverage=null）
-    { id: 3, deviceId: 4, sourceKey: "\\?\hid#vid_1532&pid_0045&mi_00", physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
+    { id: 3, deviceId: 4, sourceKey: "\\\\?\\hid#vid_1532&pid_0045&mi_00", physical: true, manualDpi: null, autoDpi: null, autoUntilMs: 0, published: false, probeStatus: "disconnected", buckets: [] },
   ],
 };
 
@@ -918,7 +918,7 @@ const LIVE_PAD_DEVICE = {
   pid: 0,
   name: "XInput 手柄",
 };
-const LIVE_MOUSE_SOURCE_KEY = "\\?\hid#vid_046d&pid_c092&mi_00";
+const LIVE_MOUSE_SOURCE_KEY = "\\\\?\\hid#vid_046d&pid_c092&mi_00";
 
 /**
  * mockLiveInputSnapshot —— 确定性模拟 held、释放、短按、摇杆、扳机、断连。
