@@ -109,3 +109,81 @@
   border: 1px solid var(--line);
 }
 
+/* ---------- 软件更新（§4.8 UpdateCard；仅追加 .update-*） ---------- */
+.update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+}
+.update-headline {
+  font-size: 14.5px;
+  font-weight: 650;
+}
+.update-detail {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.update-notes {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.update-confirm {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.update-confirm-title {
+  font-size: 13px;
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+.update-confirm-list {
+  margin: 0;
+  padding-left: 1.25em;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.update-phase {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.update-progress {
+  width: 100%;
+  height: 10px;
+  accent-color: var(--accent);
+}
+.update-failure {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 13px;
+  font-weight: 600;
+}
+.update-manual-hint {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 13px;
+  font-weight: 650;
+}
+.update-actions {
+  margin-top: 4px;
+}

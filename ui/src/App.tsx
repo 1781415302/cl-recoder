@@ -43,6 +43,10 @@ export default function App() {
   const Page = PAGES[page];
   const notices = useAppNotices();
   const tooNew = notices.data?.schemaTooNew ?? null;
+  const updateApplied = notices.data?.updateApplied ?? null;
+  // 关闭仅隐藏本次会话（§4.7）
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
+  const showUpdateBanner = Boolean(updateApplied) && !updateBannerDismissed;
   return (
     <div className="shell">
       <Sidebar page={page} onNavigate={navigate} />
@@ -51,6 +55,36 @@ export default function App() {
           <div className="app-banner app-banner--danger" role="alert">
             数据库由更新版本创建（v{tooNew.found}），当前程序支持 v
             {tooNew.supported}，请升级程序；采集器已拒绝写入
+          </div>
+        )}
+        {showUpdateBanner && updateApplied && (
+          <div className="app-banner app-banner--warning" role="status">
+            <span>
+              已更新到 v{updateApplied.toVersion}。
+              {updateApplied.collectorWasRunning &&
+              !updateApplied.collectorRestored
+                ? "采集器在更新时被停止，请到设置页启动。"
+                : null}
+            </span>
+            {updateApplied.collectorWasRunning &&
+            !updateApplied.collectorRestored ? (
+              <button
+                type="button"
+                className="btn btn-sm"
+                style={{ marginLeft: 12 }}
+                onClick={() => navigate("settings")}
+              >
+                前往设置
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{ marginLeft: 8 }}
+              onClick={() => setUpdateBannerDismissed(true)}
+            >
+              关闭
+            </button>
           </div>
         )}
         <main key={page} className="main" aria-live="off">

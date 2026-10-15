@@ -439,6 +439,13 @@ export const state: {
   diagnostics: DiagnosticsInfo;
   wpImportedAt: string;
   settings: Settings;
+  /** 启动后「更新已完成」提示（默认 null；浏览器验收横幅可临时赋值） */
+  updateApplied: import("./types").UpdateApplied | null;
+  /** §7 mock：安装流水线状态 */
+  updateStatus: import("./types").UpdateStatus;
+  /** 安装流水线计时起点（ms）；null=未运行 */
+  updatePipelineStartedAt: number | null;
+  updatePipelineVersion: string | null;
 } = {
   collectorRunning: true,
   paused: false,
@@ -464,6 +471,17 @@ export const state: {
     wpDbPath: null,
     firstRunDone: true,
   },
+  updateApplied: null,
+  updateStatus: {
+    phase: "idle",
+    receivedBytes: 0,
+    totalBytes: null,
+    errorCode: null,
+    message: null,
+    collectorRestored: null,
+  },
+  updatePipelineStartedAt: null,
+  updatePipelineVersion: null,
 };
 
 export async function mockCollectorStatus(): Promise<CollectorStatus> {
@@ -526,7 +544,7 @@ export async function mockDiagnosticsInfo(): Promise<DiagnosticsInfo> {
 /** hardening-v4：只读提示（mock 恒为无提示） */
 export async function mockAppNotices(): Promise<import("./types").AppNotices> {
   await sleep(60);
-  return { schemaTooNew: null };
+  return { schemaTooNew: null, updateApplied: state.updateApplied };
 }
 
 /** hardening-v4：旧安装迁移提示（mock 恒为空） */
@@ -1027,4 +1045,132 @@ export async function mockLiveInputSnapshot(): Promise<LiveSnapshotReply> {
     },
     error: null,
   };
+}
+
+/* ---------- 应用内更新（§7 mock：检查 600ms→有更新；安装按阶段推进） ---------- */
+
+const MOCK_UPDATE_TOTAL = 10_000_000;
+/** notes 含 XSS 字面量：浏览器验收断言必须为文本节点 */
+const MOCK_UPDATE_NOTES =
+  "本版本改进：\n- 修复若干问题\n- <img onerror=alert(1) src=x>\n请尽快安装。";
+
+function advanceUpdatePipeline(): void {
+  const started = state.updatePipelineStartedAt;
+  if (started === null) return;
+  const elapsed = Date.now() - started;
+  // 时间线（ms）：每阶段 ≥800ms，保证 500ms 轮询能依次看见（§7 浏览器验收）
+  // download 0–1500 → verifying 1500–2300 → stopping 2300–3100
+  // → backing_up 3100–3900 → launching 3900–4700 → launched ≥4700
+  if (elapsed < 1500) {
+    const received = Math.min(
+      MOCK_UPDATE_TOTAL,
+      Math.floor((elapsed / 1500) * MOCK_UPDATE_TOTAL),
+    );
+    state.updateStatus = {
+      phase: "downloading",
+      receivedBytes: received,
+      totalBytes: MOCK_UPDATE_TOTAL,
+      errorCode: null,
+      message: null,
+      collectorRestored: null,
+    };
+    return;
+  }
+  if (elapsed < 2300) {
+    state.updateStatus = {
+      phase: "verifying",
+      receivedBytes: MOCK_UPDATE_TOTAL,
+      totalBytes: MOCK_UPDATE_TOTAL,
+      errorCode: null,
+      message: null,
+      collectorRestored: null,
+    };
+    return;
+  }
+  if (elapsed < 3100) {
+    state.updateStatus = {
+      phase: "stopping_collector",
+      receivedBytes: MOCK_UPDATE_TOTAL,
+      totalBytes: MOCK_UPDATE_TOTAL,
+      errorCode: null,
+      message: null,
+      collectorRestored: null,
+    };
+    return;
+  }
+  if (elapsed < 3900) {
+    state.updateStatus = {
+      phase: "backing_up",
+      receivedBytes: MOCK_UPDATE_TOTAL,
+      totalBytes: MOCK_UPDATE_TOTAL,
+      errorCode: null,
+      message: null,
+      collectorRestored: null,
+    };
+    return;
+  }
+  if (elapsed < 4700) {
+    state.updateStatus = {
+      phase: "launching",
+      receivedBytes: MOCK_UPDATE_TOTAL,
+      totalBytes: MOCK_UPDATE_TOTAL,
+      errorCode: null,
+      message: null,
+      collectorRestored: null,
+    };
+    return;
+  }
+  state.updateStatus = {
+    phase: "launched",
+    receivedBytes: MOCK_UPDATE_TOTAL,
+    totalBytes: MOCK_UPDATE_TOTAL,
+    errorCode: null,
+    message: null,
+    collectorRestored: null,
+  };
+}
+
+/** mockUpdateCheck：600ms 后返回有更新（0.5.0）且可安装 */
+export async function mockUpdateCheck(): Promise<import("./types").UpdateCheck> {
+  await sleep(600);
+  return {
+    currentVersion: "0.4.0",
+    latestVersion: "0.5.0",
+    hasUpdate: true,
+    releaseUrl: "https://github.com/1781415302/cl-recoder/releases/tag/v0.5.0",
+    publishedAt: "2026-10-01T08:00:00Z",
+    notes: MOCK_UPDATE_NOTES,
+    assetSize: MOCK_UPDATE_TOTAL,
+    installable: true,
+    blockReason: null,
+  };
+}
+
+/** mockUpdateInstall：立即返回，后台按阶段推进 status */
+export async function mockUpdateInstall(version: string): Promise<void> {
+  await sleep(40);
+  if (
+    state.updatePipelineStartedAt !== null &&
+    state.updateStatus.phase !== "failed" &&
+    state.updateStatus.phase !== "idle" &&
+    state.updateStatus.phase !== "launched"
+  ) {
+    throw new Error("已有更新任务在进行中");
+  }
+  state.updatePipelineVersion = version;
+  state.updatePipelineStartedAt = Date.now();
+  state.updateStatus = {
+    phase: "downloading",
+    receivedBytes: 0,
+    totalBytes: MOCK_UPDATE_TOTAL,
+    errorCode: null,
+    message: null,
+    collectorRestored: null,
+  };
+}
+
+/** mockUpdateStatus：按时间推进阶段 */
+export async function mockUpdateStatus(): Promise<import("./types").UpdateStatus> {
+  advanceUpdatePipeline();
+  return { ...state.updateStatus };
 }

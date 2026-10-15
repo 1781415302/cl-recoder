@@ -30,6 +30,8 @@ import type {
   SettingsPatch,
   TaskPolicy,
   TopKeyRow,
+  UpdateCheck,
+  UpdateStatus,
   WpAppRow,
   WpComboRow,
   WpKeyRow,
@@ -267,4 +269,39 @@ export function getGamepadMotion(
 /** get_live_input_snapshot() -> LiveSnapshotReply（真实 invoke 或 mock，同一 DTO） */
 export function getLiveInputSnapshot(): Promise<LiveSnapshotReply> {
   return call("get_live_input_snapshot", undefined, () => mock.mockLiveInputSnapshot());
+}
+
+/* ===== 应用内更新（§4.5：update_check / update_install / update_status） ===== */
+
+/** 当前应用版本：Tauri 用 getVersion；mock / 纯浏览器固定 0.4.0（§4.8） */
+export async function getAppVersion(): Promise<string> {
+  if (USE_MOCK || !inTauri) return "0.4.0";
+  const { getVersion } = await import("@tauri-apps/api/app");
+  return getVersion();
+}
+
+/** 打开发布页：plugin-opener openUrl；mock / 纯浏览器 window.open */
+export async function openReleaseUrl(url: string): Promise<void> {
+  if (USE_MOCK || !inTauri) {
+    if (typeof window !== "undefined")
+      window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  const { openUrl } = await import("@tauri-apps/plugin-opener");
+  await openUrl(url);
+}
+
+/** update_check() -> UpdateCheck */
+export function updateCheck(): Promise<UpdateCheck> {
+  return call("update_check", undefined, () => mock.mockUpdateCheck());
+}
+
+/** update_install(version) -> () 立即返回，流水线后台推进 */
+export function updateInstall(version: string): Promise<void> {
+  return call("update_install", { version }, () => mock.mockUpdateInstall(version));
+}
+
+/** update_status() -> UpdateStatus */
+export function updateStatus(): Promise<UpdateStatus> {
+  return call("update_status", undefined, () => mock.mockUpdateStatus());
 }

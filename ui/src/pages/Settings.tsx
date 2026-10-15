@@ -2,11 +2,12 @@
 // 控制（暂停/立即启动）+ 自启任务三项策略只读展示与「修复采集器自启」（§4.3：一次 UAC、
 // RepairOnly、对后续启动生效）+ 诊断日志目录（§4.1）+ GUI 自启 + WhatPulse 数据源 +
 // 数据导出（§5.5，默认仍 90 天）。查询全部经 uiQueryPolicy 做 activity gating（§4.5）。
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { save } from "@tauri-apps/plugin-dialog";
 import * as client from "../api/client";
 import { uiQueryPolicy } from "../api/queryPolicy";
+import { useUpdateStatus } from "../api/queries";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { DateRangePicker } from "../components/DateRangePicker";
 import { PageHeader } from "../components/PageHeader";
@@ -22,7 +23,16 @@ import {
   IconWarn,
 } from "../components/icons";
 import { defaultRange, fmtNum } from "../lib/format";
-import type { ExportReport, Range } from "../api/types";
+import {
+  deriveUpdateFlow,
+  shouldPollUpdateStatus,
+} from "../lib/updateFlow";
+import type {
+  ExportReport,
+  Range,
+  UpdateCheck,
+  UpdateStatus,
+} from "../api/types";
 
 const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -83,6 +93,221 @@ function Row({
       </div>
       <div className="settings-row-actions">{children}</div>
     </div>
+  );
+}
+
+/** 软件更新卡片（§4.8）：状态由 updateFlow 纯函数给出，本组件只渲染与发命令 */
+function UpdateCard({
+  onPageBusy,
+}: {
+  onPageBusy: (busy: boolean) => void;
+}) {
+  const [currentVersion, setCurrentVersion] = useState("…");
+  const [checking, setChecking] = useState(false);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const [check, setCheck] = useState<UpdateCheck | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [installSubmitted, setInstallSubmitted] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void client.getAppVersion().then(
+      (v) => {
+        if (!cancelled) setCurrentVersion(v);
+      },
+      () => {
+        if (!cancelled) setCurrentVersion("0.4.0");
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const [lastStatus, setLastStatus] = useState<UpdateStatus | null>(null);
+  const poll = shouldPollUpdateStatus(installSubmitted, lastStatus);
+  const statusQuery = useUpdateStatus(poll);
+  useEffect(() => {
+    if (statusQuery.data) setLastStatus(statusQuery.data);
+  }, [statusQuery.data]);
+  // 未在轮询时仍展示最后一次状态（失败结果）
+  const status = statusQuery.data ?? lastStatus;
+
+  const view = deriveUpdateFlow({
+    currentVersion: currentVersion === "…" ? "0.4.0" : currentVersion,
+    checking,
+    checkError,
+    check,
+    confirming,
+    installSubmitted,
+    status,
+  });
+
+  useEffect(() => {
+    onPageBusy(view.pageBusy);
+  }, [view.pageBusy, onPageBusy]);
+
+  async function doCheck() {
+    setChecking(true);
+    setCheckError(null);
+    setConfirming(false);
+    try {
+      const result = await client.updateCheck();
+      setCheck(result);
+    } catch (e: unknown) {
+      setCheckError(String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function doConfirmInstall() {
+    if (!check?.latestVersion) return;
+    setConfirming(false);
+    setLastStatus(null);
+    setInstallSubmitted(true);
+    try {
+      await client.updateInstall(check.latestVersion);
+    } catch (e: unknown) {
+      setInstallSubmitted(false);
+      setCheckError(String(e));
+    }
+  }
+
+  function doRetry() {
+    setInstallSubmitted(false);
+    setLastStatus(null);
+    setConfirming(false);
+    setCheckError(null);
+    void doCheck();
+  }
+
+  return (
+    <section className="card settings-section" id="settings-update">
+      <div className="card-head">
+        <div>
+          <h2 className="card-title">软件更新</h2>
+          <p className="card-sub">检查 GitHub Release 并安装（仅安装版）</p>
+        </div>
+      </div>
+      <div className="update-card" aria-live="polite">
+        <div className="update-headline">{view.headline}</div>
+        {view.detail ? (
+          <div className="update-detail">{view.detail}</div>
+        ) : null}
+        {view.notes !== null ? (
+          <pre className="update-notes">{view.notes}</pre>
+        ) : null}
+        {view.confirmPoints ? (
+          <div className="update-confirm">
+            <div className="update-confirm-title">确认更新前请了解：</div>
+            <ol className="update-confirm-list">
+              {view.confirmPoints.map((p) => (
+                <li key={p}>{p}</li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+        {view.phaseLabel && view.mode === "in_progress" ? (
+          <div className="update-phase">{view.phaseLabel}</div>
+        ) : null}
+        {view.progress ? (
+          <progress
+            className="update-progress"
+            value={
+              view.progress.kind === "determinate"
+                ? view.progress.value
+                : undefined
+            }
+            max={
+              view.progress.kind === "determinate" ? view.progress.max : undefined
+            }
+          />
+        ) : null}
+        {view.failureMessage ? (
+          <div className="update-failure" role="alert">
+            {view.failureMessage}
+          </div>
+        ) : null}
+        {view.collectorManualHint ? (
+          <div className="update-manual-hint" role="alert">
+            {view.collectorManualHint}
+          </div>
+        ) : null}
+        <div className="btn-row update-actions">
+          {view.buttons.check ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={view.allDisabled}
+              onClick={() => void doCheck()}
+            >
+              检查更新
+            </button>
+          ) : null}
+          {view.buttons.recheck ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={view.allDisabled}
+              onClick={() => void doCheck()}
+            >
+              重新检查
+            </button>
+          ) : null}
+          {view.buttons.download ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={view.allDisabled}
+              onClick={() => setConfirming(true)}
+            >
+              下载并更新
+            </button>
+          ) : null}
+          {view.buttons.confirm ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={view.allDisabled}
+              onClick={() => void doConfirmInstall()}
+            >
+              确认并更新
+            </button>
+          ) : null}
+          {view.buttons.cancel ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={view.allDisabled}
+              onClick={() => setConfirming(false)}
+            >
+              取消
+            </button>
+          ) : null}
+          {view.buttons.retry ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={view.allDisabled}
+              onClick={() => doRetry()}
+            >
+              重试
+            </button>
+          ) : null}
+          {view.buttons.openRelease && view.releaseUrl ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={view.allDisabled}
+              onClick={() => void client.openReleaseUrl(view.releaseUrl!)}
+            >
+              前往发布页
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -292,7 +517,10 @@ export function Settings() {
   });
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [updateBusy, setUpdateBusy] = useState(false);
   const [wpPathDraft, setWpPathDraft] = useState<string | null>(null);
+  /** 更新进行中时同步禁用采集器操作按钮（§4.8） */
+  const controlsBusy = busy || updateBusy;
 
   function after(
     promise: Promise<unknown>,
@@ -397,6 +625,7 @@ export function Settings() {
             {[
               ["settings-collector", "采集器"],
               ["settings-autostart", "启动与运行"],
+              ["settings-update", "软件更新"],
               ["settings-source", "历史数据源"],
               ["settings-diagnostics", "诊断日志"],
               ["settings-export", "数据导出"],
@@ -473,7 +702,7 @@ export function Settings() {
                     <button
                       type="button"
                       className={st.paused ? "btn btn-primary" : "btn"}
-                      disabled={busy || status.isFetching}
+                      disabled={controlsBusy || status.isFetching}
                       onClick={() =>
                         after(
                           client.setCollectorPaused(!st.paused),
@@ -494,14 +723,14 @@ export function Settings() {
                     <button
                       type="button"
                       className="btn"
-                      disabled={busy}
+                      disabled={controlsBusy}
                       onClick={() =>
                         after(client.collectorStartNow(), "采集器已就绪", {
                           pending: PENDING_START,
                         })
                       }
                     >
-                      {busy ? "启动中…" : "检查并启动"}
+                      {controlsBusy ? "启动中…" : "检查并启动"}
                     </button>
                   </div>
                 </div>
@@ -519,11 +748,11 @@ export function Settings() {
                   action={
                     st.taskEvidence === "absent"
                       ? {
-                          label: busy
+                          label: controlsBusy
                             ? "处理中…"
                             : "启用采集器自启（需一次 UAC）",
                           onClick: () => {
-                            if (!busy)
+                            if (!controlsBusy)
                               after(
                                 client.collectorAutostartEnable(),
                                 "已启用自启并启动采集器",
@@ -532,9 +761,9 @@ export function Settings() {
                           },
                         }
                       : {
-                          label: busy ? "启动中…" : "立即启动采集器",
+                          label: controlsBusy ? "启动中…" : "立即启动采集器",
                           onClick: () => {
-                            if (!busy)
+                            if (!controlsBusy)
                               after(
                                 client.collectorStartNow(),
                                 "采集器已就绪",
@@ -548,11 +777,11 @@ export function Settings() {
                       ? undefined
                       : st.taskEvidence === "unknown"
                         ? {
-                            label: busy
+                            label: controlsBusy
                               ? "处理中…"
                               : "启用采集器自启（需一次 UAC）",
                             onClick: () => {
-                              if (!busy)
+                              if (!controlsBusy)
                                 after(
                                   client.collectorAutostartEnable(),
                                   "已启用自启并启动采集器",
@@ -563,7 +792,7 @@ export function Settings() {
                         : {
                             label: "仅立即启动（不装自启）",
                             onClick: () => {
-                              if (!busy)
+                              if (!controlsBusy)
                                 after(
                                   client.collectorStartNow(),
                                   "采集器已就绪",
@@ -597,19 +826,19 @@ export function Settings() {
                     <button
                       type="button"
                       className="btn btn-primary"
-                      disabled={busy}
+                      disabled={controlsBusy}
                       onClick={() =>
                         after(client.collectorStartNow(), "采集器已就绪", {
                           pending: PENDING_START,
                         })
                       }
                     >
-                      {busy ? "启动中…" : "检查并启动"}
+                      {controlsBusy ? "启动中…" : "检查并启动"}
                     </button>
                     <button
                       type="button"
                       className="btn"
-                      disabled={busy}
+                      disabled={controlsBusy}
                       onClick={() =>
                         void client.openDiagnosticsDirectory().then(
                           () => setNotice("已打开日志目录"),
@@ -656,7 +885,7 @@ export function Settings() {
                   <button
                     type="button"
                     className={`btn${taskOn ? "" : " btn-primary"}`}
-                    disabled={taskOn || busy}
+                    disabled={taskOn || controlsBusy}
                     onClick={() =>
                       after(
                         client.collectorAutostartEnable(),
@@ -678,7 +907,7 @@ export function Settings() {
                   <button
                     type="button"
                     className="btn btn-danger"
-                    disabled={!taskOn || busy}
+                    disabled={!taskOn || controlsBusy}
                     onClick={() =>
                       after(
                         client.collectorAutostartDisable(),
@@ -701,10 +930,10 @@ export function Settings() {
                     <button
                       type="button"
                       className="btn btn-sm btn-primary"
-                      disabled={busy}
+                      disabled={controlsBusy}
                       onClick={repairPolicy}
                     >
-                      {busy ? "处理中…" : "修复采集器自启（需一次 UAC）"}
+                      {controlsBusy ? "处理中…" : "修复采集器自启（需一次 UAC）"}
                     </button>
                   ) : null}
                 </Row>
@@ -793,7 +1022,9 @@ export function Settings() {
               </div>
             </section>
 
-            <DiagnosticsCard busy={busy} onNotice={setNotice} />
+            <UpdateCard onPageBusy={setUpdateBusy} />
+
+            <DiagnosticsCard busy={controlsBusy} onNotice={setNotice} />
 
             <ExportCard />
 
