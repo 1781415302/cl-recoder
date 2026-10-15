@@ -202,7 +202,7 @@ const MOUSE_CONTROLS: MotionControlSpec[] = [
     cy: 100,
     w: 92,
     h: 148,
-    hit: { x: 40, y: 26, w: 92, h: 148 },
+    hit: { x: 34, y: 10, w: 104, h: 174 },
   },
   {
     code: 2,
@@ -212,7 +212,7 @@ const MOUSE_CONTROLS: MotionControlSpec[] = [
     cy: 100,
     w: 92,
     h: 148,
-    hit: { x: 188, y: 26, w: 92, h: 148 },
+    hit: { x: 182, y: 10, w: 104, h: 174 },
   },
   {
     code: 3,

@@ -28,10 +28,18 @@ mod tests {
 
     #[test]
     fn live_input_shared_client_snapshot_is_structured() {
-        let client = Arc::new(LiveInputClient::new());
-        assert_eq!(client.pipe_name_for_test(), LIVE_PIPE_NAME);
+        let endpoint = format!(
+            r"\\.\pipe\clrecoder-live-test-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let client = Arc::new(LiveInputClient::new_at(endpoint));
+        assert_ne!(client.pipe_name_for_test(), LIVE_PIPE_NAME);
         let reply = client.snapshot();
-        // 生产端点在测试环境通常不存在 → 结构化 not_running（不是 Err/panic）。
+        // 专用端点没有服务端：无论真实采集器是否运行，均返回结构化 not_running。
         assert_eq!(
             reply.error.as_ref().map(|e| e.code),
             Some(LiveErrorCode::NotRunning),

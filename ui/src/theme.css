@@ -359,21 +359,6 @@ svg {
 .rail-status[data-tone="ok"] .rail-status-dot {
   box-shadow: 0 0 0 3px var(--ok-soft);
 }
-.rail-theme {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid var(--line);
-  border-radius: 50%;
-  background: var(--surface-2);
-  color: var(--text-2);
-}
-.rail-theme:hover {
-  border-color: var(--line-strong);
-  color: var(--text);
-}
-
 /* 页眉（吸顶） */
 .topbar {
   position: sticky;
@@ -873,10 +858,6 @@ select.input {
 .chip--warn {
   background: var(--warn-soft);
   color: var(--warn);
-}
-.chip--bad {
-  background: var(--bad-soft);
-  color: var(--bad);
 }
 .chip--gp {
   background: var(--gp-soft);
@@ -1854,17 +1835,6 @@ th[style*="right"] .th-sort {
 .device-dpad-hub {
   fill: rgba(70, 48, 24, 0.1);
 }
-.peripheral-shell {
-  fill: var(--surface);
-  stroke: var(--line-strong);
-  stroke-width: 1.5;
-}
-.peripheral-seam {
-  fill: none;
-  stroke: var(--line-strong);
-  stroke-width: 1.2;
-  opacity: 0.7;
-}
 .peripheral-inset {
   fill: rgba(70, 48, 24, 0.07);
   stroke: rgba(70, 48, 24, 0.12);
@@ -1905,6 +1875,11 @@ th[style*="right"] .th-sort {
 .skin-ring.is-pulse {
   stroke: var(--input-live-ring);
   stroke-width: 9;
+}
+.skin-ring.is-focus {
+  stroke: var(--accent);
+  stroke-width: 8;
+  stroke-opacity: 0.55;
 }
 .skin.is-selected {
   stroke: var(--text);
@@ -1982,9 +1957,6 @@ th[style*="right"] .th-sort {
   letter-spacing: 0.02em;
   pointer-events: none;
 }
-.peripheral-count {
-  display: none;
-}
 .gamepad-button[data-code="1"] {
   color: var(--skin-ink, #1f9a63);
 }
@@ -2032,15 +2004,10 @@ th[style*="right"] .th-sort {
 .mouse-button[data-code="1"] .peripheral-label,
 .mouse-button[data-code="2"] .peripheral-label {
   position: absolute;
-  top: 117px;
-  transform: translate(-50%, -50%);
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, calc(-50% + 20px));
   font-size: 12.5px;
-}
-.mouse-button[data-code="1"] .peripheral-label {
-  left: 86px;
-}
-.mouse-button[data-code="2"] .peripheral-label {
-  left: 234px;
 }
 .mouse-button[data-code="3"] .peripheral-label {
   font-size: 10.5px;

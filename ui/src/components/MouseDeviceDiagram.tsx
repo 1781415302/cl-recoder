@@ -79,6 +79,9 @@ export function MouseDeviceDiagram({
   const sheenId = `${uid}-sheen`;
   const bodyId = `${uid}-body`;
   const [hover, setHover] = useState<number | null>(null);
+  const [focusCode, setFocusCode] = useState<number | null>(null);
+  const leftHit = specs.find((s) => s.code === 1)!.hit;
+  const rightHit = specs.find((s) => s.code === 2)!.hit;
   const lookup = useMemo(() => {
     const entries = new Map<number, TopKeyRow>();
     for (const row of rows)
@@ -105,6 +108,7 @@ export function MouseDeviceDiagram({
         live: isLive,
         pulse: !isLive && pulse.has(code),
         hover: hover === code,
+        focus: focusCode === code,
       },
     };
   }
@@ -137,10 +141,18 @@ export function MouseDeviceDiagram({
               <path d={BODY_PATH} />
             </clipPath>
             <clipPath id={leftHitId}>
-              <path d={LEFT_REGION} clipPath={`url(#${clipId})`} />
+              <path
+                transform={`translate(${-leftHit.x} ${-leftHit.y})`}
+                d={LEFT_REGION}
+                clipPath={`url(#${clipId})`}
+              />
             </clipPath>
             <clipPath id={rightHitId}>
-              <path d={RIGHT_REGION} clipPath={`url(#${clipId})`} />
+              <path
+                transform={`translate(${-rightHit.x} ${-rightHit.y})`}
+                d={RIGHT_REGION}
+                clipPath={`url(#${clipId})`}
+              />
             </clipPath>
             <linearGradient id={sheenId} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0" stopColor="#fff" stopOpacity="0.55" />
@@ -210,11 +222,16 @@ export function MouseDeviceDiagram({
           </SkinGroup>
         </svg>
         {specs.map((spec) => {
-          const mainButton = spec.code === 1 || spec.code === 2;
           const total = lookup.get(spec.code)?.total;
           const isLive = held.has(spec.code);
           const isPulse = !isLive && pulse.has(spec.code);
           const selected = selectedCode === spec.code;
+          const clipped =
+            spec.code === 1
+              ? `url(#${leftHitId})`
+              : spec.code === 2
+                ? `url(#${rightHitId})`
+                : undefined;
           return (
             <button
               type="button"
@@ -231,13 +248,11 @@ export function MouseDeviceDiagram({
               data-shape={spec.shape}
               data-heat={heatVars.has(spec.code) ? "on" : undefined}
               style={{
-                left: mainButton ? 0 : spec.hit.x,
-                top: mainButton ? 0 : spec.hit.y,
-                width: mainButton ? size.width : spec.hit.w,
-                height: mainButton ? size.height : spec.hit.h,
-                clipPath: mainButton
-                  ? `url(#${spec.code === 1 ? leftHitId : rightHitId})`
-                  : undefined,
+                left: spec.hit.x,
+                top: spec.hit.y,
+                width: spec.hit.w,
+                height: spec.hit.h,
+                clipPath: clipped,
                 ...heatVars.get(spec.code),
               }}
               aria-pressed={selected}
@@ -246,8 +261,12 @@ export function MouseDeviceDiagram({
               onClick={() => onSelect(spec.code)}
               onPointerEnter={() => setHover(spec.code)}
               onPointerLeave={() => setHover((c) => (c === spec.code ? null : c))}
-              onFocus={() => setHover(spec.code)}
-              onBlur={() => setHover((c) => (c === spec.code ? null : c))}
+              onFocus={(e) => {
+                if (e.currentTarget.matches(":focus-visible")) {
+                  setFocusCode(spec.code);
+                }
+              }}
+              onBlur={() => setFocusCode((c) => (c === spec.code ? null : c))}
             >
               {spec.shape === "arrow" ? (
                 <DirectionMark direction={spec.dir ?? "up"} />
