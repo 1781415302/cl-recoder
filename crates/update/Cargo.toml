@@ -1,0 +1,10 @@
+[package]
+name = "clrecoder-update"
+version.workspace = true
+edition.workspace = true
+description = "CL Recoder 应用内更新纯逻辑：版本比较、Release 解析、curl 参数、sha256、标记与 DTO"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

@@ -9,6 +9,8 @@ members = [
     "crates/collector",
     # S1（usability-runtime-v3 §4.1）：共享有界诊断日志（collector/GUI 双角色 sink）。
     "crates/diagnostics",
+    # S5（应用内更新）：平台无关纯逻辑（版本/Release/curl 参数/sha256/标记/DTO）。
+    "crates/update",
     "src-tauri",
 ]
 
@@ -59,3 +61,5 @@ tauri-plugin-opener = "2"
 thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
+# S5：Release 资产 digest 校验（已在 lock 中为传递依赖，提升为直接依赖）
+sha2 = "0.10"

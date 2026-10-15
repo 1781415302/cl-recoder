@@ -627,6 +627,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clrecoder-update"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
