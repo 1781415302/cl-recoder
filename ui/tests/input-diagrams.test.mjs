@@ -86,6 +86,32 @@ test("mouse 9 码完整、标签与分列、hit≥44 不重叠", () => {
   assert.ok(cx(by(2)) > MOTION_CANVAS.mouse.width / 2);
 });
 
+test("mouse 左右键 hit 等于区域 bbox（§4.1）", () => {
+  const mouse = motionControlSpecs("mouse");
+  const by = (code) => mouse.find((c) => c.code === code);
+  assert.deepEqual(by(1).hit, { x: 34, y: 10, w: 104, h: 174 });
+  assert.deepEqual(by(2).hit, { x: 182, y: 10, w: 104, h: 174 });
+  // cx(1) < 160 < cx(2) 仍成立（视觉中心）
+  assert.ok(by(1).cx < 160 && 160 < by(2).cx);
+});
+
+test("MouseDeviceDiagram：无 mainButton 全画布分支，按钮盒取 spec.hit", async () => {
+  const src = await loadComponentSource("../src/components/MouseDeviceDiagram.tsx");
+  assert.doesNotMatch(src, /mainButton/);
+  // 不得再用 size.width/size.height 作按钮盒（画布容器仍可用）
+  assert.doesNotMatch(
+    src,
+    /left:\s*mainButton\s*\?\s*0|width:\s*mainButton\s*\?\s*size\.width/,
+  );
+  // 按钮定位统一用 hit
+  assert.match(src, /left:\s*spec\.hit\.x/);
+  assert.match(src, /top:\s*spec\.hit\.y/);
+  assert.match(src, /width:\s*spec\.hit\.w/);
+  assert.match(src, /height:\s*spec\.hit\.h/);
+  assert.match(src, /focus-visible/);
+  assert.match(src, /focusCode/);
+});
+
 test("gamepad 17 码完整、ABXY 菱形正确、hit≥44 不重叠", () => {
   const gp = motionControlSpecs("gamepad");
   assert.equal(gp.length, 17);

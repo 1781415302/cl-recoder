@@ -55,6 +55,7 @@ export interface SkinState {
   pulse?: boolean;
   hover?: boolean;
   unsupported?: boolean;
+  focus?: boolean; // 键盘焦点（:focus-visible）
 }
 
 function stateClass(state: SkinState): string {
@@ -64,13 +65,14 @@ function stateClass(state: SkinState): string {
     state.pulse ? "is-pulse" : "",
     state.hover ? "is-hover" : "",
     state.unsupported ? "is-unsupported" : "",
+    state.focus ? "is-focus" : "",
   ]
     .filter(Boolean)
     .join(" ");
 }
 
 /**
- * 一个可着色图形：状态环（选中/实时/脉冲）+ 本体 + 高光层。
+ * 一个可着色图形：状态环（选中/实时/脉冲/焦点）+ 本体 + 高光层。
  * children(cls) 返回同一几何的 SVG 元素，cls 分别为 skin-ring / skin / skin-sheen。
  */
 export function SkinGroup({
@@ -91,7 +93,7 @@ export function SkinGroup({
   children: (cls: string, fill?: string) => ReactNode;
 }) {
   const states = stateClass(state);
-  const hasRing = state.selected || state.live || state.pulse;
+  const hasRing = state.selected || state.live || state.pulse || state.focus;
   return (
     <g
       className={["skin-group", extra ?? "", states].filter(Boolean).join(" ")}
