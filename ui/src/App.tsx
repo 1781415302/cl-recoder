@@ -1,6 +1,5 @@
-// 应用外壳：侧边导航 + 页面切换（白名单无路由库，用状态 + hash 同步实现 8 页导航）。
+// 应用外壳：左侧导航轨 + 主区（每个页面自带吸顶页眉）。白名单无路由库，用状态 + hash 同步实现 8 页导航。
 import { useEffect, useState } from "react";
-import { IconLocal } from "./components/icons";
 import { Sidebar, type PageId } from "./components/Sidebar";
 import { Dashboard } from "./pages/Dashboard";
 import { Keyboard } from "./pages/Keyboard";
@@ -44,40 +43,18 @@ export default function App() {
   const Page = PAGES[page];
   const notices = useAppNotices();
   const tooNew = notices.data?.schemaTooNew ?? null;
-  const labels: Record<PageId, string> = {
-    dashboard: "仪表盘",
-    keyboard: "键盘",
-    mouse: "鼠标",
-    gamepad: "手柄",
-    apps: "应用",
-    combos: "组合键",
-    whatpulse: "WhatPulse",
-    settings: "设置",
-  };
   return (
-    <div className="app-shell">
+    <div className="shell">
       <Sidebar page={page} onNavigate={navigate} />
-      <div className="workspace">
-        <header className="app-bar">
-          <div className="app-breadcrumb">
-            <span>工作台</span>
-            <span aria-hidden="true">/</span>
-            <strong>{labels[page]}</strong>
-          </div>
-          <div className="app-local">
-            <IconLocal size={15} />
-            本地记录
-          </div>
-        </header>
+      <div className="stage">
         {tooNew && (
           <div className="app-banner app-banner--danger" role="alert">
-            数据库由更新版本创建（v{tooNew.found}），当前程序支持 v{tooNew.supported}，请升级程序；采集器已拒绝写入
+            数据库由更新版本创建（v{tooNew.found}），当前程序支持 v
+            {tooNew.supported}，请升级程序；采集器已拒绝写入
           </div>
         )}
-        <main key={page} className="app-main" aria-live="off">
-          <div className="page">
-            <Page />
-          </div>
+        <main key={page} className="main" aria-live="off">
+          <Page />
         </main>
       </div>
     </div>

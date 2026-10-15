@@ -96,20 +96,22 @@ export function MouseDpiEditor({
 
   return (
     <section className="card dpi-panel">
-      <div className="section-heading">
-        <h2 className="card-title">距离校准</h2>
-        <span className={`chip${source.connected ? " chip-positive" : ""}`}>
+      <div className="card-head">
+        <div>
+          <h2 className="card-title">距离校准</h2>
+          <p className="card-sub">{displayName}</p>
+        </div>
+        <span className={`chip${source.connected ? " chip--ok" : ""}`}>
           {source.connected ? "已连接" : "离线"}
         </span>
       </div>
-      <p className="card-sub">{displayName}</p>
       <div className="dpi-current">
-        <span className="td-muted">当前 DPI</span>
+        <span className="muted">当前 DPI</span>
         <strong className="dpi-value">{source.effectiveDpi ?? "—"}</strong>
         <span className="chip">{ORIGIN_LABEL[source.dpiOrigin]}</span>
       </div>
       {!source.physical ? (
-        <p className="chart-hint">虚拟或未知来源无法配置 DPI。</p>
+        <p className="hint">虚拟或未知来源无法配置 DPI。</p>
       ) : autoActive ? (
         <div className="dpi-readonly" role="note">
           已读取鼠标当前档位。
@@ -117,12 +119,12 @@ export function MouseDpiEditor({
             <>有效至 {fmtUntil(source.autoValidUntil)}。</>
           )}
           {source.manualDpi !== null ? (
-            <p style={{ margin: "8px 0 0" }}>
+            <p className="dpi-note">
               后备手动 DPI：<strong>{source.manualDpi}</strong>
               ，自动值失效后使用。
             </p>
           ) : (
-            <p style={{ margin: "8px 0 0" }}>自动值失效后可手动填写。</p>
+            <p className="dpi-note">自动值失效后可手动填写。</p>
           )}
         </div>
       ) : (
@@ -146,7 +148,7 @@ export function MouseDpiEditor({
             aria-describedby={error ? `${inputId}-error` : undefined}
           />
           {error && (
-            <p className="dpi-error" id={`${inputId}-error`} role="alert">
+            <p className="field-error" id={`${inputId}-error`} role="alert">
               {error}
             </p>
           )}
@@ -167,7 +169,7 @@ export function MouseDpiEditor({
               清除
             </button>
           </div>
-          <p className="chart-hint">
+          <p className="hint">
             {MANUAL_DPI_MIN}–{MANUAL_DPI_MAX} 的整数 · 自动探测：
             {PROBE_LABEL[source.probeStatus]}
           </p>

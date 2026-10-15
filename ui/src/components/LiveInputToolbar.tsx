@@ -29,18 +29,18 @@ function statusLabel(view: DeviceLiveView): string {
   }
 }
 
-function statusChipClass(view: DeviceLiveView): string {
+function statusTone(view: DeviceLiveView): string {
   switch (view.state) {
     case "ready":
-      return "chip chip-positive";
+      return "ok";
     case "unavailable":
     case "suspended":
-      return "chip chip-danger";
+      return "bad";
     case "waiting":
     case "connecting":
-      return "chip chip-accent";
+      return "warn";
     default:
-      return "chip";
+      return "idle";
   }
 }
 
@@ -54,31 +54,33 @@ export function LiveInputToolbar({
   const sourceId = useId();
   const showConnections =
     view.connections.length > 0 && typeof onSourceChange === "function";
+  const tone = enabled ? statusTone(view) : "idle";
 
   return (
-    <div className="source-toolbar" role="group" aria-label="实时输入">
-      <label className="field-label" htmlFor={toggleId}>
+    <div className="live-bar" role="group" aria-label="实时输入">
+      <label className="switch" htmlFor={toggleId}>
         <input
           id={toggleId}
           type="checkbox"
+          role="switch"
           checked={enabled}
           onChange={(e) => onEnabledChange(e.currentTarget.checked)}
-          style={{ marginRight: 8 }}
         />
-        实时显示
+        <span className="switch-track" aria-hidden="true" />
+        <span className="switch-label">实时显示</span>
       </label>
-      <span className={statusChipClass(view)} aria-live="polite">
+      <span className="live-state" data-tone={tone} aria-live="polite">
+        <span className="live-dot" aria-hidden="true" />
         {enabled ? statusLabel(view) : "已关闭"}
       </span>
-      {showConnections && (
-        <>
+      {showConnections ? (
+        <div className="live-source">
           <label className="field-label" htmlFor={sourceId}>
             手柄连接
           </label>
           <select
             id={sourceId}
-            className="input"
-            style={{ minHeight: 36, maxWidth: 160 }}
+            className="input input-sm"
             value={view.selectedSourceId ?? ""}
             onChange={(e) => {
               const v = e.currentTarget.value;
@@ -92,8 +94,8 @@ export function LiveInputToolbar({
               </option>
             ))}
           </select>
-        </>
-      )}
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -25,6 +25,7 @@ import { useDevices, useMouseMotion, useMouseSources } from "../api/queries";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
+import { PageHeader } from "../components/PageHeader";
 import { EmptyState } from "../components/EmptyState";
 import { MouseDpiEditor } from "../components/MouseDpiEditor";
 import {
@@ -147,9 +148,12 @@ function DetailCard(props: {
   children: ReactNode;
 }) {
   return (
-    <div className="card detail-card">
-      <div className="detail-card-heading">
-        <h2 className="card-title">{props.title}</h2>
+    <section className="card detail-card">
+      <div className="card-head">
+        <div>
+          <h2 className="card-title">{props.title}</h2>
+          <p className="card-sub">{props.sub}</p>
+        </div>
         <button
           type="button"
           className="btn btn-sm"
@@ -159,9 +163,8 @@ function DetailCard(props: {
           {props.open ? "收起" : "展开"}
         </button>
       </div>
-      <p className="card-sub">{props.sub}</p>
       {props.open ? props.children : null}
-    </div>
+    </section>
   );
 }
 
@@ -170,7 +173,7 @@ const topColumns: Column<TopKeyRow>[] = [
     key: "label",
     header: "鼠标按键",
     value: (r) => r.label,
-    render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span>,
+    render: (r) => <strong>{r.label}</strong>,
   },
   {
     key: "code",
@@ -438,7 +441,7 @@ export function Mouse() {
       {topKeysLoading ? (
         <SkeletonCard rows={6} />
       ) : (
-        <div style={{ marginTop: "var(--space-3)" }}>
+        <div className="card-body">
           <DataTable
             columns={topColumns}
             rows={topKeys.data ?? []}
@@ -467,26 +470,20 @@ export function Mouse() {
       onToggle={() => setLegacyOpen((open) => !open)}
     >
       {legacy.isError ? (
-        <p
-          className="card-sub"
-          role="alert"
-          style={{ marginTop: "var(--space-3)" }}
-        >
+        <p className="card-sub card-body" role="alert">
           旧历史读取失败：
           {legacy.error !== null ? errMsg(legacy.error) : "未知错误"}
         </p>
       ) : legacy.data === undefined || !activity.ready ? (
         <SkeletonCard rows={2} />
       ) : (
-        <dl className="motion-summary" style={{ marginTop: "var(--space-3)" }}>
-          <div className="motion-summary-item">
-            <dt className="motion-summary-label">
-              原始移动量（旧算法 · 按型号）
-            </dt>
-            <dd className="motion-summary-value num">
+        <dl className="metrics card-body">
+          <div className="metric">
+            <dt className="metric-label">原始移动量（旧算法 · 按型号）</dt>
+            <dd className="metric-value num">
               {fmtNum(legacy.data.rawCounts)}
             </dd>
-            <dd className="motion-summary-hint">
+            <dd className="metric-hint">
               质量：legacy_uncalibrated（未校准口径，仅还原原始累计）
             </dd>
           </div>
@@ -503,11 +500,7 @@ export function Mouse() {
       onToggle={() => setModelDailyOpen((open) => !open)}
     >
       {modelKeyDaily.isError ? (
-        <p
-          className="card-sub"
-          role="alert"
-          style={{ marginTop: "var(--space-3)" }}
-        >
+        <p className="card-sub card-body" role="alert">
           逐日明细读取失败：
           {modelKeyDaily.error !== null
             ? errMsg(modelKeyDaily.error)
@@ -516,7 +509,7 @@ export function Mouse() {
       ) : modelKeyDaily.data === undefined || !activity.ready ? (
         <SkeletonCard rows={8} />
       ) : (
-        <div style={{ marginTop: "var(--space-3)" }}>
+        <div className="card-body">
           <DataTable
             columns={dailyColumns}
             rows={modelKeyDaily.data}
@@ -539,153 +532,142 @@ export function Mouse() {
 
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">鼠标</h1>
-          <p className="page-desc">查看鼠标移动距离、DPI 与按键统计</p>
-        </div>
-        <DateRangePicker value={range} onChange={onChange} />
-      </div>
-
-      {/* 来源选择：加载中骨架；空列表 EmptyState；就绪后 picker（不阻挡下方实时图） */}
-      {bootLoading ? (
-        <SkeletonCards count={1} />
-      ) : sourceRows.length === 0 && mouseModels.length === 0 ? (
-        <EmptyState
-          icon={<IconPlug size={36} />}
-          title="还没有鼠标设备的记录"
-          description="采集器启动后会自动识别接入的设备并开始计数。若已连接鼠标，请确认采集器正在运行（设置页可启动）。"
-          action={{ label: "前往设置", onClick: goSettings }}
-        />
-      ) : (
-        <div
-          style={{
-            display: "flex",
-            gap: "var(--space-4)",
-            alignItems: "flex-start",
-            flexWrap: "wrap",
-          }}
-        >
-          <div style={{ flex: "1 1 340px", minWidth: 0 }}>
-            <MouseSourcePicker
-              sources={sourceRows}
-              models={mouseModels}
-              selection={pickerSelection}
-              onSelect={setPicked}
-            />
+      <PageHeader
+        title="鼠标"
+        description="查看鼠标移动距离、DPI 与按键统计"
+        actions={<DateRangePicker value={range} onChange={onChange} />}
+      />
+      <div className="page">
+        {/* 来源选择：加载中骨架；空列表 EmptyState；就绪后 picker（不阻挡下方实时图） */}
+        {bootLoading ? (
+          <SkeletonCards count={1} />
+        ) : sourceRows.length === 0 && mouseModels.length === 0 ? (
+          <EmptyState
+            icon={<IconPlug size={36} />}
+            title="还没有鼠标设备的记录"
+            description="采集器启动后会自动识别接入的设备并开始计数。若已连接鼠标，请确认采集器正在运行（设置页可启动）。"
+            action={{ label: "前往设置", onClick: goSettings }}
+          />
+        ) : (
+          <div className="picker-row">
+            <div className="picker-main">
+              <MouseSourcePicker
+                sources={sourceRows}
+                models={mouseModels}
+                selection={pickerSelection}
+                onSelect={setPicked}
+              />
+            </div>
+            {sources.isError ? (
+              <div className="card picker-aside" role="alert">
+                <h2 className="card-title">鼠标来源读取失败</h2>
+                <p className="card-sub">
+                  {sources.error !== null ? errMsg(sources.error) : "未知错误"}
+                </p>
+              </div>
+            ) : needsUpgrade ? (
+              <div className="picker-aside">
+                <UpgradeNote />
+              </div>
+            ) : null}
           </div>
-          {sources.isError ? (
-            <div
-              className="card"
-              role="alert"
-              style={{ flex: "1 1 300px", minWidth: 0 }}
-            >
-              <h2 className="card-title">鼠标来源读取失败</h2>
+        )}
+
+        {selectedSource !== null ? (
+          motion.isError ? (
+            <div className="card" role="alert">
+              <h2 className="card-title">运动数据读取失败</h2>
               <p className="card-sub">
-                {sources.error !== null ? errMsg(sources.error) : "未知错误"}
+                {motion.error !== null ? errMsg(motion.error) : "未知错误"}
               </p>
             </div>
-          ) : needsUpgrade ? (
-            <div style={{ flex: "1 1 300px", minWidth: 0 }}>
-              <UpgradeNote />
+          ) : motion.data === undefined || !activity.ready ? (
+            <SkeletonCard rows={2} height="110px" />
+          ) : motion.data.availability === "needs_upgrade" ? (
+            <UpgradeNote />
+          ) : (
+            <MotionSummary items={overviewItems(motion.data, selectedSource)} />
+          )
+        ) : !bootLoading &&
+          (sourceRows.length > 0 || mouseModels.length > 0) ? (
+          <div className="card" role="note">
+            <h2 className="card-title">
+              {selectedModel !== null
+                ? `${selectedModel.nickname ?? selectedModel.name}（按型号汇总）`
+                : "型号历史（按型号汇总）"}
+            </h2>
+            <p className="card-sub">
+              按钮计数与旧历史按型号汇总；运动与 DPI
+              按物理来源记录——在上方「运动来源」选择具体来源即可查看。
+            </p>
+            {needsUpgrade ? (
+              <p className="hint">
+                按来源记录的运动与 DPI：启动/更新采集器后可用。
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* 每页只挂载一份分布图（原两处控件图合并）；DPI 侧栏保留 */}
+        <div className="mouse-workspace">
+          <div className="cell">
+            {liveDiagram}
+            <p className="hint">
+              按钮计数按型号汇总（同型号来源共享同一型号的按键记录）。
+            </p>
+          </div>
+          {selectedSource !== null ? (
+            <div className="cell">
+              <MouseDpiEditor
+                source={selectedSource}
+                pending={dpiSave.isPending}
+                onSave={saveDpi}
+              />
             </div>
           ) : null}
         </div>
-      )}
 
-      {selectedSource !== null ? (
-        motion.isError ? (
-          <div className="card" role="alert">
-            <h2 className="card-title">运动数据读取失败</h2>
-            <p className="card-sub">
-              {motion.error !== null ? errMsg(motion.error) : "未知错误"}
-            </p>
-          </div>
-        ) : motion.data === undefined || !activity.ready ? (
-          <SkeletonCard rows={2} height="110px" />
-        ) : motion.data.availability === "needs_upgrade" ? (
-          <UpgradeNote />
-        ) : (
-          <MotionSummary items={overviewItems(motion.data, selectedSource)} />
-        )
-      ) : !bootLoading && (sourceRows.length > 0 || mouseModels.length > 0) ? (
-        <div className="card" role="note">
-          <h2 className="card-title">
-            {selectedModel !== null
-              ? `${selectedModel.nickname ?? selectedModel.name}（按型号汇总）`
-              : "型号历史（按型号汇总）"}
-          </h2>
-          <p className="card-sub">
-            按钮计数与旧历史按型号汇总；运动与 DPI
-            按物理来源记录——在上方「运动来源」选择具体来源即可查看。
-          </p>
-          {needsUpgrade ? (
-            <p className="chart-hint">
-              按来源记录的运动与 DPI：启动/更新采集器后可用。
-            </p>
-          ) : null}
-        </div>
-      ) : null}
-
-      {/* 每页只挂载一份分布图（原两处控件图合并）；DPI 侧栏保留 */}
-      <div className="mouse-workspace">
-        <div style={{ minWidth: 0 }}>
-          {liveDiagram}
-          <p className="chart-hint">
-            按钮计数按型号汇总（同型号来源共享同一型号的按键记录）。
-          </p>
-        </div>
-        {selectedSource !== null ? (
-          <div style={{ minWidth: 0 }}>
-            <MouseDpiEditor
-              source={selectedSource}
-              pending={dpiSave.isPending}
-              onSave={saveDpi}
-            />
-          </div>
+        {!bootLoading && (sourceRows.length > 0 || mouseModels.length > 0) ? (
+          selectedSource !== null ? (
+            <>
+              {fullListDetail}
+              {motionReadyData !== null ? (
+                <DetailCard
+                  title="运动逐日明细"
+                  sub="所选来源每天的移动量与距离；未配置 DPI 的部分保留原始量"
+                  open={daysOpen}
+                  onToggle={() => setDaysOpen((open) => !open)}
+                >
+                  <div className="card-body">
+                    <DataTable
+                      columns={motionDayColumns}
+                      rows={motionReadyData.days}
+                      rowKey={(r) => r.day}
+                      initialSort={{ key: "rawCounts", dir: "desc" }}
+                      caption="鼠标运动逐日明细（所选来源）"
+                      pageSize={50}
+                      resetKey={deviceRangeKey}
+                      empty={
+                        <EmptyState
+                          title="所选范围内没有运动记录"
+                          description="移动鼠标或扩大日期范围后再试。"
+                        />
+                      }
+                    />
+                  </div>
+                </DetailCard>
+              ) : null}
+              {legacyDetail}
+            </>
+          ) : (
+            <>
+              {fullListDetail}
+              {modelDailyDetail}
+              {legacyDetail}
+            </>
+          )
         ) : null}
       </div>
-
-      {!bootLoading && (sourceRows.length > 0 || mouseModels.length > 0) ? (
-        selectedSource !== null ? (
-          <>
-            {fullListDetail}
-            {motionReadyData !== null ? (
-              <DetailCard
-                title="运动逐日明细"
-                sub="所选来源每天的移动量与距离；未配置 DPI 的部分保留原始量"
-                open={daysOpen}
-                onToggle={() => setDaysOpen((open) => !open)}
-              >
-                <div style={{ marginTop: "var(--space-3)" }}>
-                  <DataTable
-                    columns={motionDayColumns}
-                    rows={motionReadyData.days}
-                    rowKey={(r) => r.day}
-                    initialSort={{ key: "rawCounts", dir: "desc" }}
-                    caption="鼠标运动逐日明细（所选来源）"
-                    pageSize={50}
-                    resetKey={deviceRangeKey}
-                    empty={
-                      <EmptyState
-                        title="所选范围内没有运动记录"
-                        description="移动鼠标或扩大日期范围后再试。"
-                      />
-                    }
-                  />
-                </div>
-              </DetailCard>
-            ) : null}
-            {legacyDetail}
-          </>
-        ) : (
-          <>
-            {fullListDetail}
-            {modelDailyDetail}
-            {legacyDetail}
-          </>
-        )
-      ) : null}
     </>
   );
 }

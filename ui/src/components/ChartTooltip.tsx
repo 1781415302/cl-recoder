@@ -1,4 +1,4 @@
-// Recharts 自定义 tooltip（令牌样式：白卡 + token 边框 + elevation-2）。
+// Recharts 自定义 tooltip。
 import { fmtNum } from "../lib/format";
 
 export interface TooltipEntry {
@@ -14,25 +14,13 @@ interface ChartTooltipProps {
   unit?: string;
 }
 
-export function ChartTooltip({
-  active,
-  payload,
-  label,
-  unit,
-}: ChartTooltipProps) {
+export function ChartTooltip({ active, payload, label, unit }: ChartTooltipProps) {
   if (!active || !payload || payload.length === 0) return null;
   return (
-    <div className="chart-tooltip">
-      <div style={{ fontWeight: 600, marginBottom: 2 }}>{label}</div>
+    <div className="chart-tip">
+      <div className="chart-tip-label">{label}</div>
       {payload.map((p, i) => (
-        <div
-          key={i}
-          style={{
-            display: "flex",
-            gap: "var(--space-2)",
-            justifyContent: "space-between",
-          }}
-        >
+        <div key={i} className="chart-tip-row">
           <span>{p.name}</span>
           <span className="num">
             {fmtNum(Number(p.value ?? 0))}

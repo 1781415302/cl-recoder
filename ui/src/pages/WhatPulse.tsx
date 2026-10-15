@@ -16,6 +16,7 @@ import { uiQueryPolicy } from "../api/queryPolicy";
 import { wpMouseQueryOptions } from "../api/wpMouseQuery";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
+import { PageHeader } from "../components/PageHeader";
 import { EmptyState } from "../components/EmptyState";
 import { RankedList } from "../components/RankedList";
 import { SkeletonCard, SkeletonCards } from "../components/Skeleton";
@@ -33,11 +34,11 @@ import type { ImportReport, WpAppRow } from "../api/types";
 
 function ImportReportCard({ report }: { report: ImportReport }) {
   return (
-    <div className="card" role="status">
-      <h2
-        className="card-title"
-        style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}
-      >
+    <section
+      className={`card report${report.ok ? "" : " report--bad"}`}
+      role="status"
+    >
+      <h2 className="card-title report-title">
         <IconImport /> 导入{report.ok ? "成功" : "失败"}
       </h2>
       <p className="card-sub">
@@ -47,29 +48,15 @@ function ImportReportCard({ report }: { report: ImportReport }) {
         {fmtNum(report.durationMs)} ms
       </p>
       {report.warnings.length > 0 ? (
-        <ul
-          style={{
-            margin: "var(--space-2) 0 0",
-            paddingLeft: "var(--space-4)",
-            color: "var(--color-text-muted)",
-            fontSize: "var(--text-caption)",
-          }}
-        >
+        <ul className="report-warnings">
           {report.warnings.map((w, i) => (
-            <li
-              key={i}
-              style={{
-                display: "flex",
-                gap: "var(--space-1)",
-                alignItems: "baseline",
-              }}
-            >
+            <li key={i}>
               <IconWarn size={14} /> {w}
             </li>
           ))}
         </ul>
       ) : null}
-    </div>
+    </section>
   );
 }
 
@@ -182,34 +169,41 @@ export function WhatPulse() {
     (q) => q.data !== undefined && q.isFetching,
   );
 
-  if (meta.isPending) return <SkeletonCard rows={6} />;
+  if (meta.isPending)
+    return (
+      <>
+        <PageHeader title="WhatPulse" description="导入的历史记录，独立保留" />
+        <div className="page">
+          <SkeletonCard rows={6} />
+        </div>
+      </>
+    );
   if (!meta.data) {
     return (
       <>
-        <div className="page-header">
-          <div>
-            <h1 className="page-title">WhatPulse</h1>
-            <p className="page-desc">导入的历史记录，独立保留</p>
-          </div>
+        <PageHeader title="WhatPulse" description="导入的历史记录，独立保留" />
+        <div className="page">
+          <EmptyState
+            icon={<IconPulse size={36} />}
+            title="尚未导入 WhatPulse 数据"
+            description="将从 WhatPulse 本地 SQLite 数据库（只读、先复制后打开）导入按键/组合/应用/鼠标历史。默认探测 %LOCALAPPDATA%\\WhatPulse\\whatpulse.db，也可在设置页覆盖路径。"
+            action={{
+              label: "开始导入",
+              onClick: () => importMut.mutate(dbPath),
+            }}
+          />
+          {importMut.isPending ? (
+            <p className="readout" role="status">
+              正在导入（复制快照并重建 wp_* 表）…
+            </p>
+          ) : null}
+          {importMut.isError ? (
+            <p className="banner banner--bad" role="alert">
+              导入失败：{String(importMut.error)}
+            </p>
+          ) : null}
+          {report ? <ImportReportCard report={report} /> : null}
         </div>
-        <EmptyState
-          icon={<IconPulse size={36} />}
-          title="尚未导入 WhatPulse 数据"
-          description="将从 WhatPulse 本地 SQLite 数据库（只读、先复制后打开）导入按键/组合/应用/鼠标历史。默认探测 %LOCALAPPDATA%\\WhatPulse\\whatpulse.db，也可在设置页覆盖路径。"
-          action={{
-            label: "开始导入",
-            onClick: () => importMut.mutate(dbPath),
-          }}
-        />
-        {importMut.isPending ? (
-          <p className="chart-readout">正在导入（复制快照并重建 wp_* 表）…</p>
-        ) : null}
-        {importMut.isError ? (
-          <p style={{ color: "var(--color-danger)" }}>
-            导入失败：{String(importMut.error)}
-          </p>
-        ) : null}
-        {report ? <ImportReportCard report={report} /> : null}
       </>
     );
   }
@@ -217,217 +211,94 @@ export function WhatPulse() {
   const m = meta.data;
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">WhatPulse</h1>
-          <p className="page-desc">
-            导入的历史快照 · {fmtDay(m.dateMin ?? m.importedAt)} —{" "}
-            {fmtDay(m.dateMax ?? m.importedAt)}
-          </p>
-        </div>
-        <div
-          style={{
-            display: "flex",
-            gap: "var(--space-2)",
-            alignItems: "center",
-            flexWrap: "wrap",
-          }}
-        >
-          <span className="chip">
-            导入于 {fmtDay(m.importedAt.slice(0, 10))}
+      <PageHeader
+        title="WhatPulse"
+        description={`导入的历史快照 · ${fmtDay(m.dateMin ?? m.importedAt)} — ${fmtDay(m.dateMax ?? m.importedAt)}`}
+        actions={
+          <>
+            <span className="chip" title={m.sourcePath}>
+              导入于 {fmtDay(m.importedAt.slice(0, 10))}
+            </span>
+            <button
+              type="button"
+              className="btn"
+              disabled={importMut.isPending}
+              onClick={() => importMut.mutate(dbPath)}
+            >
+              <IconRefresh size={16} />{" "}
+              {importMut.isPending ? "导入中…" : "重新导入"}
+            </button>
+          </>
+        }
+      />
+      <div className="page">
+        {report ? <ImportReportCard report={report} /> : null}
+
+        <div className="wp-tools">
+          <DateRangePicker value={range} onChange={setRange} />
+          <span className="chip chip--wp" title={m.sourcePath}>
+            独立历史快照
           </span>
-          <button
-            type="button"
-            className="btn"
-            disabled={importMut.isPending}
-            onClick={() => importMut.mutate(dbPath)}
-          >
-            <IconRefresh size={16} />{" "}
-            {importMut.isPending ? "导入中…" : "重新导入"}
-          </button>
+          {updating ? (
+            <span className="updating" role="status">
+              历史数据更新中…
+            </span>
+          ) : null}
         </div>
-      </div>
 
-      {report ? <ImportReportCard report={report} /> : null}
-
-      <div className="wp-tools">
-        <DateRangePicker value={range} onChange={setRange} />
-        <span className="chip" title={m.sourcePath}>
-          独立历史快照
-        </span>
-      </div>
-      {updating ? (
-        <p className="chart-readout" role="status">
-          历史数据更新中…
-        </p>
-      ) : null}
-
-      {overview.isLoading ? (
-        <SkeletonCards count={4} />
-      ) : (
-        <div className="grid-cards wp-metrics">
-          {/* §4.6：appsTotal 为范围内应用前台秒数总和（非条目数量），fmtDuration 展示 */}
-          <StatCard
-            label="WhatPulse 按键"
-            value={fmtNum(overview.data?.keysTotal ?? 0)}
-            tone="primary"
-          />
-          <StatCard
-            label="组合键"
-            value={fmtNum(overview.data?.combosTotal ?? 0)}
-          />
-          <StatCard
-            label="应用前台时长"
-            value={fmtDuration(overview.data?.appsTotal ?? 0)}
-          />
-          <StatCard
-            label="鼠标点击"
-            value={fmtNum(overview.data?.mouseClicksTotal ?? 0)}
-            tone="accent"
-          />
-        </div>
-      )}
-
-      {overview.isLoading ? (
-        <SkeletonCard rows={5} height="110px" />
-      ) : (
-        <TrendChart
-          data={overview.data?.days ?? []}
-          title="WhatPulse 每日按键（所选范围）"
-          colorVar="--chart-2"
-          seriesName="WhatPulse"
-          height={200}
-        />
-      )}
-
-      {keys.isLoading ? (
-        <SkeletonCard rows={5} />
-      ) : (
-        <RankedList
-          title="WhatPulse 按键逐日高频项"
-          rows={(keys.data ?? []).map((r) => ({
-            id: `${r.day}:${r.qtKey}`,
-            label: `${r.label}（${fmtDay(r.day)}）`,
-            value: r.count,
-          }))}
-          unit="次"
-          labelHeader="按键"
-          valueHeader="累计次数"
-          queryLimit={200}
-          fullTable={
-            <DataTable
-              columns={[
-                {
-                  key: "day",
-                  header: "日期",
-                  value: (r) => r.day,
-                  render: (r) => fmtDay(r.day),
-                },
-                { key: "label", header: "按键", value: (r) => r.label },
-                {
-                  key: "qtKey",
-                  header: "Qt 键码",
-                  value: (r) => r.qtKey,
-                  render: (r) => <span className="mono">{r.qtKey}</span>,
-                },
-                {
-                  key: "count",
-                  header: "累计次数",
-                  value: (r) => r.count,
-                  numeric: true,
-                  render: (r) => fmtNum(r.count),
-                },
-              ]}
-              rows={keys.data ?? []}
-              rowKey={(r) => `${r.day}:${r.qtKey}`}
-              initialSort={{ key: "count", dir: "desc" }}
-              caption="WhatPulse 按键逐日明细"
-              pageSize={50}
-              resetKey={`${range.from}|${range.to}`}
+        {overview.isLoading ? (
+          <SkeletonCards count={4} />
+        ) : (
+          <div className="kpi-grid kpi-grid--4">
+            {/* §4.6：appsTotal 为范围内应用前台秒数总和（非条目数量），fmtDuration 展示 */}
+            <StatCard
+              label="WhatPulse 按键"
+              value={fmtNum(overview.data?.keysTotal ?? 0)}
+              tone="kb"
             />
-          }
-        />
-      )}
-
-      {combos.isLoading ? (
-        <SkeletonCard rows={4} />
-      ) : (
-        <RankedList
-          title="WhatPulse 组合键逐日高频项"
-          rows={(combos.data ?? []).map((r) => ({
-            id: `${r.day}:${r.combo}`,
-            label: `${r.label}（${fmtDay(r.day)}）`,
-            value: r.count,
-          }))}
-          unit="次"
-          labelHeader="组合键"
-          valueHeader="累计次数"
-          queryLimit={200}
-          fullTable={
-            <DataTable
-              columns={[
-                {
-                  key: "day",
-                  header: "日期",
-                  value: (r) => r.day,
-                  render: (r) => fmtDay(r.day),
-                },
-                { key: "label", header: "组合键", value: (r) => r.label },
-                {
-                  key: "combo",
-                  header: "源记录",
-                  value: (r) => r.combo,
-                  render: (r) => <span className="mono">{r.combo}</span>,
-                },
-                {
-                  key: "count",
-                  header: "累计次数",
-                  value: (r) => r.count,
-                  numeric: true,
-                  render: (r) => fmtNum(r.count),
-                },
-              ]}
-              rows={combos.data ?? []}
-              rowKey={(r) => `${r.day}:${r.combo}`}
-              initialSort={{ key: "count", dir: "desc" }}
-              caption="WhatPulse 组合键逐日明细"
-              pageSize={50}
-              resetKey={`${range.from}|${range.to}`}
+            <StatCard
+              label="组合键"
+              value={fmtNum(overview.data?.combosTotal ?? 0)}
             />
-          }
-        />
-      )}
-
-      {apps.isLoading ? (
-        <SkeletonCard rows={6} />
-      ) : (
-        <div className="card">
-          <h2 className="card-title">应用明细</h2>
-          <p className="card-sub">
-            按 (日期, 应用) 记录的前台时长与按键、点击；同名不同路径按 path 区分
-          </p>
-          <div style={{ marginTop: "var(--space-3)" }}>
-            <DataTable
-              columns={wpAppColumns}
-              rows={apps.data ?? []}
-              rowKey={(r) => `${r.day}:${r.path}`}
-              initialSort={{ key: "seconds", dir: "desc" }}
-              caption="WhatPulse 应用明细"
-              pageSize={50}
-              resetKey={`${range.from}|${range.to}`}
+            <StatCard
+              label="应用前台时长"
+              value={fmtDuration(overview.data?.appsTotal ?? 0)}
+            />
+            <StatCard
+              label="鼠标点击"
+              value={fmtNum(overview.data?.mouseClicksTotal ?? 0)}
+              tone="ms"
             />
           </div>
-        </div>
-      )}
+        )}
 
-      <div className="grid-2">
-        {mouse.isLoading ? (
+        {overview.isLoading ? (
+          <SkeletonCard rows={5} height="110px" />
+        ) : (
+          <TrendChart
+            data={overview.data?.days ?? []}
+            title="WhatPulse 每日按键（所选范围）"
+            colorVar="--wp"
+            seriesName="WhatPulse"
+            height={200}
+          />
+        )}
+
+        {keys.isLoading ? (
           <SkeletonCard rows={5} />
         ) : (
-          <div className="card">
-            <h2 className="card-title">鼠标点击与移动</h2>
-            <p className="card-sub">历史移动距离（米）</p>
-            <div style={{ marginTop: "var(--space-3)" }}>
+          <RankedList
+            title="WhatPulse 按键逐日高频项"
+            rows={(keys.data ?? []).map((r) => ({
+              id: `${r.day}:${r.qtKey}`,
+              label: `${r.label}（${fmtDay(r.day)}）`,
+              value: r.count,
+            }))}
+            unit="次"
+            labelHeader="按键"
+            valueHeader="累计次数"
+            queryLimit={200}
+            fullTable={
               <DataTable
                 columns={[
                   {
@@ -436,78 +307,187 @@ export function WhatPulse() {
                     value: (r) => r.day,
                     render: (r) => fmtDay(r.day),
                   },
+                  { key: "label", header: "按键", value: (r) => r.label },
                   {
-                    key: "clicks",
-                    header: "点击",
-                    value: (r) => r.clicks,
-                    numeric: true,
-                    render: (r) => fmtNum(r.clicks),
+                    key: "qtKey",
+                    header: "Qt 键码",
+                    value: (r) => r.qtKey,
+                    render: (r) => <span className="mono">{r.qtKey}</span>,
                   },
                   {
-                    key: "meters",
-                    header: "移动距离",
-                    value: (r) => r.distanceMeters,
+                    key: "count",
+                    header: "累计次数",
+                    value: (r) => r.count,
                     numeric: true,
-                    render: (r) => `${fmtNum(r.distanceMeters)} m`,
+                    render: (r) => fmtNum(r.count),
                   },
                 ]}
-                rows={mouse.data ?? []}
-                rowKey={(r) => r.day}
-                initialSort={{ key: "day", dir: "desc" }}
-                caption="WhatPulse 每日鼠标数据"
+                rows={keys.data ?? []}
+                rowKey={(r) => `${r.day}:${r.qtKey}`}
+                initialSort={{ key: "count", dir: "desc" }}
+                caption="WhatPulse 按键逐日明细"
+                pageSize={50}
+                resetKey={`${range.from}|${range.to}`}
+              />
+            }
+          />
+        )}
+
+        {combos.isLoading ? (
+          <SkeletonCard rows={4} />
+        ) : (
+          <RankedList
+            title="WhatPulse 组合键逐日高频项"
+            rows={(combos.data ?? []).map((r) => ({
+              id: `${r.day}:${r.combo}`,
+              label: `${r.label}（${fmtDay(r.day)}）`,
+              value: r.count,
+            }))}
+            unit="次"
+            labelHeader="组合键"
+            valueHeader="累计次数"
+            queryLimit={200}
+            fullTable={
+              <DataTable
+                columns={[
+                  {
+                    key: "day",
+                    header: "日期",
+                    value: (r) => r.day,
+                    render: (r) => fmtDay(r.day),
+                  },
+                  { key: "label", header: "组合键", value: (r) => r.label },
+                  {
+                    key: "combo",
+                    header: "源记录",
+                    value: (r) => r.combo,
+                    render: (r) => <span className="mono">{r.combo}</span>,
+                  },
+                  {
+                    key: "count",
+                    header: "累计次数",
+                    value: (r) => r.count,
+                    numeric: true,
+                    render: (r) => fmtNum(r.count),
+                  },
+                ]}
+                rows={combos.data ?? []}
+                rowKey={(r) => `${r.day}:${r.combo}`}
+                initialSort={{ key: "count", dir: "desc" }}
+                caption="WhatPulse 组合键逐日明细"
+                pageSize={50}
+                resetKey={`${range.from}|${range.to}`}
+              />
+            }
+          />
+        )}
+
+        {apps.isLoading ? (
+          <SkeletonCard rows={6} />
+        ) : (
+          <div className="card">
+            <h2 className="card-title">应用明细</h2>
+            <p className="card-sub">
+              按 (日期, 应用) 记录的前台时长与按键、点击；同名不同路径按 path
+              区分
+            </p>
+            <div className="card-body">
+              <DataTable
+                columns={wpAppColumns}
+                rows={apps.data ?? []}
+                rowKey={(r) => `${r.day}:${r.path}`}
+                initialSort={{ key: "seconds", dir: "desc" }}
+                caption="WhatPulse 应用明细"
                 pageSize={50}
                 resetKey={`${range.from}|${range.to}`}
               />
             </div>
           </div>
         )}
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: "var(--grid-gap)",
-          }}
-        >
-          <div className="card">
-            <h2 className="card-title">鼠标按键分布</h2>
-            <div style={{ marginTop: "var(--space-2)" }}>
-              <DataTable
-                columns={[
-                  { key: "label", header: "按键", value: (r) => r.label },
-                  {
-                    key: "total",
-                    header: "次数",
-                    value: (r) => r.total,
-                    numeric: true,
-                    render: (r) => fmtNum(r.total),
-                  },
-                ]}
-                rows={buttons.data ?? []}
-                rowKey={(r) => r.label}
-                initialSort={{ key: "total", dir: "desc" }}
-                caption="WhatPulse 鼠标按键分布"
-              />
+
+        <div className="grid-2">
+          {mouse.isLoading ? (
+            <SkeletonCard rows={5} />
+          ) : (
+            <div className="card">
+              <h2 className="card-title">鼠标点击与移动</h2>
+              <p className="card-sub">历史移动距离（米）</p>
+              <div className="card-body">
+                <DataTable
+                  columns={[
+                    {
+                      key: "day",
+                      header: "日期",
+                      value: (r) => r.day,
+                      render: (r) => fmtDay(r.day),
+                    },
+                    {
+                      key: "clicks",
+                      header: "点击",
+                      value: (r) => r.clicks,
+                      numeric: true,
+                      render: (r) => fmtNum(r.clicks),
+                    },
+                    {
+                      key: "meters",
+                      header: "移动距离",
+                      value: (r) => r.distanceMeters,
+                      numeric: true,
+                      render: (r) => `${fmtNum(r.distanceMeters)} m`,
+                    },
+                  ]}
+                  rows={mouse.data ?? []}
+                  rowKey={(r) => r.day}
+                  initialSort={{ key: "day", dir: "desc" }}
+                  caption="WhatPulse 每日鼠标数据"
+                  pageSize={50}
+                  resetKey={`${range.from}|${range.to}`}
+                />
+              </div>
             </div>
-          </div>
-          <div className="card">
-            <h2 className="card-title">滚轮方向分布</h2>
-            <div style={{ marginTop: "var(--space-2)" }}>
-              <DataTable
-                columns={[
-                  { key: "label", header: "方向", value: (r) => r.label },
-                  {
-                    key: "total",
-                    header: "次数",
-                    value: (r) => r.total,
-                    numeric: true,
-                    render: (r) => fmtNum(r.total),
-                  },
-                ]}
-                rows={scrolls.data ?? []}
-                rowKey={(r) => r.label}
-                initialSort={{ key: "total", dir: "desc" }}
-                caption="WhatPulse 滚轮方向分布"
-              />
+          )}
+          <div className="stack">
+            <div className="card">
+              <h2 className="card-title">鼠标按键分布</h2>
+              <div className="card-body">
+                <DataTable
+                  columns={[
+                    { key: "label", header: "按键", value: (r) => r.label },
+                    {
+                      key: "total",
+                      header: "次数",
+                      value: (r) => r.total,
+                      numeric: true,
+                      render: (r) => fmtNum(r.total),
+                    },
+                  ]}
+                  rows={buttons.data ?? []}
+                  rowKey={(r) => r.label}
+                  initialSort={{ key: "total", dir: "desc" }}
+                  caption="WhatPulse 鼠标按键分布"
+                />
+              </div>
+            </div>
+            <div className="card">
+              <h2 className="card-title">滚轮方向分布</h2>
+              <div className="card-body">
+                <DataTable
+                  columns={[
+                    { key: "label", header: "方向", value: (r) => r.label },
+                    {
+                      key: "total",
+                      header: "次数",
+                      value: (r) => r.total,
+                      numeric: true,
+                      render: (r) => fmtNum(r.total),
+                    },
+                  ]}
+                  rows={scrolls.data ?? []}
+                  rowKey={(r) => r.label}
+                  initialSort={{ key: "total", dir: "desc" }}
+                  caption="WhatPulse 滚轮方向分布"
+                />
+              </div>
             </div>
           </div>
         </div>

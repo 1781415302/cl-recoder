@@ -7,7 +7,7 @@ export function Keyboard() {
       kind="keyboard"
       title="键盘"
       description="每个按键的使用次数 · 长按自动重复不计"
-      colorVar="--chart-1"
+      colorVar="--kb"
     />
   );
 }

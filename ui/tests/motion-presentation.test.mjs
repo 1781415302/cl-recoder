@@ -456,6 +456,10 @@ test("展示组件模块可加载并导出组件函数；只依赖 react/本地�
     "./icons",
     "./MouseDeviceDiagram",
     "./GamepadDeviceDiagram",
+    "../lib/heatPalette",
+    "../lib/theme",
+    "./diagramSkin",
+    "../api/types",
   ]);
   for (const [file, exportName] of COMPONENTS) {
     const { exports, required } = await loadComponentModule(`../src/components/${file}`);

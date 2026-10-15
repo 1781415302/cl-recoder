@@ -7,6 +7,7 @@ import * as client from "../api/client";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "../components/DataTable";
 import { DateRangePicker } from "../components/DateRangePicker";
+import { PageHeader } from "../components/PageHeader";
 import { EmptyState } from "../components/EmptyState";
 import { RankedList } from "../components/RankedList";
 import { SkeletonCard } from "../components/Skeleton";
@@ -22,10 +23,8 @@ const columns: Column<AppRowLabeled>[] = [
     value: (r) => r.name,
     render: (r) => (
       <span>
-        <span style={{ fontWeight: 600 }}>{r.name}</span>
-        <span className="mono" style={{ marginLeft: "var(--space-2)" }}>
-          {r.exe}
-        </span>
+        <strong>{r.name}</strong>
+        <span className="mono app-exe">{r.exe}</span>
       </span>
     ),
   },
@@ -78,53 +77,52 @@ export function Apps() {
 
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">应用</h1>
-          <p className="page-desc">时间花在哪里，输入发生在哪里</p>
-        </div>
-        <DateRangePicker value={range} onChange={onChange} />
+      <PageHeader
+        title="应用"
+        description="时间花在哪里，输入发生在哪里"
+        actions={<DateRangePicker value={range} onChange={onChange} />}
+      />
+      <div className="page">
+        {loading ? (
+          <SkeletonCard rows={7} />
+        ) : (
+          <RankedList
+            title="应用前台时长排行"
+            rows={(data ?? []).map((r) => ({
+              id: r.exe,
+              label: r.name || r.exe,
+              value: r.seconds,
+            }))}
+            formatValue={fmtDuration}
+            labelHeader="应用"
+            valueHeader="前台时长"
+            queryLimit={200}
+            fullTable={
+              <DataTable
+                columns={columns}
+                rows={data ?? []}
+                rowKey={(r) => r.exe}
+                initialSort={{ key: "seconds", dir: "desc" }}
+                caption="应用前台时长排行（所选范围）"
+                pageSize={50}
+                resetKey={`${range.from}|${range.to}`}
+                empty={
+                  <EmptyState
+                    title="还没有应用数据"
+                    description="前台应用跟踪在采集器运行时自动记录；切换窗口后稍等片刻再来看。"
+                    action={{
+                      label: "前往设置",
+                      onClick: () => {
+                        window.location.hash = "settings";
+                      },
+                    }}
+                  />
+                }
+              />
+            }
+          />
+        )}
       </div>
-
-      {loading ? (
-        <SkeletonCard rows={7} />
-      ) : (
-        <RankedList
-          title="应用前台时长排行"
-          rows={(data ?? []).map((r) => ({
-            id: r.exe,
-            label: r.name || r.exe,
-            value: r.seconds,
-          }))}
-          formatValue={fmtDuration}
-          labelHeader="应用"
-          valueHeader="前台时长"
-          queryLimit={200}
-          fullTable={
-            <DataTable
-              columns={columns}
-              rows={data ?? []}
-              rowKey={(r) => r.exe}
-              initialSort={{ key: "seconds", dir: "desc" }}
-              caption="应用前台时长排行（所选范围）"
-              pageSize={50}
-              resetKey={`${range.from}|${range.to}`}
-              empty={
-                <EmptyState
-                  title="还没有应用数据"
-                  description="前台应用跟踪在采集器运行时自动记录；切换窗口后稍等片刻再来看。"
-                  action={{
-                    label: "前往设置",
-                    onClick: () => {
-                      window.location.hash = "settings";
-                    },
-                  }}
-                />
-              }
-            />
-          }
-        />
-      )}
     </>
   );
 }

@@ -215,3 +215,36 @@ export function IconStick(p: IconProps) {
     p,
   );
 }
+
+export function IconSun(p: IconProps) {
+  return base(
+    p.size,
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2.5v2.2M12 19.3v2.2M4.6 4.6l1.6 1.6M17.8 17.8l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.6 19.4l1.6-1.6M17.8 6.2l1.6-1.6" />
+    </>,
+    p,
+  );
+}
+export function IconMoon(p: IconProps) {
+  return base(p.size, <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z" />, p);
+}
+export function IconAuto(p: IconProps) {
+  return base(
+    p.size,
+    <>
+      <rect x="3" y="4" width="18" height="12" rx="2" />
+      <path d="M8 20h8M12 16v4" />
+    </>,
+    p,
+  );
+}
+export function IconChevron(p: IconProps) {
+  return base(p.size, <path d="m6 9 6 6 6-6" />, p);
+}
+export function IconClose(p: IconProps) {
+  return base(p.size, <path d="M6 6l12 12M18 6 6 18" />, p);
+}
+export function IconBolt(p: IconProps) {
+  return base(p.size, <path d="M13 2.5 4.5 13.5H11l-1 8 8.5-11H12l1-8Z" />, p);
+}

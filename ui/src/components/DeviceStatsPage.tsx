@@ -17,6 +17,7 @@ import { useDevices } from "../api/queries";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { DataTable, type Column } from "./DataTable";
 import { DateRangePicker } from "./DateRangePicker";
+import { PageHeader } from "./PageHeader";
 import { DeviceTabs } from "./DeviceTabs";
 import { EmptyState } from "./EmptyState";
 import { LiveDeviceControls } from "./LiveDeviceControls";
@@ -25,7 +26,7 @@ import { fmtDay, fmtNum, kindLabel } from "../lib/format";
 import { sameDevice } from "../lib/liveInputPresentation";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { useStatisticsRange } from "../lib/useStatisticsRange";
-import { IconPlug } from "./icons";
+import { IconChevron, IconPlug } from "./icons";
 
 interface DeviceStatsPageProps {
   /** 键盘页专用（鼠标/手柄已改用各自 motion 页面，见 pages/Mouse.tsx、pages/Gamepad.tsx） */
@@ -81,9 +82,7 @@ export function DeviceStatsPage({
     if (picked !== null && kindDevices.some((d) => d.id === picked))
       return picked;
     if (liveHint !== null) {
-      const match = kindDevices.find((d) =>
-        sameDevice(toLiveKey(d), liveHint),
-      );
+      const match = kindDevices.find((d) => sameDevice(toLiveKey(d), liveHint));
       if (match) return match.id;
     }
     return kindDevices[0]?.id ?? null;
@@ -152,7 +151,7 @@ export function DeviceStatsPage({
       key: "label",
       header: `${noun}按键`,
       value: (r) => r.label,
-      render: (r) => <span style={{ fontWeight: 600 }}>{r.label}</span>,
+      render: (r) => <strong>{r.label}</strong>,
     },
     {
       key: "code",
@@ -203,119 +202,117 @@ export function DeviceStatsPage({
 
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">{title}</h1>
-          <p className="page-desc">{description}</p>
-        </div>
-        <DateRangePicker value={range} onChange={onChange} />
-      </div>
-
-      {/* 历史型号 tabs 就绪时放分布图前；分布图本身移出 devices 加载门 */}
-      {!devicesLoading && kindDevices.length > 0 ? (
-        <DeviceTabs
-          devices={kindDevices}
-          selectedId={deviceId}
-          onSelect={setPicked}
-          onRenamed={() =>
-            void qc.invalidateQueries({ queryKey: ["devices"] })
-          }
-        />
-      ) : null}
-
-      <LiveDeviceControls
-        kind="keyboard"
-        target={liveTarget}
-        rows={topKeys.data ?? []}
-        historyState={historyState}
-        selectedCode={selection.code}
-        onSelect={(code) =>
-          setSelection((prev) => ({ key: prev.key, code }))
-        }
-        onLiveDeviceResolved={onLiveDeviceResolved}
+      <PageHeader
+        title={title}
+        description={description}
+        actions={<DateRangePicker value={range} onChange={onChange} />}
       />
+      <div className="page">
+        {/* 历史型号 tabs 就绪时放分布图前；分布图本身移出 devices 加载门 */}
+        {!devicesLoading && kindDevices.length > 0 ? (
+          <DeviceTabs
+            devices={kindDevices}
+            selectedId={deviceId}
+            onSelect={setPicked}
+            onRenamed={() =>
+              void qc.invalidateQueries({ queryKey: ["devices"] })
+            }
+          />
+        ) : null}
 
-      {devicesLoading ? (
-        <SkeletonCards count={2} />
-      ) : kindDevices.length === 0 ? (
-        <EmptyState
-          icon={<IconPlug size={36} />}
-          title={`还没有${noun}设备的记录`}
-          description="采集器启动后会自动识别接入的设备并开始计数。若已连接设备，请确认采集器正在运行（设置页可启动）。"
-          action={{ label: "前往设置", onClick: goSettings }}
+        <LiveDeviceControls
+          kind="keyboard"
+          target={liveTarget}
+          rows={topKeys.data ?? []}
+          historyState={historyState}
+          selectedCode={selection.code}
+          onSelect={(code) => setSelection((prev) => ({ key: prev.key, code }))}
+          onLiveDeviceResolved={onLiveDeviceResolved}
         />
-      ) : (
-        <>
-          {topKeysLoading ? null : (
-            <details className="card overview-details">
-              <summary className="card-title">{noun}完整列表</summary>
-              <p className="card-sub">全部按键记录，可排序查看</p>
-              <div style={{ marginTop: "var(--space-3)" }}>
-                <DataTable
-                  columns={topColumns}
-                  rows={topKeys.data ?? []}
-                  rowKey={(r) => `k${r.code}`}
-                  initialSort={{ key: "total", dir: "desc" }}
-                  caption={`${noun}按键累计排行（所选范围）`}
-                  pageSize={50}
-                  resetKey={deviceRangeKey}
-                  empty={
-                    <EmptyState
-                      title="该设备在所选范围内没有按键记录"
-                      description="试试扩大日期范围，或确认采集器已开始统计。"
-                    />
-                  }
-                />
-              </div>
-            </details>
-          )}
-          <div className="card">
-            <div
-              style={{
-                display: "flex",
-                alignItems: "baseline",
-                justifyContent: "space-between",
-                gap: "var(--space-2)",
-                flexWrap: "wrap",
-              }}
-            >
-              <h2 className="card-title">{noun} × 逐日明细</h2>
-              <button
-                type="button"
-                className="btn btn-sm"
-                aria-expanded={dailyOpen}
-                onClick={() => setDailyOpen((open) => !open)}
-              >
-                {dailyOpen ? "收起逐日明细" : "展开逐日明细"}
-              </button>
-            </div>
-            <p className="card-sub">每日按键使用次数</p>
-            {dailyOpen ? (
-              keyDaily.isLoading || !activity.ready ? (
-                <SkeletonCard rows={8} />
-              ) : (
-                <div style={{ marginTop: "var(--space-3)" }}>
+
+        {devicesLoading ? (
+          <SkeletonCards count={2} />
+        ) : kindDevices.length === 0 ? (
+          <EmptyState
+            icon={<IconPlug size={36} />}
+            title={`还没有${noun}设备的记录`}
+            description="采集器启动后会自动识别接入的设备并开始计数。若已连接设备，请确认采集器正在运行（设置页可启动）。"
+            action={{ label: "前往设置", onClick: goSettings }}
+          />
+        ) : (
+          <>
+            {topKeysLoading ? null : (
+              <details className="card fold">
+                <summary className="fold-summary">
+                  <span className="fold-copy">
+                    <span className="card-title">{noun}完整列表</span>
+                    <span className="card-sub">全部按键记录，可排序查看</span>
+                  </span>
+                  <span className="fold-chevron" aria-hidden="true">
+                    <IconChevron size={18} />
+                  </span>
+                </summary>
+                <div className="fold-body">
                   <DataTable
-                    columns={dailyColumns}
-                    rows={keyDaily.data ?? []}
-                    rowKey={(r) => `${r.day}-${r.code}`}
-                    initialSort={{ key: "count", dir: "desc" }}
-                    caption={`${noun}按键逐日明细`}
+                    columns={topColumns}
+                    rows={topKeys.data ?? []}
+                    rowKey={(r) => `k${r.code}`}
+                    initialSort={{ key: "total", dir: "desc" }}
+                    caption={`${noun}按键累计排行（所选范围）`}
                     pageSize={50}
                     resetKey={deviceRangeKey}
                     empty={
                       <EmptyState
-                        title="所选范围内没有逐日数据"
-                        description="扩大日期范围后再试。"
+                        title="该设备在所选范围内没有按键记录"
+                        description="试试扩大日期范围，或确认采集器已开始统计。"
                       />
                     }
                   />
                 </div>
-              )
-            ) : null}
-          </div>
-        </>
-      )}
+              </details>
+            )}
+            <div className="card detail-card">
+              <div className="card-head">
+                <div>
+                  <h2 className="card-title">{noun} × 逐日明细</h2>
+                  <p className="card-sub">每日按键使用次数</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  aria-expanded={dailyOpen}
+                  onClick={() => setDailyOpen((open) => !open)}
+                >
+                  {dailyOpen ? "收起逐日明细" : "展开逐日明细"}
+                </button>
+              </div>
+              {dailyOpen ? (
+                keyDaily.isLoading || !activity.ready ? (
+                  <SkeletonCard rows={8} />
+                ) : (
+                  <div className="card-body">
+                    <DataTable
+                      columns={dailyColumns}
+                      rows={keyDaily.data ?? []}
+                      rowKey={(r) => `${r.day}-${r.code}`}
+                      initialSort={{ key: "count", dir: "desc" }}
+                      caption={`${noun}按键逐日明细`}
+                      pageSize={50}
+                      resetKey={deviceRangeKey}
+                      empty={
+                        <EmptyState
+                          title="所选范围内没有逐日数据"
+                          description="扩大日期范围后再试。"
+                        />
+                      }
+                    />
+                  </div>
+                )
+              ) : null}
+            </div>
+          </>
+        )}
+      </div>
     </>
   );
 }

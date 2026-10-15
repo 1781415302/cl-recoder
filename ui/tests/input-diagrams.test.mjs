@@ -210,8 +210,8 @@ test("theme.css：实时 token 与 live/pulse/扳机热力样式就绪", async (
     new URL("../src/theme.css", import.meta.url),
     "utf8",
   );
-  assert.match(css, /--input-live:\s*#187b66/);
-  assert.match(css, /--input-live-soft:\s*#e8f5ee/);
+  assert.match(css, /--input-live:\s*#0e9a76/);
+  assert.match(css, /--input-live-soft:\s*#dcf5ec/);
   assert.match(css, /\.peripheral-button\.is-live|\.is-live/);
   assert.match(css, /\.is-pulse/);
   assert.match(css, /\.trigger-heat-bar/);
@@ -219,7 +219,7 @@ test("theme.css：实时 token 与 live/pulse/扳机热力样式就绪", async (
   assert.match(css, /prefers-reduced-motion/);
 });
 
-test("画布尺寸保持 mouse 320×360、gamepad 620×340", () => {
+test("画布尺寸保持 mouse 320×360、gamepad 620×380", () => {
   assert.deepEqual(MOTION_CANVAS.mouse, { width: 320, height: 360 });
-  assert.deepEqual(MOTION_CANVAS.gamepad, { width: 620, height: 340 });
+  assert.deepEqual(MOTION_CANVAS.gamepad, { width: 620, height: 380 });
 });

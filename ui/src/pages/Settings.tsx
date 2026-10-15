@@ -9,6 +9,7 @@ import * as client from "../api/client";
 import { uiQueryPolicy } from "../api/queryPolicy";
 import { useAppActivity } from "../lib/AppActivityProvider";
 import { DateRangePicker } from "../components/DateRangePicker";
+import { PageHeader } from "../components/PageHeader";
 import { EmptyState } from "../components/EmptyState";
 import {
   IconCheck,
@@ -122,78 +123,71 @@ function ExportCard() {
   }
 
   return (
-    <div className="card settings-section" id="settings-export">
-      <h2
-        className="card-title"
-        style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}
-      >
-        <IconDownload /> 数据导出
-      </h2>
-      <p className="card-sub">CSV 可用 Excel 打开；JSON 包含完整导出数据</p>
-      <div
-        style={{
-          marginTop: "var(--space-3)",
-          display: "flex",
-          flexDirection: "column",
-          gap: "var(--space-2)",
-        }}
-      >
+    <section className="card settings-section" id="settings-export">
+      <div className="card-head">
+        <div>
+          <h2 className="card-title with-icon">
+            <IconDownload /> 数据导出
+          </h2>
+          <p className="card-sub">CSV 可用 Excel 打开；JSON 包含完整导出数据</p>
+        </div>
+      </div>
+      <div className="settings-rows">
         <Row label="格式">
-          {(["csv", "json"] as const).map((f) => (
-            <button
-              key={f}
-              type="button"
-              className={`btn btn-sm${format === f ? " btn-primary" : ""}`}
-              aria-pressed={format === f}
-              onClick={() => setFormat(f)}
-            >
-              {f.toUpperCase()}
-            </button>
-          ))}
+          <div className="seg" role="group" aria-label="导出格式">
+            {(["csv", "json"] as const).map((f) => (
+              <button
+                key={f}
+                type="button"
+                className="seg-btn"
+                aria-pressed={format === f}
+                onClick={() => setFormat(f)}
+              >
+                {f.toUpperCase()}
+              </button>
+            ))}
+          </div>
         </Row>
         <Row label="范围数据源" hint="本软件统计或导入的历史记录">
-          {(["own", "wp"] as const).map((s) => (
-            <button
-              key={s}
-              type="button"
-              className={`btn btn-sm${scope === s ? " btn-primary" : ""}`}
-              aria-pressed={scope === s}
-              onClick={() => setScope(s)}
-            >
-              {s === "own" ? "本软件" : "WhatPulse"}
-            </button>
-          ))}
+          <div className="seg" role="group" aria-label="数据源">
+            {(["own", "wp"] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                className="seg-btn"
+                aria-pressed={scope === s}
+                onClick={() => setScope(s)}
+              >
+                {s === "own" ? "本软件" : "WhatPulse"}
+              </button>
+            ))}
+          </div>
         </Row>
         <Row label="日期范围">
           <DateRangePicker value={range} onChange={setRange} />
         </Row>
-        <div>
-          <button
-            type="button"
-            className="btn btn-primary"
-            disabled={busy}
-            onClick={() => void doExport()}
-          >
-            {busy ? "导出中…" : "选择位置并导出"}
-          </button>
-          {error ? (
-            <span
-              style={{
-                color: "var(--color-danger)",
-                marginLeft: "var(--space-2)",
-              }}
-            >
-              {error}
-            </span>
-          ) : null}
-        </div>
-        {result ? (
-          <p className="chart-readout" role="status">
-            已导出 {fmtNum(result.rows)} 行 → {result.files.join("、")}
-          </p>
+      </div>
+      <div className="card-foot-actions">
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={busy}
+          onClick={() => void doExport()}
+        >
+          {busy ? "导出中…" : "选择位置并导出"}
+        </button>
+        {error ? (
+          <span className="field-error" role="alert">
+            {error}
+          </span>
         ) : null}
       </div>
-    </div>
+      {result ? (
+        <p className="readout" role="status">
+          已导出 {fmtNum(result.rows)} 行 → {result.files.join("、")}
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -215,15 +209,16 @@ function DiagnosticsCard({
   const info = diagnostics.data;
 
   return (
-    <div className="card settings-section" id="settings-diagnostics">
-      <h2
-        className="card-title"
-        style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}
-      >
-        <IconWarn /> 诊断日志
-      </h2>
-      <p className="card-sub">遇到问题时，可打开日志查看详情</p>
-      <div style={{ marginTop: "var(--space-2)" }}>
+    <section className="card settings-section" id="settings-diagnostics">
+      <div className="card-head">
+        <div>
+          <h2 className="card-title with-icon">
+            <IconWarn /> 诊断日志
+          </h2>
+          <p className="card-sub">遇到问题时，可打开日志查看详情</p>
+        </div>
+      </div>
+      <div className="settings-rows">
         <Row
           label="日志目录"
           hint={
@@ -234,12 +229,7 @@ function DiagnosticsCard({
               : undefined
           }
         >
-          <span
-            style={{
-              fontFamily: "var(--font-mono)",
-              fontSize: "var(--text-caption)",
-            }}
-          >
+          <span className="mono path-text">
             {info
               ? (info.logDirectory ?? "未知")
               : diagnostics.isError
@@ -260,25 +250,17 @@ function DiagnosticsCard({
             打开日志目录
           </button>
         </Row>
-        {info?.lastError ? (
-          <p
-            style={{
-              color: "var(--color-danger)",
-              fontSize: "var(--text-caption)",
-              margin: "var(--space-1) 0 0",
-            }}
-          >
-            最近日志错误：{info.lastError}
-          </p>
-        ) : null}
-        {info ? (
-          <p className="chart-hint">
-            两角色日志文件合计上限约{" "}
-            {fmtNum(Math.round(info.maxTotalBytes / 1024 / 1024))} MB
-          </p>
-        ) : null}
       </div>
-    </div>
+      {info?.lastError ? (
+        <p className="field-error">最近日志错误：{info.lastError}</p>
+      ) : null}
+      {info ? (
+        <p className="hint">
+          两角色日志文件合计上限约{" "}
+          {fmtNum(Math.round(info.maxTotalBytes / 1024 / 1024))} MB
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -378,50 +360,53 @@ export function Settings() {
               : policy!.compliant === false
                 ? "与推荐策略不一致，可修复"
                 : "已读取任务定义，合规状态未知";
-  const policySummaryColor =
+  const policyTone =
     policyState === "present" && policy!.compliant === true
-      ? "var(--color-positive)"
+      ? "ok"
       : policyState === "present" && policy!.compliant === false
-        ? "var(--color-danger)"
-        : "var(--color-text-muted)";
+        ? "bad"
+        : "muted";
 
   function repairPolicy() {
     // §5.2：一次 UAC、RepairOnly、只改三项并回读；结果刷新 taskPolicy 与 task 缓存，
     // 不进入启动流程。成功仅表示定义校验通过，当前实例不重启。
     after(client.collectorAutostartRepair(), REPAIR_OK, {
       pending: PENDING_REPAIR,
-      invalidate: [["collectorTaskPolicy"], ["collectorStatus"], ["legacyInstallHints"]],
+      invalidate: [
+        ["collectorTaskPolicy"],
+        ["collectorStatus"],
+        ["legacyInstallHints"],
+      ],
     });
   }
 
   const wpPath = wpPathDraft ?? s?.wpDbPath ?? "";
 
+  const collectorHead = (
+    <h2 className="card-title with-icon">
+      <IconPlug /> 采集器
+    </h2>
+  );
+
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1 className="page-title">设置</h1>
-          <p className="page-desc">管理采集、启动方式与本地数据</p>
-        </div>
-      </div>
-
-      <div className="settings-layout">
-        <nav className="settings-index" aria-label="设置分区">
-          {[
-            ["settings-collector", "采集器"],
-            ["settings-autostart", "启动与运行"],
-            ["settings-source", "历史数据源"],
-            ["settings-diagnostics", "诊断日志"],
-            ["settings-export", "数据导出"],
-            ["settings-about", "关于"],
-          ].map(([id, label]) => (
-            <button
-              type="button"
-              key={id}
-              onClick={() =>
-                document
-                  .getElementById(id)
-                  ?.scrollIntoView({
+      <PageHeader title="设置" description="管理采集、启动方式与本地数据" />
+      <div className="page">
+        <div className="settings-layout">
+          <nav className="settings-index" aria-label="设置分区">
+            {[
+              ["settings-collector", "采集器"],
+              ["settings-autostart", "启动与运行"],
+              ["settings-source", "历史数据源"],
+              ["settings-diagnostics", "诊断日志"],
+              ["settings-export", "数据导出"],
+              ["settings-about", "关于"],
+            ].map(([id, label]) => (
+              <button
+                type="button"
+                key={id}
+                onClick={() =>
+                  document.getElementById(id)?.scrollIntoView({
                     behavior: window.matchMedia(
                       "(prefers-reduced-motion: reduce)",
                     ).matches
@@ -429,142 +414,110 @@ export function Settings() {
                       : "smooth",
                     block: "start",
                   })
-              }
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-        <div className="settings-content">
-          {notice ? (
-            <p className="chart-readout" role="status">
-              {notice}
-            </p>
-          ) : null}
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+          <div className="settings-content">
+            {notice ? (
+              <p className="readout notice" role="status">
+                {notice}
+              </p>
+            ) : null}
 
-          <section id="settings-collector" className="settings-section">
-            {status.isError && !st ? (
-              // 检测失败：重试入口直接 refetch，不依赖查询是否被 gating 禁用（§5.2）
-              <EmptyState
-                icon={<IconRefresh size={36} />}
-                title="采集器状态检测失败"
-                description={`检测采集器健康状态时出错：${String(status.error)}。可重新检测；下方的日志入口不受影响。`}
-                action={{
-                  label: "重新检测",
-                  onClick: () => void status.refetch(),
-                }}
-              />
-            ) : !st ? (
-              <EmptyState title="正在读取采集器状态…" description="请稍候。" />
-            ) : health === "running" || health === "paused" ? (
-              <div className="card">
-                <h2
-                  className="card-title"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "var(--space-2)",
+            <section id="settings-collector" className="settings-section">
+              {status.isError && !st ? (
+                // 检测失败：重试入口直接 refetch，不依赖查询是否被 gating 禁用（§5.2）
+                <EmptyState
+                  icon={<IconRefresh size={36} />}
+                  title="采集器状态检测失败"
+                  description={`检测采集器健康状态时出错：${String(status.error)}。可重新检测；下方的日志入口不受影响。`}
+                  action={{
+                    label: "重新检测",
+                    onClick: () => void status.refetch(),
                   }}
-                >
-                  <IconPlug /> 采集器
-                </h2>
-                <p className="card-sub">
-                  {health === "paused" ? "已暂停（不记录输入）" : "运行中"} ·
-                  启动于 {st.startedAt?.replace("T", " ").slice(0, 19)} ·
-                  最近事件{" "}
-                  {st.lastEventAt
-                    ? st.lastEventAt.replace("T", " ").slice(0, 19)
-                    : "无"}{" "}
-                  · 自启任务
-                  {st.taskEvidence === "present"
-                    ? "已配置"
-                    : st.taskEvidence === "absent"
-                      ? "未配置"
-                      : "状态未知"}
-                </p>
-                <div
-                  style={{
-                    marginTop: "var(--space-3)",
-                    display: "flex",
-                    gap: "var(--space-2)",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <button
-                    type="button"
-                    className={st.paused ? "btn btn-primary" : "btn"}
-                    disabled={busy || status.isFetching}
-                    onClick={() =>
-                      after(
-                        client.setCollectorPaused(!st.paused),
-                        st.paused ? "已恢复统计" : "已暂停统计",
-                      )
-                    }
-                  >
-                    {st.paused ? (
-                      <>
-                        <IconPlay size={16} /> 恢复统计
-                      </>
-                    ) : (
-                      <>
-                        <IconPause size={16} /> 暂停统计
-                      </>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={() =>
-                      after(client.collectorStartNow(), "采集器已就绪", {
-                        pending: PENDING_START,
-                      })
-                    }
-                  >
-                    {busy ? "启动中…" : "检查并启动"}
-                  </button>
+                />
+              ) : !st ? (
+                <EmptyState
+                  title="正在读取采集器状态…"
+                  description="请稍候。"
+                />
+              ) : health === "running" || health === "paused" ? (
+                <div className="card">
+                  <div className="card-head">
+                    <div>
+                      {collectorHead}
+                      <p className="card-sub">
+                        启动于 {st.startedAt?.replace("T", " ").slice(0, 19)} ·
+                        最近事件{" "}
+                        {st.lastEventAt
+                          ? st.lastEventAt.replace("T", " ").slice(0, 19)
+                          : "无"}{" "}
+                        · 自启任务
+                        {st.taskEvidence === "present"
+                          ? "已配置"
+                          : st.taskEvidence === "absent"
+                            ? "未配置"
+                            : "状态未知"}
+                      </p>
+                    </div>
+                    <span
+                      className={`chip ${health === "paused" ? "chip--warn" : "chip--ok"}`}
+                    >
+                      {health === "paused" ? "已暂停（不记录输入）" : "运行中"}
+                    </span>
+                  </div>
+                  <div className="btn-row">
+                    <button
+                      type="button"
+                      className={st.paused ? "btn btn-primary" : "btn"}
+                      disabled={busy || status.isFetching}
+                      onClick={() =>
+                        after(
+                          client.setCollectorPaused(!st.paused),
+                          st.paused ? "已恢复统计" : "已暂停统计",
+                        )
+                      }
+                    >
+                      {st.paused ? (
+                        <>
+                          <IconPlay size={16} /> 恢复统计
+                        </>
+                      ) : (
+                        <>
+                          <IconPause size={16} /> 暂停统计
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        after(client.collectorStartNow(), "采集器已就绪", {
+                          pending: PENDING_START,
+                        })
+                      }
+                    >
+                      {busy ? "启动中…" : "检查并启动"}
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ) : health === "not_running" ? (
-              <EmptyState
-                icon={<IconPlug size={36} />}
-                title="采集器未运行"
-                description={
-                  st.taskEvidence === "present"
-                    ? "自启任务已配置，但采集器当前未运行。点「立即启动」拉起（请等待完成，勿连点）。"
-                    : st.taskEvidence === "unknown"
-                      ? "暂时无法确认自启任务是否已配置（证据不足，不臆断）。可点「立即启动」直接拉起采集器，或在下方「自启管理」查看任务与策略。"
-                      : "统计需要提权采集进程（计划任务 ClRecoderCollector，开机自启）。先启用自启任务，会自动启动采集器。"
-                }
-                action={
-                  st.taskEvidence === "absent"
-                    ? {
-                        label: busy
-                          ? "处理中…"
-                          : "启用采集器自启（需一次 UAC）",
-                        onClick: () => {
-                          if (!busy)
-                            after(
-                              client.collectorAutostartEnable(),
-                              "已启用自启并启动采集器",
-                              { pending: PENDING_ENABLE },
-                            );
-                        },
-                      }
-                    : {
-                        label: busy ? "启动中…" : "立即启动采集器",
-                        onClick: () => {
-                          if (!busy)
-                            after(client.collectorStartNow(), "采集器已就绪", {
-                              pending: PENDING_START,
-                            });
-                        },
-                      }
-                }
-                secondary={
-                  st.taskEvidence === "present"
-                    ? undefined
-                    : st.taskEvidence === "unknown"
+              ) : health === "not_running" ? (
+                <EmptyState
+                  icon={<IconPlug size={36} />}
+                  title="采集器未运行"
+                  description={
+                    st.taskEvidence === "present"
+                      ? "自启任务已配置，但采集器当前未运行。点「立即启动」拉起（请等待完成，勿连点）。"
+                      : st.taskEvidence === "unknown"
+                        ? "暂时无法确认自启任务是否已配置（证据不足，不臆断）。可点「立即启动」直接拉起采集器，或在下方「自启管理」查看任务与策略。"
+                        : "统计需要提权采集进程（计划任务 ClRecoderCollector，开机自启）。先启用自启任务，会自动启动采集器。"
+                  }
+                  action={
+                    st.taskEvidence === "absent"
                       ? {
                           label: busy
                             ? "处理中…"
@@ -579,7 +532,7 @@ export function Settings() {
                           },
                         }
                       : {
-                          label: "仅立即启动（不装自启）",
+                          label: busy ? "启动中…" : "立即启动采集器",
                           onClick: () => {
                             if (!busy)
                               after(
@@ -589,82 +542,105 @@ export function Settings() {
                               );
                           },
                         }
-                }
-              />
-            ) : (
-              // unreachable / access_denied / unknown：诊断卡片 + 重试与日志入口（不杀进程、不臆断未运行）
-              <div className="card">
-                <h2
-                  className="card-title"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "var(--space-2)",
-                  }}
-                >
-                  <IconPlug /> 采集器
-                </h2>
-                <p className="card-sub">
-                  {DIAG_COPY[health].title} · {DIAG_COPY[health].desc}
-                </p>
-                {st.diagnosticMessage ? (
-                  <p
-                    style={{
-                      color: "var(--color-danger)",
-                      fontSize: "var(--text-caption)",
-                      margin: "var(--space-1) 0 0",
-                    }}
-                  >
-                    诊断信息：{st.diagnosticMessage}
-                    {st.diagnosticCode ? `（诊断码 ${st.diagnosticCode}）` : ""}
-                  </p>
-                ) : null}
-                <div
-                  style={{
-                    marginTop: "var(--space-3)",
-                    display: "flex",
-                    gap: "var(--space-2)",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={busy}
-                    onClick={() =>
-                      after(client.collectorStartNow(), "采集器已就绪", {
-                        pending: PENDING_START,
-                      })
-                    }
-                  >
-                    {busy ? "启动中…" : "检查并启动"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy}
-                    onClick={() =>
-                      void client.openDiagnosticsDirectory().then(
-                        () => setNotice("已打开日志目录"),
-                        (e: unknown) => setNotice(`操作失败：${String(e)}`),
-                      )
-                    }
-                  >
-                    打开日志目录
-                  </button>
+                  }
+                  secondary={
+                    st.taskEvidence === "present"
+                      ? undefined
+                      : st.taskEvidence === "unknown"
+                        ? {
+                            label: busy
+                              ? "处理中…"
+                              : "启用采集器自启（需一次 UAC）",
+                            onClick: () => {
+                              if (!busy)
+                                after(
+                                  client.collectorAutostartEnable(),
+                                  "已启用自启并启动采集器",
+                                  { pending: PENDING_ENABLE },
+                                );
+                            },
+                          }
+                        : {
+                            label: "仅立即启动（不装自启）",
+                            onClick: () => {
+                              if (!busy)
+                                after(
+                                  client.collectorStartNow(),
+                                  "采集器已就绪",
+                                  { pending: PENDING_START },
+                                );
+                            },
+                          }
+                  }
+                />
+              ) : (
+                // unreachable / access_denied / unknown：诊断卡片 + 重试与日志入口（不杀进程、不臆断未运行）
+                <div className="card">
+                  <div className="card-head">
+                    <div>
+                      {collectorHead}
+                      <p className="card-sub">
+                        {DIAG_COPY[health].title} · {DIAG_COPY[health].desc}
+                      </p>
+                    </div>
+                    <span className="chip chip--warn">需要诊断</span>
+                  </div>
+                  {st.diagnosticMessage ? (
+                    <p className="field-error">
+                      诊断信息：{st.diagnosticMessage}
+                      {st.diagnosticCode
+                        ? `（诊断码 ${st.diagnosticCode}）`
+                        : ""}
+                    </p>
+                  ) : null}
+                  <div className="btn-row">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={busy}
+                      onClick={() =>
+                        after(client.collectorStartNow(), "采集器已就绪", {
+                          pending: PENDING_START,
+                        })
+                      }
+                    >
+                      {busy ? "启动中…" : "检查并启动"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={busy}
+                      onClick={() =>
+                        void client.openDiagnosticsDirectory().then(
+                          () => setNotice("已打开日志目录"),
+                          (e: unknown) => setNotice(`操作失败：${String(e)}`),
+                        )
+                      }
+                    >
+                      打开日志目录
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section className="card settings-section" id="settings-autostart">
+              <div className="card-head">
+                <div>
+                  <h2 className="card-title">启动与运行</h2>
+                  <p className="card-sub">自启任务、运行策略与界面启动方式</p>
                 </div>
               </div>
-            )}
-          </section>
-          <div className="settings-grid">
-            <div className="card settings-section" id="settings-autostart">
-              <h2 className="card-title">启动与运行</h2>
               {(legacyHints.data ?? []).map((h) => (
-                <div key={h.code} className="app-banner app-banner--warning" role="status">
+                <div
+                  key={h.code}
+                  className="app-banner app-banner--warning"
+                  role="status"
+                >
                   {h.message}
                 </div>
               ))}
-              <div style={{ marginTop: "var(--space-2)" }}>
+              <div className="settings-rows">
                 <Row
                   label="采集器自启（计划任务）"
                   hint={
@@ -718,12 +694,7 @@ export function Settings() {
                   label="任务策略（只读）"
                   hint="保持持续采集；修复对后续启动生效"
                 >
-                  <span
-                    style={{
-                      fontSize: "var(--text-caption)",
-                      color: policySummaryColor,
-                    }}
-                  >
+                  <span className="policy-state" data-tone={policyTone}>
                     {policySummary}
                   </span>
                   {showRepair ? (
@@ -738,7 +709,7 @@ export function Settings() {
                   ) : null}
                 </Row>
                 <Row label="执行时限" hint="建议不限制运行时长">
-                  <span>
+                  <span className="value-text">
                     {policyReady
                       ? fmtExecutionTimeLimit(policy!.executionTimeLimit)
                       : "—"}
@@ -748,7 +719,7 @@ export function Settings() {
                   label="电池供电时禁止启动"
                   hint="建议关闭，电池供电时照常采集"
                 >
-                  <span>
+                  <span className="value-text">
                     {policyReady
                       ? fmtPolicyBool(policy!.disallowStartIfOnBatteries)
                       : "—"}
@@ -758,63 +729,49 @@ export function Settings() {
                   label="切换到电池时停止"
                   hint="建议关闭，切换供电时继续采集"
                 >
-                  <span>
+                  <span className="value-text">
                     {policyReady
                       ? fmtPolicyBool(policy!.stopIfGoingOnBatteries)
                       : "—"}
                   </span>
                 </Row>
                 <Row label="界面开机自启" hint="登录 Windows 后打开界面">
-                  <button
-                    type="button"
-                    className={`btn btn-sm${s?.guiAutostart ? " btn-primary" : ""}`}
-                    aria-pressed={s?.guiAutostart ?? false}
-                    disabled={!s}
-                    onClick={() =>
-                      after(
-                        client.setSettings({ guiAutostart: !s?.guiAutostart }),
-                        "已保存 GUI 自启设置",
-                      )
-                    }
-                  >
-                    {s?.guiAutostart ? (
-                      <>
-                        <IconCheck size={14} /> 已开启
-                      </>
-                    ) : (
-                      "已关闭"
-                    )}
-                  </button>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      checked={s?.guiAutostart ?? false}
+                      disabled={!s}
+                      onChange={() =>
+                        after(
+                          client.setSettings({
+                            guiAutostart: !s?.guiAutostart,
+                          }),
+                          "已保存 GUI 自启设置",
+                        )
+                      }
+                    />
+                    <span className="switch-track" aria-hidden="true" />
+                    <span className="switch-label">
+                      {s?.guiAutostart ? "已开启" : "已关闭"}
+                    </span>
+                  </label>
                 </Row>
               </div>
-            </div>
+            </section>
 
-            <div className="card settings-section" id="settings-source">
-              <h2
-                className="card-title"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "var(--space-2)",
-                }}
-              >
-                <IconDatabase /> WhatPulse 数据源
-              </h2>
-              <p className="card-sub">导入历史快照，不修改原始数据库</p>
-              <div
-                style={{
-                  marginTop: "var(--space-2)",
-                  display: "flex",
-                  gap: "var(--space-2)",
-                }}
-              >
+            <section className="card settings-section" id="settings-source">
+              <div className="card-head">
+                <div>
+                  <h2 className="card-title with-icon">
+                    <IconDatabase /> WhatPulse 数据源
+                  </h2>
+                  <p className="card-sub">导入历史快照，不修改原始数据库</p>
+                </div>
+              </div>
+              <div className="path-edit">
                 <input
-                  className="input"
-                  style={{
-                    flex: 1,
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "var(--text-caption)",
-                  }}
+                  className="input mono"
                   value={wpPath}
                   onChange={(e) => setWpPathDraft(e.target.value)}
                   aria-label="WhatPulse 数据库路径"
@@ -834,19 +791,23 @@ export function Settings() {
                   保存
                 </button>
               </div>
-            </div>
-          </div>
+            </section>
 
-          <DiagnosticsCard busy={busy} onNotice={setNotice} />
+            <DiagnosticsCard busy={busy} onNotice={setNotice} />
 
-          <ExportCard />
+            <ExportCard />
 
-          <div className="card settings-section" id="settings-about">
-            <h2 className="card-title">关于</h2>
-            <p className="card-sub">
-              统计永久保存在本机：%LOCALAPPDATA%\ClRecoder\stats.db。删除该文件会清空统计。
-              锁屏与 UAC 安全桌面期间的输入属于系统级隔离，不会统计。
-            </p>
+            <section className="card settings-section" id="settings-about">
+              <div className="card-head">
+                <div>
+                  <h2 className="card-title">关于</h2>
+                </div>
+              </div>
+              <p className="about-text">
+                统计永久保存在本机：%LOCALAPPDATA%\ClRecoder\stats.db。删除该文件会清空统计。
+                锁屏与 UAC 安全桌面期间的输入属于系统级隔离，不会统计。
+              </p>
+            </section>
           </div>
         </div>
       </div>

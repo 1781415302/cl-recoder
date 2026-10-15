@@ -232,11 +232,11 @@ export function DataTable<T>(props: DataTableProps<T>) {
       </div>
       {paginated ? (
         <nav className="pager" aria-label="表格分页">
-          <span className="chart-hint">
+          <span className="hint">
             第 {page} / {pageCount} 页 · 每页 {pageSizeNum} 行 · 共{" "}
             {sorted.length} 行
           </span>
-          <div style={{ display: "flex", gap: "var(--space-2)" }}>
+          <div className="row">
             <button
               type="button"
               className="btn btn-sm"
@@ -256,7 +256,7 @@ export function DataTable<T>(props: DataTableProps<T>) {
           </div>
         </nav>
       ) : renderLimit !== undefined && sorted.length > shown.length ? (
-        <p className="chart-hint">
+        <p className="hint">
           仅显示前 {shown.length} 行，共 {sorted.length}{" "}
           行（点击表头可排序查看）
         </p>

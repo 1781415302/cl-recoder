@@ -1,4 +1,4 @@
-// 鼠标来源选择（motion-dpi §4.6 S7）：型号名＋来源序号的物理来源项 + 「按型号汇总」的型号历史项。
+// 鼠标来源选择：型号名＋来源序号的物理来源项 + 「按型号汇总」的型号历史项。
 //
 // 边界：纯选择列表，不查询 API、不改选择状态（选择属页面，轮询不跳源）；不暴露来源路径/键；
 // 来源序号 = 同型号内按来源 id 升序的稳定次序（同型号两只鼠标显示为 来源 1/来源 2）；
@@ -25,8 +25,7 @@ function sourceFallbackName(s: MouseSourceRow): string {
 
 function dpiChipText(s: MouseSourceRow): string {
   if (s.dpiOrigin === "auto" && s.autoDpi !== null) return `自动 ${s.autoDpi}`;
-  if (s.dpiOrigin === "manual" && s.manualDpi !== null)
-    return `手动 ${s.manualDpi}`;
+  if (s.dpiOrigin === "manual" && s.manualDpi !== null) return `手动 ${s.manualDpi}`;
   return "未配置";
 }
 
@@ -58,29 +57,22 @@ export function MouseSourcePicker({
   const empty = groups.length === 0 && models.length === 0;
 
   return (
-    <div className="source-toolbar">
-      <label className="field-label" htmlFor={selectId}>
-        <IconMouse size={18} />
+    <div className="picker">
+      <label className="picker-label" htmlFor={selectId}>
+        <IconMouse size={16} />
         鼠标来源
       </label>
       {empty ? (
-        <p className="chart-hint" style={{ marginTop: "var(--space-3)" }}>
-          暂无鼠标来源与型号记录。
-        </p>
+        <p className="hint">暂无鼠标来源与型号记录。</p>
       ) : (
         <select
           id={selectId}
           className="input"
-          style={{ minHeight: 40 }}
           value={selection ? `${selection.kind}:${selection.id}` : ""}
           onChange={(e) => {
             const [kind, rawId] = e.currentTarget.value.split(":");
             const id = Number(rawId);
-            if (
-              (kind === "source" || kind === "model") &&
-              Number.isSafeInteger(id) &&
-              id > 0
-            )
+            if ((kind === "source" || kind === "model") && Number.isSafeInteger(id) && id > 0)
               onSelect({ kind, id });
           }}
         >
@@ -91,8 +83,7 @@ export function MouseSourcePicker({
             <optgroup key={g.deviceId} label={g.label}>
               {g.list.map((s, i) => (
                 <option key={s.id} value={`source:${s.id}`}>
-                  {g.label} · 来源 {i + 1} · {s.connected ? "已连接" : "离线"} ·{" "}
-                  {dpiChipText(s)}
+                  {g.label} · 来源 {i + 1} · {s.connected ? "已连接" : "离线"} · {dpiChipText(s)}
                 </option>
               ))}
             </optgroup>
