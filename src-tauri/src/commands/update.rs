@@ -531,7 +531,7 @@ fn update_install_start(app: tauri::AppHandle, version: String) -> Result<(), St
         .name("clrecoder-update".into())
         .spawn(move || {
             let rt = app2.state::<UpdateRuntime>();
-            run_install_pipeline(app2.clone(), &*rt, version);
+            run_install_pipeline(app2.clone(), &rt, version);
         })
         .map_err(|e| {
             app.state::<UpdateRuntime>()
@@ -749,8 +749,7 @@ fn run_install_pipeline(app: tauri::AppHandle, rt: &UpdateRuntime, want_version:
 /// 只读状态（PLAN §4.5 `update_status`）。
 #[tauri::command]
 pub async fn update_status(rt: tauri::State<'_, UpdateRuntime>) -> Result<UpdateStatus, String> {
-    let snap = rt.snapshot();
-    Ok(snap)
+    Ok(rt.snapshot())
 }
 
 #[cfg(test)]
