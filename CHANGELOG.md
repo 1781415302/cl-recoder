@@ -28,6 +28,12 @@
 - 升级前正常退出 GUI 与 collector，备份 `stats.db` 及未合并 WAL、`settings.json` 与旧程序后再替换。若已迁移 schema 4，回退旧 collector 必须恢复升级前数据库备份，不能仅换回旧 exe。
 - 新版 GUI 读 v3 库仍可看旧数据，扳机热力提示需更新采集器；导出格式版本适配 v4，旧字段语义不变。
 
+### 收尾
+
+- 鼠标左右键命中区与绘制轮廓一致（含焦点环），并清理相关失效 CSS。
+- 删除未使用的 `TopBarChart` 组件；取消对 `output/playwright/*.png` 截图的 Git 追踪并移除仓库内副本。
+- 新增 GitHub Actions CI（`frontend` / `rust` / `scripts` 三个 job）。
+
 ### 兼容保留
 
 - 控制协议、脚本、按钮编码、暂停/恢复、窗口活动、DPI、鼠标距离、摇杆 R 行程与热力、日期查询、WhatPulse、明细与导出均保持原口径。
