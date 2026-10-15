@@ -846,32 +846,46 @@ mod tests {
         }
     }
 
-    /// 有界探针端到端（注入假 CIM 输出命令）：快速 JSON → 对应证据。
+    /// 本机轻量子进程输出固定 JSON，验证 runner 与证据解析。
+    /// PowerShell 脚本内容由模板测试覆盖，子进程合同测试不计入其冷启动耗时。
     #[test]
     fn usability_v3_process_probe_end_to_end_with_fake_cim_output() {
-        let echo = |json: &str| format!("Write-Output '{}'", json.replace('\'', "''"));
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let fixture = |json: &str| {
+            // json 仅来自下方固定 ASCII 夹具，原样交给 cmd 的 echo 保留 JSON 双引号。
+            Command::new("cmd.exe")
+                .args(["/D", "/C"])
+                .raw_arg(format!("echo {json}"))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("无法启动固定 JSON 探针子进程")
+        };
         let present = run_bounded_probe_with(
             || {
-                spawn_powershell_probe(&echo(
+                Ok(fixture(
                     r#"{"queried":true,"ownCount":1,"foreignCount":0,"unknownCount":0}"#,
                 ))
             },
             Duration::from_secs(10),
         )
-        .unwrap();
+        .expect("固定 JSON 探针未完成：runner 超时或无法等待子进程");
         assert_eq!(
             parse_process_probe_output(&present).map(evidence_from_counts),
             Some(Evidence::Present)
         );
         let absent = run_bounded_probe_with(
             || {
-                spawn_powershell_probe(&echo(
+                Ok(fixture(
                     r#"{"queried":true,"ownCount":0,"foreignCount":0,"unknownCount":0}"#,
                 ))
             },
             Duration::from_secs(10),
         )
-        .unwrap();
+        .expect("固定 JSON 探针未完成：runner 超时或无法等待子进程");
         assert_eq!(
             parse_process_probe_output(&absent).map(evidence_from_counts),
             Some(Evidence::Absent)
