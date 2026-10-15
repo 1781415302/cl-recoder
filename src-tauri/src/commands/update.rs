@@ -18,7 +18,7 @@ use clrecoder_update::{
     build_api_curl_args, build_download_curl_args, build_update_check, map_curl_exit, parse_latest_release,
     parse_marker, parse_version, serialize_marker, verify_installer, PendingMarker,
     UpdateApplied, UpdateCheck, UpdateErrorCode, UpdatePhase, UpdateStatus, VerifyError,
-    LATEST_API_URL,
+    LATEST_API_URL, MAX_API_BYTES,
 };
 
 use super::collector_ctl::{
@@ -261,14 +261,42 @@ fn download_with_progress(
 }
 
 fn fetch_latest_json() -> Result<String, (UpdateErrorCode, String)> {
-    let out = updates_dir().join("latest.json");
-    if let Some(parent) = out.parent() {
-        let _ = fs::create_dir_all(parent);
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let curl = curl_exe_path();
+    if !curl.is_file() {
+        return Err((
+            UpdateErrorCode::CurlMissing,
+            "未找到系统 curl.exe，请前往发布页手动下载安装包。".into(),
+        ));
     }
-    let args = build_api_curl_args(LATEST_API_URL, &out.to_string_lossy(), current_version_str())
+    let args = build_api_curl_args(LATEST_API_URL, current_version_str())
         .map_err(|m| (UpdateErrorCode::Network, m.to_string()))?;
-    run_curl(&args)?;
-    fs::read_to_string(&out).map_err(|e| (UpdateErrorCode::Disk, format!("读取 Release JSON 失败: {e}")))
+    let output = std::process::Command::new(&curl)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| (UpdateErrorCode::Network, format!("启动 curl 失败: {e}")))?;
+    let code = output.status.code().unwrap_or(-1);
+    if let Some(mapped) = map_curl_exit(code) {
+        return Err((mapped.code, mapped.message));
+    }
+    if output.stdout.len() as u64 > MAX_API_BYTES {
+        return Err((
+            UpdateErrorCode::Network,
+            "Release JSON 超过大小上限。".into(),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| {
+        (
+            UpdateErrorCode::Network,
+            format!("Release JSON 不是合法 UTF-8: {e}"),
+        )
+    })
 }
 
 fn open_installer_locked(path: &Path) -> Result<File, String> {
@@ -485,7 +513,6 @@ pub(crate) fn process_startup_marker(rt: &UpdateRuntime) {
 #[tauri::command]
 pub async fn update_check() -> Result<UpdateCheck, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let _ = fs::create_dir_all(updates_dir());
         let json = fetch_latest_json().map_err(|(_, m)| m)?;
         let release = parse_latest_release(&json).map_err(|e| e.to_string())?;
         let current = parse_version(current_version_str())

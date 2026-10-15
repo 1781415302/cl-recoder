@@ -44,10 +44,10 @@ fn user_agent(app_version: &str) -> String {
 
 /// 构造拉取 latest Release JSON 的 curl 参数（不含 `curl.exe` 本身）。
 ///
-/// `url` 必须通过 [`is_allowed_api_url`]；`output_path` 为 `-o` 目标。
+/// `url` 必须通过 [`is_allowed_api_url`]。JSON 写到 **stdout**（不带 `-o`），
+/// 由胶水层捕获，避免落在用户可写目录。
 pub fn build_api_curl_args(
     url: &str,
-    output_path: &str,
     app_version: &str,
 ) -> Result<Vec<String>, &'static str> {
     if !is_allowed_api_url(url) {
@@ -63,8 +63,6 @@ pub fn build_api_curl_args(
         user_agent(app_version),
         "-H".into(),
         "Accept: application/vnd.github+json".into(),
-        "-o".into(),
-        output_path.into(),
         url.into(),
     ]);
     Ok(args)
@@ -139,7 +137,7 @@ mod tests {
 
     #[test]
     fn api_args_contain_required_flags_no_shell_meta() {
-        let args = build_api_curl_args(LATEST_API_URL, r"C:\tmp\latest.json", "0.4.0").unwrap();
+        let args = build_api_curl_args(LATEST_API_URL, "0.4.0").unwrap();
         assert!(args.contains(&"--silent".into()));
         assert!(args.contains(&"--show-error".into()));
         assert!(args.contains(&"--fail".into()));
@@ -157,6 +155,7 @@ mod tests {
         assert!(args.contains(&"CL-Recoder/0.4.0".into()));
         assert!(args.contains(&"-H".into()));
         assert!(args.contains(&"Accept: application/vnd.github+json".into()));
+        assert!(!args.iter().any(|s| s == "-o"), "API curl must not write to a file: {args:?}");
         assert_eq!(args.last().map(String::as_str), Some(LATEST_API_URL));
 
         // 无 shell 元字符拼接：每个元素不应含未转义的 `|`、`;`、`$()` 等拼接点
@@ -185,7 +184,6 @@ mod tests {
 
         assert!(build_api_curl_args(
             "https://evil.example/latest",
-            "o",
             "0.4.0"
         )
         .is_err());
