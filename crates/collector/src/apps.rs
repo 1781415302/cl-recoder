@@ -97,7 +97,7 @@ pub fn spawn(tx: Sender<AggEvent>, fg: Arc<Mutex<FgState>>) -> JoinHandle<()> {
 
 /// 注册钩子并发送初始快照，然后驱动消息循环（仅 apps 线程调用一次）。
 fn run_message_loop() {
-    // SAFETY：仅在 apps 线程调用一次；钩子回调与本消息循环同线程（WINEVENT_OUTOFCONTEXT
+    // SAFETY: 仅在 apps 线程调用一次；钩子回调与本消息循环同线程（WINEVENT_OUTOFCONTEXT
     // + hmod=None 时事件经注册线程的消息队列投递）。
     let hook = unsafe {
         SetWinEventHook(
@@ -138,7 +138,7 @@ fn run_message_loop() {
         }
     }
 
-    // SAFETY：hook 由本线程刚注册成功且尚未被反注册。
+    // SAFETY: hook 由本线程刚注册成功且尚未被反注册。
     let _ = unsafe { UnhookWinEvent(hook) };
 }
 
@@ -208,7 +208,7 @@ fn apply_foreground(fg: &Mutex<FgState>, exe: String, force: bool) {
 /// `hwnd` 必须是有效的窗口句柄；本函数仅做只读系统查询。
 unsafe fn resolve_foreground_exe(hwnd: HWND) -> String {
     let mut pid = 0u32;
-    // SAFETY：hwnd 有效性已由调用方保证。
+    // SAFETY: hwnd 有效性已由调用方保证。
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let top_image = if pid == 0 {
         None
@@ -276,11 +276,11 @@ fn lowercase_basename(path: &str) -> Option<String> {
 /// # Safety
 /// 仅做只读系统查询；`pid` 可为任意进程 id（无有效性前提）。
 unsafe fn query_process_image(pid: u32) -> Option<String> {
-    // SAFETY：只读查询；句柄在查询后立即关闭。
+    // SAFETY: 只读查询；句柄在查询后立即关闭。
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
     let mut buf = [0u16; 2048]; // 远大于常规可执行路径，溢出按失败归 "unknown"
     let mut len = buf.len() as u32;
-    // SAFETY：buf 为调用方栈上缓冲，len 为其容量（字符数）。
+    // SAFETY: buf 为调用方栈上缓冲，len 为其容量（字符数）。
     let r = unsafe {
         QueryFullProcessImageNameW(
             handle,
@@ -310,7 +310,7 @@ unsafe fn query_process_image(pid: u32) -> Option<String> {
 /// `host` 必须是有效的窗口句柄。
 unsafe fn pid_of_core_window_child(host: HWND) -> Option<u32> {
     let mut pid: u32 = 0;
-    // SAFETY：回调仅读取类名/进程 id 并写入本函数栈上的输出槽。
+    // SAFETY: 回调仅读取类名/进程 id 并写入本函数栈上的输出槽。
     let _ = unsafe {
         EnumChildWindows(
             Some(host),
