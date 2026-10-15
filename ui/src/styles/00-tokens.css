@@ -1,0 +1,134 @@
+/* =====================================================================
+   CL Recoder · 设计系统（暖中性色 + 余烬橙强调）
+   - 浅色 / 深色由 <html data-theme> 切换（lib/theme.tsx 负责写入）
+   - 软件渲染（--disable-gpu）友好：不使用 backdrop-filter / 大面积模糊 / 持续动画
+   - 热力色带 --heat-low/mid/high 必须保持 #rrggbb（lib/heatPalette.ts 读取）
+   ===================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* 表面 */
+  --bg: #f5f3ef;
+  --surface: #ffffff;
+  --surface-2: #faf8f5;
+  --surface-3: #f0ede7;
+  --line: #e8e3da;
+  --line-strong: #d3ccc0;
+
+  /* 文本 */
+  --text: #1e1c19;
+  --text-2: #5b554c;
+  --text-3: #8b8479;
+
+  /* 强调（余烬橙） */
+  --accent: #dd4f24;
+  --accent-hover: #c7431b;
+  --accent-soft: #fdebe4;
+  --accent-ink: #ffffff;
+
+  /* 设备识别色 */
+  --kb: #dd4f24;
+  --kb-soft: #fdebe4;
+  --ms: #0c87a3;
+  --ms-soft: #def3f8;
+  --gp: #7656d4;
+  --gp-soft: #ece7fb;
+  --wp: #b9831a;
+  --wp-soft: #faf0d9;
+
+  /* 语义色 */
+  --ok: #1b8a5a;
+  --ok-soft: #def4e9;
+  --warn: #a96a0b;
+  --warn-soft: #fbefd6;
+  --bad: #c7352f;
+  --bad-soft: #fbe3e1;
+
+  /* 实时输入 */
+  --input-live: #0e9a76;
+  --input-live-soft: #dcf5ec;
+  --input-live-ring: rgba(14, 154, 118, 0.35);
+
+  /* 热力色带（必须为 #rrggbb） */
+  --heat-low: #f4efe6;
+  --heat-mid: #f2a04a;
+  --heat-high: #c7301d;
+
+  --key: #ffffff;
+  --device-top: #ffffff;
+  --device-bottom: #ebe5da;
+  --seg-active: #ffffff;
+  --shadow-pop: 0 14px 36px rgba(40, 30, 15, 0.16);
+  --shadow-seg: 0 1px 2px rgba(40, 30, 15, 0.14);
+  --ring: rgba(221, 79, 36, 0.35);
+
+  /* 尺寸 */
+  --font-sans:
+    "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono:
+    "Cascadia Mono", "Cascadia Code", "Consolas", "SFMono-Regular", monospace;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --radius: 16px;
+  --radius-md: 12px;
+  --radius-sm: 9px;
+  --rail-w: 84px;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #131211;
+  --surface: #1c1a18;
+  --surface-2: #232120;
+  --surface-3: #2b2927;
+  --line: #2f2c29;
+  --line-strong: #46423d;
+
+  --text: #f2eee7;
+  --text-2: #b6afa4;
+  --text-3: #837c71;
+
+  --accent: #ff7a4d;
+  --accent-hover: #ff9068;
+  --accent-soft: #3a2218;
+  --accent-ink: #1a0d07;
+
+  --kb: #ff7a4d;
+  --kb-soft: #3a2218;
+  --ms: #3fc3de;
+  --ms-soft: #12323b;
+  --gp: #a58bf5;
+  --gp-soft: #2a2347;
+  --wp: #e8b23f;
+  --wp-soft: #3a2f14;
+
+  --ok: #4ad39a;
+  --ok-soft: #153327;
+  --warn: #efb74e;
+  --warn-soft: #3a2d12;
+  --bad: #ff7d75;
+  --bad-soft: #3d1b19;
+
+  --input-live: #34d6aa;
+  --input-live-soft: #12372d;
+  --input-live-ring: rgba(52, 214, 170, 0.4);
+
+  --heat-low: #262321;
+  --heat-mid: #d96a39;
+  --heat-high: #ffd27a;
+
+  --key: #2a2826;
+  --device-top: #34312e;
+  --device-bottom: #25221f;
+  --seg-active: #3a3633;
+  --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.55);
+  --shadow-seg: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --ring: rgba(255, 122, 77, 0.45);
+}
+

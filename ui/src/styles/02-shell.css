@@ -1,0 +1,197 @@
+/* ---------- 外壳 ---------- */
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+.stage {
+  flex: 1;
+  min-width: 0;
+}
+.main {
+  min-width: 0;
+}
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 22px 28px 56px;
+}
+
+/* 左侧导航轨 */
+.rail {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  flex: none;
+  width: var(--rail-w);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 8px 12px;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.rail::-webkit-scrollbar {
+  display: none;
+}
+.rail-brand {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 6px;
+  color: var(--accent);
+}
+.rail-brand-bg {
+  fill: var(--accent-soft);
+}
+.rail-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  width: 100%;
+}
+.rail-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 2px 6px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.rail-item svg {
+  width: 21px;
+  height: 21px;
+}
+.rail-item:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.rail-item[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 650;
+}
+.rail-sep {
+  height: 1px;
+  margin: 6px 14px;
+  background: var(--line);
+}
+.rail-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.rail-status {
+  --tone: var(--text-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.rail-status[data-tone="ok"] {
+  --tone: var(--ok);
+}
+.rail-status[data-tone="warn"] {
+  --tone: var(--warn);
+}
+.rail-status[data-tone="bad"] {
+  --tone: var(--bad);
+}
+.rail-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+.rail-status[data-tone="ok"] .rail-status-dot {
+  box-shadow: 0 0 0 3px var(--ok-soft);
+}
+/* 页眉（吸顶） */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  min-height: 72px;
+  padding: 14px 28px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.topbar-copy {
+  min-width: 0;
+}
+.topbar-title {
+  font-size: 21px;
+  font-weight: 750;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+}
+.topbar-desc {
+  margin-top: 1px;
+  color: var(--text-3);
+  font-size: 13px;
+}
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* 横幅 */
+.app-banner {
+  padding: 10px 28px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.app-banner--danger {
+  background: var(--bad);
+  color: #fff;
+}
+.app-banner--warning {
+  margin-top: 14px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-weight: 500;
+}
+.banner {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.banner--bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+

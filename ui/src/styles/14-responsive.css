@@ -1,0 +1,32 @@
+/* ---------- 响应 ---------- */
+@media (max-width: 980px) {
+  .kpi-grid--4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 900px) {
+  .mouse-workspace,
+  .grid-2,
+  .stick-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 1040px) {
+  .page {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+  .topbar {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-index {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
+

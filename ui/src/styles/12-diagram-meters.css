@@ -1,0 +1,448 @@
+/* ---------- 分布图：读数条 / 其它输入 ---------- */
+.readout-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  min-height: 46px;
+  margin-top: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.readout-bar strong {
+  color: var(--text);
+  font-size: 14px;
+}
+.readout-num {
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 750;
+}
+.others {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.others-title {
+  color: var(--text-3);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.others-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.other-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 12.5px;
+}
+.other-chip:hover {
+  border-color: var(--line-strong);
+}
+.other-chip[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.other-chip .num {
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+/* 键盘物理布局 */
+.dev-zones {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px 22px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.dev-zone-label {
+  margin-bottom: 6px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.dev-zone-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 3px;
+  margin: -3px;
+}
+.dev-zone-grid {
+  position: relative;
+}
+.dev-key {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 7px;
+  background: var(--cap, var(--key));
+  color: var(--cap-ink, var(--text));
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+.dev-key:hover {
+  border-color: var(--text-3);
+}
+.dev-key-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+.dev-key-num {
+  font-size: 9.5px;
+  font-weight: 500;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+.dev-key[aria-pressed="true"] {
+  z-index: 3;
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px var(--accent),
+    0 0 0 4px var(--ring);
+}
+
+/* 鼠标 / 手柄示意图（绘制式：SVG 皮肤层 + 透明 HTML 命中层） */
+.peripheral-stage {
+  overflow: auto;
+  padding: 20px 18px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg, 16px);
+  background:
+    radial-gradient(circle at 1px 1px, var(--line) 1px, transparent 1.4px) 0 0 / 18px 18px,
+    var(--surface-2);
+}
+.peripheral-board {
+  position: relative;
+  margin: auto;
+}
+.peripheral-svg {
+  display: block;
+}
+.device-shadow {
+  fill: rgba(70, 48, 24, 0.13);
+}
+.device-body {
+  stroke: none;
+}
+.device-face {
+  fill: #fff;
+  fill-opacity: 0.38;
+  stroke: #fff;
+  stroke-opacity: 0.7;
+  stroke-width: 1;
+  pointer-events: none;
+}
+.device-outline {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+  pointer-events: none;
+}
+.device-groove {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  opacity: 0.75;
+}
+.device-logo {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+  opacity: 0.7;
+}
+.device-logo-dot {
+  fill: var(--line-strong);
+  opacity: 0.7;
+}
+.device-well {
+  fill: rgba(70, 48, 24, 0.12);
+  stroke: var(--line-strong);
+  stroke-width: 1;
+}
+.device-dpad-base {
+  fill: rgba(70, 48, 24, 0.12);
+  stroke: rgba(70, 48, 24, 0.12);
+  stroke-width: 10;
+  stroke-linejoin: round;
+}
+.device-dpad-hub {
+  fill: rgba(70, 48, 24, 0.1);
+}
+.peripheral-inset {
+  fill: rgba(70, 48, 24, 0.07);
+  stroke: rgba(70, 48, 24, 0.12);
+}
+
+/* 皮肤：fill = 热力色（--skin，未着色回落 --key）；状态用描边 + 外环 */
+.skin {
+  fill: var(--skin, var(--key));
+  stroke: var(--line-strong);
+  stroke-width: 1.3;
+  stroke-linejoin: round;
+}
+.skin-sheen {
+  stroke: none;
+  pointer-events: none;
+}
+.skin-ring {
+  fill: none;
+  stroke: none;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.skin.is-hover {
+  stroke: var(--text-3);
+}
+.skin.is-unsupported {
+  stroke-dasharray: 4 3;
+}
+.skin.is-live,
+.skin.is-pulse {
+  stroke: var(--input-live);
+  stroke-width: 2.4;
+}
+.skin.is-live {
+  fill: var(--input-live-soft);
+}
+.skin-ring.is-live,
+.skin-ring.is-pulse {
+  stroke: var(--input-live-ring);
+  stroke-width: 9;
+}
+.skin-ring.is-focus {
+  stroke: var(--accent);
+  stroke-width: 8;
+  stroke-opacity: 0.55;
+}
+.skin.is-selected {
+  stroke: var(--text);
+  stroke-width: 2.6;
+}
+.skin-ring.is-selected {
+  stroke: var(--accent);
+  stroke-opacity: 0.5;
+  stroke-width: 9;
+}
+.skin--abxy .skin.is-selected {
+  stroke: var(--text);
+}
+/* ABXY 身份色（A 绿 / B 红 / X 蓝 / Y 黄） */
+.skin--a {
+  --ident: #1f9a63;
+}
+.skin--b {
+  --ident: #d4483b;
+}
+.skin--x {
+  --ident: #3b78d8;
+}
+.skin--y {
+  --ident: #d99a13;
+}
+.skin--abxy .skin:not(.is-selected):not(.is-live):not(.is-pulse):not(.is-hover) {
+  stroke: var(--ident);
+  stroke-width: 2.4;
+}
+.skin--mouse-key .skin {
+  stroke-width: 1.2;
+}
+.skin--wheel .skin {
+  stroke-width: 1.4;
+}
+.skin--chip .skin,
+.skin--arm .skin {
+  stroke-width: 1.2;
+}
+
+/* 命中层：透明按钮，只负责标签与交互 */
+.peripheral-button {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--skin-ink, var(--text-2));
+  cursor: pointer;
+}
+.peripheral-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.peripheral-button[data-shape="circle"] {
+  border-radius: 50%;
+}
+.peripheral-button svg {
+  width: 15px;
+  height: 15px;
+  color: var(--skin-ink, var(--text-3));
+}
+.peripheral-button[aria-pressed="true"] {
+  color: var(--skin-ink, var(--accent));
+}
+.peripheral-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+.gamepad-button[data-code="1"] {
+  color: var(--skin-ink, #1f9a63);
+}
+.gamepad-button[data-code="2"] {
+  color: var(--skin-ink, #d4483b);
+}
+.gamepad-button[data-code="3"] {
+  color: var(--skin-ink, #b27a05);
+}
+.gamepad-button[data-code="4"] {
+  color: var(--skin-ink, #3b78d8);
+}
+.gamepad-button[data-code="1"] .peripheral-label,
+.gamepad-button[data-code="2"] .peripheral-label,
+.gamepad-button[data-code="3"] .peripheral-label,
+.gamepad-button[data-code="4"] .peripheral-label {
+  font-size: 15px;
+  font-weight: 800;
+}
+.gamepad-button[data-code="9"] .peripheral-label,
+.gamepad-button[data-code="10"] .peripheral-label {
+  font-size: 9.5px;
+  letter-spacing: 0;
+}
+.gamepad-button[data-code="11"] .peripheral-label {
+  font-size: 10px;
+  letter-spacing: 0;
+}
+/* 摇杆标签放在摇杆井下方，给实时摇杆点让位 */
+.gamepad-button[data-code="12"] .peripheral-label,
+.gamepad-button[data-code="13"] .peripheral-label {
+  position: absolute;
+  top: calc(100% + 14px);
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.gamepad-button[data-code="6"] .peripheral-label,
+.gamepad-button[data-code="8"] .peripheral-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mouse-button[data-code="1"] .peripheral-label,
+.mouse-button[data-code="2"] .peripheral-label {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, calc(-50% + 20px));
+  font-size: 12.5px;
+}
+.mouse-button[data-code="3"] .peripheral-label {
+  font-size: 10.5px;
+}
+
+/* 实时态（input-live-trigger） */
+.peripheral-button.is-live {
+  color: var(--input-live);
+}
+.dev-key.is-live {
+  border-color: var(--input-live);
+  background: var(--cap, var(--input-live-soft));
+  box-shadow: inset 0 0 0 1px var(--input-live);
+}
+.dev-key.is-pulse {
+  border-color: var(--input-live);
+  box-shadow: 0 0 0 3px var(--input-live-ring);
+}
+.dev-key.is-live[aria-pressed="true"],
+.dev-key.is-pulse[aria-pressed="true"] {
+  border-color: var(--accent);
+  box-shadow:
+    inset 0 0 0 1px var(--input-live),
+    0 0 0 2px var(--accent);
+}
+.peripheral-unsupported {
+  display: none;
+}
+.peripheral-button.is-unsupported .peripheral-unsupported {
+  display: block;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1.1;
+}
+.trigger-pct {
+  display: block;
+  color: var(--input-live);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.peripheral-live-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+.trigger-travel-track {
+  fill: none;
+  stroke: none;
+  pointer-events: none;
+}
+.trigger-travel-fill {
+  fill: var(--input-live);
+  fill-opacity: 0.5;
+  stroke: none;
+  pointer-events: none;
+}
+.stick-tip-line {
+  stroke: var(--input-live);
+  stroke-width: 2;
+  stroke-linecap: round;
+  pointer-events: none;
+}
+.stick-tip-dot {
+  fill: var(--input-live);
+  stroke: #fff;
+  stroke-width: 2;
+  pointer-events: none;
+}
+

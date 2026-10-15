@@ -231,11 +231,22 @@ test("TriggerHeatmap：仅历史 props、无实时字段、空记录文案、101
   assert.equal(heatCellColor(0).startsWith("rgba("), true);
 });
 
-test("theme.css：实时 token 与 live/pulse/扳机热力样式就绪", async () => {
-  const css = await readFile(
-    new URL("../src/theme.css", import.meta.url),
-    "utf8",
+async function loadThemeCssBundle() {
+  // S3：theme.css 只留 @import；把引用的 styles/* 按顺序拼回再断言
+  const themePath = new URL("../src/theme.css", import.meta.url);
+  const theme = await readFile(themePath, "utf8");
+  const imports = [...theme.matchAll(/@import\s+"(\.\/styles\/[^"]+)"\s*;/g)].map(
+    (m) => m[1],
   );
+  assert.ok(imports.length > 0, "theme.css 应引用 styles/*");
+  const parts = await Promise.all(
+    imports.map((rel) => readFile(new URL(rel, themePath), "utf8")),
+  );
+  return parts.join("");
+}
+
+test("theme.css：实时 token 与 live/pulse/扳机热力样式就绪", async () => {
+  const css = await loadThemeCssBundle();
   assert.match(css, /--input-live:\s*#0e9a76/);
   assert.match(css, /--input-live-soft:\s*#dcf5ec/);
   assert.match(css, /\.peripheral-button\.is-live|\.is-live/);
