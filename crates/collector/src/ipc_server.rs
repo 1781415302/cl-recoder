@@ -204,7 +204,7 @@ pub fn spawn(flags: Arc<Flags>, status: Arc<RuntimeStatus>) -> std::thread::Join
 
 /// windows 0.62 的 HANDLE 是 *mut c_void 包装、非 Send——句柄移交工作线程必须经此 newtype。
 ///
-/// SAFETY：内核句柄进程内全局有效；Send 仅表达所有权移交（单 worker，无需 Sync）。
+/// SAFETY: 内核句柄进程内全局有效；Send 仅表达所有权移交（单 worker，无需 Sync）。
 struct SendHandle(HANDLE);
 
 // SAFETY: 见类型文档——句柄仅在进程内有效，移交 worker 单线程持有直到 serve_client 关闭。
@@ -234,8 +234,8 @@ pub(crate) struct OwnedSecurityAttributes {
 impl OwnedSecurityAttributes {
     /// 构造限当前用户 SID 的显式 DACL 安全属性（§4.4）。
     pub(crate) fn new() -> windows::core::Result<Self> {
-        // SAFETY: build_security_attributes 仅调 Win32；成功后 SD 由 Self::Drop LocalFree。
         Ok(Self {
+            // SAFETY: build_security_attributes 仅调 Win32；成功后 SD 由 Self::Drop LocalFree。
             sa: unsafe { build_security_attributes()? },
         })
     }
@@ -547,8 +547,8 @@ unsafe fn current_user_sid_string() -> windows::core::Result<String> {
     unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
     }
-    // SAFETY: token 刚由 OpenProcessToken 成功打开，本轮调用内有效。
     let result = token_user_sid_string(token);
+    // SAFETY: token 刚由 OpenProcessToken 成功打开，本轮调用内有效。
     unsafe {
         let _ = CloseHandle(token);
     }
@@ -1026,8 +1026,8 @@ mod tests {
         let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
         // SAFETY: user.User.Sid 是 buf 内的有效 SID。
         let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
-        // SAFETY: 从有效 SID 起始处读取 GetLengthSid 个字节。
         let bytes =
+            // SAFETY: 从有效 SID 起始处读取 GetLengthSid 个字节。
             unsafe { std::slice::from_raw_parts(user.User.Sid.0 as *const u8, sid_len) }.to_vec();
         bytes
     }
@@ -1043,9 +1043,9 @@ mod tests {
 
         // SAFETY: 测试辅助：在 deadline 前打开命名管道客户端；返回句柄由本测试 CloseHandle/transact 收尾。
         let client = unsafe { open_client(Instant::now() + Duration::from_secs(10)) };
-        // SAFETY: client 已连入；查询其内核对象 DACL。
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: client 已连入；查询其内核对象 DACL。
         let err = unsafe {
             GetSecurityInfo(
                 client,
