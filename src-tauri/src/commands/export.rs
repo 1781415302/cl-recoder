@@ -134,6 +134,15 @@ pub(crate) fn csv_text_field(s: &str) -> String {
     }
 }
 
+/// 枚举 → CSV 线上名字：经 serde 得到字符串；非字符串或序列化失败则 `"unknown"`（不 panic）。
+/// 取代原先 to_string + 强制解包 + 剥引号的写法，避免 CSV 导出路径上 panic。
+fn enum_wire_name<T: Serialize>(v: &T) -> String {
+    match serde_json::to_value(v) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => "unknown".to_string(),
+    }
+}
+
 /// 写一个 CSV 文件：BOM + 表头行 + 数据行；返回 (路径, 数据行数)。
 fn write_csv_file(
     path: &Path,
@@ -176,7 +185,7 @@ pub fn export_csv(
                 .map(|d| {
                     vec![
                         d.id.to_string(),
-                        serde_json::to_string(&d.kind).unwrap().trim_matches('"').to_string(),
+                        enum_wire_name(&d.kind),
                         d.vid.to_string(),
                         d.pid.to_string(),
                         csv_text_field(&d.name),
@@ -290,7 +299,7 @@ pub fn export_csv(
                         r.source_id.to_string(),
                         r.day.clone(),
                         r.dpi.map_or_else(String::new, |d| d.to_string()),
-                        serde_json::to_string(&r.dpi_origin).unwrap().trim_matches('"').to_string(),
+                        enum_wire_name(&r.dpi_origin),
                         r.counts.to_string(),
                         r.meters.map_or_else(String::new, |m| m.to_string()),
                     ]
@@ -310,7 +319,7 @@ pub fn export_csv(
                     vec![
                         r.device_id.to_string(),
                         r.day.clone(),
-                        serde_json::to_string(&r.stick).unwrap().trim_matches('"').to_string(),
+                        enum_wire_name(&r.stick),
                         r.active_us.to_string(),
                         r.travel_r.to_string(),
                     ]
@@ -330,7 +339,7 @@ pub fn export_csv(
                     vec![
                         r.device_id.to_string(),
                         r.day.clone(),
-                        serde_json::to_string(&r.stick).unwrap().trim_matches('"').to_string(),
+                        enum_wire_name(&r.stick),
                         r.bin.to_string(),
                         r.dwell_us.to_string(),
                     ]
@@ -371,7 +380,7 @@ pub fn export_csv(
                     vec![
                         r.device_id.to_string(),
                         r.day.clone(),
-                        serde_json::to_string(&r.trigger).unwrap().trim_matches('"').to_string(),
+                        enum_wire_name(&r.trigger),
                         r.bin.to_string(),
                         r.dwell_us.to_string(),
                     ]
@@ -1980,6 +1989,53 @@ mod tests {
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
         assert_eq!(csv_field(""), "");
+    }
+
+    /// 旧实现：to_string + unwrap + trim 引号（仅用于对照验证）。
+    fn old_enum_wire_name<T: Serialize>(v: &T) -> String {
+        serde_json::to_string(v).unwrap().trim_matches('"').to_string()
+    }
+
+    /// enum_wire_name 与旧 unwrap 路径对 4 类枚举逐字相同；非字符串回落 "unknown"。
+    #[test]
+    fn enum_wire_name_matches_old_for_four_enums() {
+        let kinds = [DeviceKind::Keyboard, DeviceKind::Mouse, DeviceKind::Gamepad];
+        for k in kinds {
+            assert_eq!(enum_wire_name(&k), old_enum_wire_name(&k));
+        }
+        assert_eq!(enum_wire_name(&DeviceKind::Keyboard), "keyboard");
+        assert_eq!(enum_wire_name(&DeviceKind::Mouse), "mouse");
+        assert_eq!(enum_wire_name(&DeviceKind::Gamepad), "gamepad");
+
+        let origins = [DpiOrigin::Auto, DpiOrigin::Manual, DpiOrigin::Unknown];
+        for o in origins {
+            assert_eq!(enum_wire_name(&o), old_enum_wire_name(&o));
+        }
+        assert_eq!(enum_wire_name(&DpiOrigin::Auto), "auto");
+        assert_eq!(enum_wire_name(&DpiOrigin::Manual), "manual");
+        assert_eq!(enum_wire_name(&DpiOrigin::Unknown), "unknown");
+
+        let sticks = [StickSide::Left, StickSide::Right];
+        for s in sticks {
+            assert_eq!(enum_wire_name(&s), old_enum_wire_name(&s));
+        }
+        assert_eq!(enum_wire_name(&StickSide::Left), "left");
+        assert_eq!(enum_wire_name(&StickSide::Right), "right");
+
+        let triggers = [TriggerSide::Left, TriggerSide::Right];
+        for t in triggers {
+            assert_eq!(enum_wire_name(&t), old_enum_wire_name(&t));
+        }
+        assert_eq!(enum_wire_name(&TriggerSide::Left), "left");
+        assert_eq!(enum_wire_name(&TriggerSide::Right), "right");
+
+        // 非字符串 Value：不 panic，回落 "unknown"
+        #[derive(Serialize)]
+        struct NotAString {
+            n: i32,
+        }
+        assert_eq!(enum_wire_name(&NotAString { n: 1 }), "unknown");
+        assert_eq!(enum_wire_name(&42u32), "unknown");
     }
 
     /// csv_dir 规则：带扩展名取父目录，纯目录原样。
