@@ -199,27 +199,6 @@ fn clear_updates_dir() -> Result<(), String> {
     Ok(())
 }
 
-fn run_curl(args: &[String]) -> Result<(), (UpdateErrorCode, String)> {
-    use std::os::windows::process::CommandExt;
-    let curl = curl_exe_path();
-    if !curl.is_file() {
-        return Err((
-            UpdateErrorCode::CurlMissing,
-            "未找到系统 curl.exe，请前往发布页手动下载安装包。".into(),
-        ));
-    }
-    let status = std::process::Command::new(&curl)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|e| (UpdateErrorCode::Network, format!("启动 curl 失败: {e}")))?;
-    let code = status.code().unwrap_or(-1);
-    if let Some(mapped) = map_curl_exit(code) {
-        return Err((mapped.code, mapped.message));
-    }
-    Ok(())
-}
-
 /// 下载并轮询 `.part` 大小；成功返回 ().
 fn download_with_progress(
     args: &[String],
