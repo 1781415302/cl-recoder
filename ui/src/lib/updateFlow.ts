@@ -59,8 +59,8 @@ export interface UpdateFlowProgress {
 }
 
 export interface UpdateFlowInput {
-  /** 当前应用版本（getVersion / mock 0.4.0） */
-  currentVersion: string;
+  /** 当前应用版本；getAppVersion 失败时为 null（显示「未知」，不传假版本） */
+  currentVersion: string | null;
   /** 是否正在检查 */
   checking: boolean;
   /** 检查失败文案（检查阶段报错，不改安装态） */
@@ -229,7 +229,8 @@ export function deriveUpdateFlow(input: UpdateFlowInput): UpdateFlowView {
 
   const releaseUrl = check?.releaseUrl ?? null;
   const targetVersion = check?.latestVersion ?? null;
-  const verLabel = `当前版本 v${currentVersion}`;
+  const verLabel =
+    currentVersion !== null ? `当前版本 v${currentVersion}` : "当前版本 未知";
 
   const phase = status?.phase ?? "idle";
   const isLaunched = installSubmitted && phase === "launched";
@@ -243,7 +244,7 @@ export function deriveUpdateFlow(input: UpdateFlowInput): UpdateFlowView {
       headline: phaseLabel("launched"),
       detail: null,
       notes: null,
-      phaseLabel: phaseLabel("launched"),
+      phaseLabel: null,
       progress: { kind: "indeterminate", value: 0, max: 1 },
       buttons: NO_BUTTONS,
       allDisabled: true,
@@ -288,7 +289,8 @@ export function deriveUpdateFlow(input: UpdateFlowInput): UpdateFlowView {
       headline: label || "正在更新…",
       detail,
       notes: null,
-      phaseLabel: label || null,
+      // 文案只放 headline，避免与 phaseLabel 重复（P1-2d）
+      phaseLabel: null,
       progress,
       buttons: NO_BUTTONS,
       allDisabled: true,
@@ -471,6 +473,31 @@ export function deriveUpdateFlow(input: UpdateFlowInput): UpdateFlowView {
     failureMessage: null,
     releaseUrl: null,
     targetVersion: null,
+  };
+}
+
+/**
+ * 挂载时是否应根据后端 status 恢复 installSubmitted（P1-2b）。
+ * phase 非 idle（含 downloading…failed/launched）→ 恢复轮询/展示。
+ */
+export function shouldResumeInstallPolling(
+  status: UpdateStatus | null | undefined,
+): boolean {
+  if (!status) return false;
+  return status.phase !== "idle";
+}
+
+/**
+ * 采集器操作按钮：disabled 受 actionBusy|updateBusy；进行中文案只看 actionBusy（P1-2c）。
+ * 更新占用期间按钮禁用，但文案不得变成「启动中…」。
+ */
+export function collectorActionBusyState(
+  actionBusy: boolean,
+  updateBusy: boolean,
+): { disabled: boolean; showBusyLabel: boolean } {
+  return {
+    disabled: actionBusy || updateBusy,
+    showBusyLabel: actionBusy,
   };
 }
 

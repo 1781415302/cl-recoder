@@ -24,8 +24,10 @@ import {
 } from "../components/icons";
 import { defaultRange, fmtNum } from "../lib/format";
 import {
+  collectorActionBusyState,
   deriveUpdateFlow,
   shouldPollUpdateStatus,
+  shouldResumeInstallPolling,
 } from "../lib/updateFlow";
 import type {
   ExportReport,
@@ -102,12 +104,13 @@ function UpdateCard({
 }: {
   onPageBusy: (busy: boolean) => void;
 }) {
-  const [currentVersion, setCurrentVersion] = useState("…");
+  const [currentVersion, setCurrentVersion] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [check, setCheck] = useState<UpdateCheck | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [installSubmitted, setInstallSubmitted] = useState(false);
+  const [lastStatus, setLastStatus] = useState<UpdateStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -116,7 +119,8 @@ function UpdateCard({
         if (!cancelled) setCurrentVersion(v);
       },
       () => {
-        if (!cancelled) setCurrentVersion("0.4.0");
+        // 失败时显示「未知」，不传假版本（P1-2a）
+        if (!cancelled) setCurrentVersion(null);
       },
     );
     return () => {
@@ -124,7 +128,26 @@ function UpdateCard({
     };
   }, []);
 
-  const [lastStatus, setLastStatus] = useState<UpdateStatus | null>(null);
+  // 挂载时拉一次 status：非 idle 则恢复 installSubmitted 与轮询（P1-2b）
+  useEffect(() => {
+    let cancelled = false;
+    void client.updateStatus().then(
+      (st) => {
+        if (cancelled) return;
+        setLastStatus(st);
+        if (shouldResumeInstallPolling(st)) {
+          setInstallSubmitted(true);
+        }
+      },
+      () => {
+        /* 忽略：无后端/失败时保持 idle */
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const poll = shouldPollUpdateStatus(installSubmitted, lastStatus);
   const statusQuery = useUpdateStatus(poll);
   useEffect(() => {
@@ -134,7 +157,7 @@ function UpdateCard({
   const status = statusQuery.data ?? lastStatus;
 
   const view = deriveUpdateFlow({
-    currentVersion: currentVersion === "…" ? "0.4.0" : currentVersion,
+    currentVersion,
     checking,
     checkError,
     check,
@@ -519,8 +542,9 @@ export function Settings() {
   const [busy, setBusy] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [wpPathDraft, setWpPathDraft] = useState<string | null>(null);
-  /** 更新进行中时同步禁用采集器操作按钮（§4.8） */
+  /** 更新进行中时同步禁用采集器操作按钮（§4.8）；文案只看 busy（P1-2c） */
   const controlsBusy = busy || updateBusy;
+  const actionBusy = collectorActionBusyState(busy, updateBusy);
 
   function after(
     promise: Promise<unknown>,
@@ -730,7 +754,7 @@ export function Settings() {
                         })
                       }
                     >
-                      {controlsBusy ? "启动中…" : "检查并启动"}
+                      {actionBusy.showBusyLabel ? "启动中…" : "检查并启动"}
                     </button>
                   </div>
                 </div>
@@ -748,7 +772,7 @@ export function Settings() {
                   action={
                     st.taskEvidence === "absent"
                       ? {
-                          label: controlsBusy
+                          label: actionBusy.showBusyLabel
                             ? "处理中…"
                             : "启用采集器自启（需一次 UAC）",
                           onClick: () => {
@@ -761,7 +785,7 @@ export function Settings() {
                           },
                         }
                       : {
-                          label: controlsBusy ? "启动中…" : "立即启动采集器",
+                          label: actionBusy.showBusyLabel ? "启动中…" : "立即启动采集器",
                           onClick: () => {
                             if (!controlsBusy)
                               after(
@@ -777,7 +801,7 @@ export function Settings() {
                       ? undefined
                       : st.taskEvidence === "unknown"
                         ? {
-                            label: controlsBusy
+                            label: actionBusy.showBusyLabel
                               ? "处理中…"
                               : "启用采集器自启（需一次 UAC）",
                             onClick: () => {
@@ -833,7 +857,7 @@ export function Settings() {
                         })
                       }
                     >
-                      {controlsBusy ? "启动中…" : "检查并启动"}
+                      {actionBusy.showBusyLabel ? "启动中…" : "检查并启动"}
                     </button>
                     <button
                       type="button"
@@ -933,7 +957,7 @@ export function Settings() {
                       disabled={controlsBusy}
                       onClick={repairPolicy}
                     >
-                      {controlsBusy ? "处理中…" : "修复采集器自启（需一次 UAC）"}
+                      {actionBusy.showBusyLabel ? "处理中…" : "修复采集器自启（需一次 UAC）"}
                     </button>
                   ) : null}
                 </Row>

@@ -168,6 +168,18 @@
   height: 10px;
   accent-color: var(--accent);
 }
+.update-progress::-webkit-progress-bar {
+  background-color: var(--surface-3);
+  border-radius: 999px;
+}
+.update-progress::-webkit-progress-value {
+  background-color: var(--accent);
+  border-radius: 999px;
+}
+.update-progress::-moz-progress-bar {
+  background-color: var(--accent);
+  border-radius: 999px;
+}
 .update-failure {
   padding: 8px 12px;
   border-radius: var(--radius-sm);

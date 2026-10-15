@@ -4,11 +4,13 @@ import {
   COLLECTOR_MANUAL_HINT,
   UPDATE_CONFIRM_POINTS,
   blockReasonText,
+  collectorActionBusyState,
   deriveUpdateFlow,
   errorCodeText,
   formatBytes,
   phaseLabel,
   shouldPollUpdateStatus,
+  shouldResumeInstallPolling,
 } from "./updateFlow";
 
 const baseCheck = (over: Partial<UpdateCheck> = {}): UpdateCheck => ({
@@ -225,7 +227,8 @@ describe("deriveUpdateFlow", () => {
       },
     });
     expect(v.mode).toBe("in_progress");
-    expect(v.phaseLabel).toContain("下载");
+    expect(v.headline).toContain("下载");
+    expect(v.phaseLabel).toBeNull();
     expect(v.progress?.kind).toBe("determinate");
     expect(v.progress?.value).toBe(2_500_000);
     expect(v.progress?.max).toBe(10_000_000);
@@ -258,7 +261,8 @@ describe("deriveUpdateFlow", () => {
       });
       expect(v.mode).toBe("in_progress");
       expect(v.progress?.kind).toBe("indeterminate");
-      expect(v.phaseLabel).toBe(phaseLabel(phase));
+      expect(v.headline).toBe(phaseLabel(phase));
+      expect(v.phaseLabel).toBeNull();
     }
   });
 
@@ -342,6 +346,63 @@ describe("deriveUpdateFlow", () => {
     });
     expect(v.mode).toBe("check_error");
     expect(v.buttons.recheck).toBe(true);
+  });
+
+  it("null currentVersion shows 未知 without fake version", () => {
+    const v = deriveUpdateFlow({
+      currentVersion: null,
+      checking: false,
+      checkError: null,
+      check: null,
+      confirming: false,
+      installSubmitted: false,
+      status: null,
+    });
+    expect(v.mode).toBe("initial");
+    expect(v.headline).toBe("当前版本 未知");
+    expect(v.headline).not.toContain("0.4.0");
+  });
+});
+
+describe("shouldResumeInstallPolling", () => {
+  it("resumes when phase is not idle", () => {
+    expect(shouldResumeInstallPolling(null)).toBe(false);
+    expect(shouldResumeInstallPolling(undefined)).toBe(false);
+    expect(shouldResumeInstallPolling(idleStatus())).toBe(false);
+    expect(
+      shouldResumeInstallPolling({ ...idleStatus(), phase: "downloading" }),
+    ).toBe(true);
+    expect(
+      shouldResumeInstallPolling({ ...idleStatus(), phase: "verifying" }),
+    ).toBe(true);
+    expect(
+      shouldResumeInstallPolling({ ...idleStatus(), phase: "failed" }),
+    ).toBe(true);
+    expect(
+      shouldResumeInstallPolling({ ...idleStatus(), phase: "launched" }),
+    ).toBe(true);
+  });
+});
+
+describe("collectorActionBusyState", () => {
+  it("disables on updateBusy but keeps idle label", () => {
+    expect(collectorActionBusyState(false, false)).toEqual({
+      disabled: false,
+      showBusyLabel: false,
+    });
+    expect(collectorActionBusyState(true, false)).toEqual({
+      disabled: true,
+      showBusyLabel: true,
+    });
+    // 更新占用：按钮禁用，文案不变（不显示「启动中…」）
+    expect(collectorActionBusyState(false, true)).toEqual({
+      disabled: true,
+      showBusyLabel: false,
+    });
+    expect(collectorActionBusyState(true, true)).toEqual({
+      disabled: true,
+      showBusyLabel: true,
+    });
   });
 });
 
