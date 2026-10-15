@@ -181,10 +181,21 @@ fn rollback_collector_if_needed(was_running: bool) -> Option<bool> {
 
 fn clear_updates_dir() -> Result<(), String> {
     let dir = updates_dir();
-    if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| format!("清理更新目录失败: {e}"))?;
-    }
     fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {e}"))?;
+    // 只清 backup 以外的内容，保留 updates\backup（P1-1）
+    for entry in fs::read_dir(&dir).map_err(|e| format!("读取更新目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取更新目录项失败: {e}"))?;
+        let name = entry.file_name();
+        if name == *"backup" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| format!("清理 {} 失败: {e}", path.display()))?;
+        } else {
+            fs::remove_file(&path).map_err(|e| format!("清理 {} 失败: {e}", path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -344,6 +355,16 @@ fn verify_locked_file(
 fn backup_stats_db() -> Result<(), String> {
     let backup_dir = updates_dir().join("backup");
     fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    // 复制前先清空 backup 内旧文件，避免残留旧的 -wal/-shm（P1-1）
+    for entry in fs::read_dir(&backup_dir).map_err(|e| format!("读取备份目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取备份目录项失败: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|e| format!("清理旧备份 {} 失败: {e}", path.display()))?;
+        } else {
+            fs::remove_file(&path).map_err(|e| format!("清理旧备份 {} 失败: {e}", path.display()))?;
+        }
+    }
     let src = crate::db::stats_db_path();
     let copy_one = |name: &str| -> Result<(), String> {
         let from = if name.is_empty() {
