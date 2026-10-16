@@ -5,7 +5,7 @@
 //! AppState、不触 SQLite），而以独立的低频命令返回，前端以 30s 间隔 + 活动门控查询。
 //! 本命令只读：不修改任何文件、注册表或计划任务。
 
-use clrecoder_update::{UpdateApplied, UpdateAppliedOutcome};
+use clrecoder_update::UpdateApplied;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -59,6 +59,7 @@ pub async fn get_app_notices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clrecoder_update::UpdateAppliedOutcome;
 
     #[test]
     fn notices_dto_shape_is_camel_case() {
