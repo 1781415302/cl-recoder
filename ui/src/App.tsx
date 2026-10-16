@@ -10,6 +10,7 @@ import { Combos } from "./pages/Combos";
 import { WhatPulse } from "./pages/WhatPulse";
 import { Settings } from "./pages/Settings";
 import { useAppNotices } from "./api/queries";
+import { formatUpdateBanner } from "./lib/updateBanner";
 
 const PAGES: Record<PageId, () => React.JSX.Element> = {
   dashboard: Dashboard,
@@ -47,6 +48,7 @@ export default function App() {
   // 关闭仅隐藏本次会话（§4.7）
   const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false);
   const showUpdateBanner = Boolean(updateApplied) && !updateBannerDismissed;
+  const updateBanner = updateApplied ? formatUpdateBanner(updateApplied) : null;
   return (
     <div className="shell">
       <Sidebar page={page} onNavigate={navigate} />
@@ -57,17 +59,10 @@ export default function App() {
             {tooNew.supported}，请升级程序；采集器已拒绝写入
           </div>
         )}
-        {showUpdateBanner && updateApplied && (
+        {showUpdateBanner && updateBanner && (
           <div className="app-banner app-banner--warning" role="status">
-            <span>
-              已更新到 v{updateApplied.toVersion}。
-              {updateApplied.collectorWasRunning &&
-              !updateApplied.collectorRestored
-                ? "采集器在更新时被停止，请到设置页启动。"
-                : null}
-            </span>
-            {updateApplied.collectorWasRunning &&
-            !updateApplied.collectorRestored ? (
+            <span>{updateBanner.message}</span>
+            {updateBanner.showGoSettings ? (
               <button
                 type="button"
                 className="btn btn-sm"

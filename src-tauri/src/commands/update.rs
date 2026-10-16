@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 use clrecoder_core::ipc::CtlRequest;
 use tauri::Manager;
 use clrecoder_update::{
-    build_api_curl_args, build_download_curl_args, build_update_check, map_curl_exit, parse_latest_release,
-    parse_marker, parse_version, serialize_marker, verify_installer, PendingMarker,
-    UpdateApplied, UpdateCheck, UpdateErrorCode, UpdatePhase, UpdateStatus, VerifyError,
-    LATEST_API_URL, MAX_API_BYTES,
+    build_api_curl_args, build_download_curl_args, build_update_check, decide_marker_outcome,
+    map_curl_exit, parse_latest_release, parse_marker, parse_version, serialize_marker,
+    verify_installer, PendingMarker, UpdateApplied, UpdateCheck, UpdateErrorCode, UpdatePhase,
+    UpdateStatus, VerifyError, LATEST_API_URL, MAX_API_BYTES,
 };
 
 use super::collector_ctl::{
@@ -584,6 +584,8 @@ fn stop_collector_gracefully() -> Result<bool, (UpdateErrorCode, String, bool)> 
 }
 
 /// 启动时消费 `update-pending.json`（PLAN §4.7）：读完即删；损坏忽略。
+///
+/// 版本未变也展示 `not_applied` 横幅；只要更新前采集器在跑且管道不可达就恢复一次。
 pub(crate) fn process_startup_marker(rt: &UpdateRuntime) {
     let path = pending_marker_path();
     let text = match fs::read_to_string(&path) {
@@ -596,26 +598,22 @@ pub(crate) fn process_startup_marker(rt: &UpdateRuntime) {
         Err(_) => return,
     };
     let current = current_version_str();
-    if marker.from_version == current {
-        // 版本未变 → 不算「已更新」（可能安装失败/取消后残留）
-        return;
-    }
+    let collector_reachable = matches!(
+        ctl_request_typed(&CtlRequest::Status),
+        Ok(resp) if resp.ok
+    );
+    let decision = decide_marker_outcome(&marker, current, collector_reachable);
     let mut collector_restored = true;
-    if marker.collector_was_running {
-        let reachable = matches!(
-            ctl_request_typed(&CtlRequest::Status),
-            Ok(resp) if resp.ok
-        );
-        if !reachable {
-            let _ = run_scheduled_task_now();
-            collector_restored = wait_collector_running(Duration::from_secs(5));
-        }
+    if decision.should_restore {
+        let _ = run_scheduled_task_now();
+        collector_restored = wait_collector_running(Duration::from_secs(5));
     }
     rt.set_applied(Some(UpdateApplied {
         from_version: marker.from_version,
         to_version: marker.to_version,
         collector_was_running: marker.collector_was_running,
         collector_restored,
+        outcome: decision.outcome,
     }));
 }
 

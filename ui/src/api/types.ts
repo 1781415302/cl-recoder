@@ -500,10 +500,14 @@ export interface UpdateStatus {
   collectorRestored: boolean | null;
 }
 
-/** 启动后「更新已完成」提示（get_app_notices.updateApplied） */
+/** 启动标记消费结果：版本是否已变化 */
+export type UpdateAppliedOutcome = "applied" | "not_applied";
+
+/** 启动后「更新已完成 / 未完成」提示（get_app_notices.updateApplied） */
 export interface UpdateApplied {
   fromVersion: string;
   toVersion: string;
   collectorWasRunning: boolean;
   collectorRestored: boolean;
+  outcome: UpdateAppliedOutcome;
 }

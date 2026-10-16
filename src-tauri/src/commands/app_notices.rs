@@ -5,7 +5,7 @@
 //! AppState、不触 SQLite），而以独立的低频命令返回，前端以 30s 间隔 + 活动门控查询。
 //! 本命令只读：不修改任何文件、注册表或计划任务。
 
-use clrecoder_update::UpdateApplied;
+use clrecoder_update::{UpdateApplied, UpdateAppliedOutcome};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -78,12 +78,14 @@ mod tests {
             to_version: "0.5.0".into(),
             collector_was_running: true,
             collector_restored: false,
+            outcome: UpdateAppliedOutcome::Applied,
         };
         let v = serde_json::to_value(build_notices(None, Some(applied))).unwrap();
         assert_eq!(v["updateApplied"]["fromVersion"], "0.4.0");
         assert_eq!(v["updateApplied"]["toVersion"], "0.5.0");
         assert_eq!(v["updateApplied"]["collectorWasRunning"], true);
         assert_eq!(v["updateApplied"]["collectorRestored"], false);
+        assert_eq!(v["updateApplied"]["outcome"], "applied");
         assert!(v.get("update_applied").is_none());
     }
 }

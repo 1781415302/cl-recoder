@@ -21,8 +21,9 @@ pub use http::{
 pub use marker::{parse_marker, serialize_marker, PendingMarker};
 pub use release::{parse_latest_release, AssetInfo, ParseError, ReleaseInfo};
 pub use status::{
-    build_update_check, UpdateApplied, UpdateBlockReason, UpdateCheck, UpdateErrorCode,
-    UpdatePhase, UpdateStatus,
+    build_update_check, decide_marker_outcome, MarkerOutcomeDecision, UpdateApplied,
+    UpdateAppliedOutcome, UpdateBlockReason, UpdateCheck, UpdateErrorCode, UpdatePhase,
+    UpdateStatus,
 };
 pub use verify::{sha256_hex, verify_installer, VerifyError};
 pub use version::{parse_version, Version};

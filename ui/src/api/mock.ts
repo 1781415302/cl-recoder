@@ -429,6 +429,25 @@ export function mockWpMouseScrolls(from: string, to: string, limit: number): WpM
 }
 
 /* ---------- 有状态命令（采集器控制 / 设置 / 导入 / 导出） ---------- */
+
+/** §4.7 mock 示例：安装已生效 */
+export const MOCK_UPDATE_APPLIED_APPLIED: import("./types").UpdateApplied = {
+  fromVersion: "0.4.0",
+  toVersion: "0.5.0",
+  collectorWasRunning: true,
+  collectorRestored: true,
+  outcome: "applied",
+};
+
+/** §4.7 mock 示例：安装未生效（失败/取消后重开旧版） */
+export const MOCK_UPDATE_APPLIED_NOT_APPLIED: import("./types").UpdateApplied = {
+  fromVersion: "0.4.0",
+  toVersion: "0.5.0",
+  collectorWasRunning: true,
+  collectorRestored: false,
+  outcome: "not_applied",
+};
+
 export const state: {
   collectorRunning: boolean;
   paused: boolean;

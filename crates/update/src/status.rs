@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::marker::PendingMarker;
 use crate::release::ReleaseInfo;
 use crate::version::Version;
 
@@ -101,7 +102,17 @@ impl Default for UpdateStatus {
     }
 }
 
-/// 启动时「更新已完成」提示。
+/// 启动标记消费结果：版本是否已变化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateAppliedOutcome {
+    /// `from_version != current`：安装已生效
+    Applied,
+    /// `from_version == current`：安装未生效（失败/取消后残留标记）
+    NotApplied,
+}
+
+/// 启动时「更新已完成 / 未完成」提示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateApplied {
@@ -109,6 +120,34 @@ pub struct UpdateApplied {
     pub to_version: String,
     pub collector_was_running: bool,
     pub collector_restored: bool,
+    pub outcome: UpdateAppliedOutcome,
+}
+
+/// [`decide_marker_outcome`] 的纯结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerOutcomeDecision {
+    pub outcome: UpdateAppliedOutcome,
+    /// 更新前采集器在跑且当前管道不可达 → 应尝试恢复一次
+    pub should_restore: bool,
+}
+
+/// 如何处理 `update-pending.json`（与版本是否变化无关地决定是否恢复采集器）。
+#[must_use]
+pub fn decide_marker_outcome(
+    marker: &PendingMarker,
+    current_version: &str,
+    collector_reachable: bool,
+) -> MarkerOutcomeDecision {
+    let outcome = if marker.from_version == current_version {
+        UpdateAppliedOutcome::NotApplied
+    } else {
+        UpdateAppliedOutcome::Applied
+    };
+    let should_restore = marker.collector_was_running && !collector_reachable;
+    MarkerOutcomeDecision {
+        outcome,
+        should_restore,
+    }
 }
 
 /// 由已解析的 Release + 当前版本 + 布局标志组装 [`UpdateCheck`]。
@@ -214,11 +253,24 @@ mod tests {
             to_version: "0.5.0".into(),
             collector_was_running: true,
             collector_restored: false,
+            outcome: UpdateAppliedOutcome::Applied,
         };
         let v = serde_json::to_value(&applied).unwrap();
         assert_eq!(v["fromVersion"], "0.4.0");
         assert_eq!(v["collectorWasRunning"], true);
         assert_eq!(v["collectorRestored"], false);
+        assert_eq!(v["outcome"], "applied");
+        let not_applied = UpdateApplied {
+            from_version: "0.4.0".into(),
+            to_version: "0.5.0".into(),
+            collector_was_running: false,
+            collector_restored: true,
+            outcome: UpdateAppliedOutcome::NotApplied,
+        };
+        assert_eq!(
+            serde_json::to_value(&not_applied).unwrap()["outcome"],
+            "not_applied"
+        );
 
         // 全部枚举值 round-trip
         for reason in [
@@ -270,5 +322,35 @@ mod tests {
         assert!(!same.has_update);
         assert!(!same.installable);
         assert!(same.block_reason.is_none());
+    }
+
+    fn sample_marker(from: &str, was_running: bool) -> PendingMarker {
+        PendingMarker {
+            from_version: from.into(),
+            to_version: "0.5.0".into(),
+            collector_was_running: was_running,
+            created_at: "2026-10-16T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn decide_marker_outcome_version_x_reachable_x_was_running() {
+        // 版本变 / 未变 × 可达 / 不可达 × was_running 真 / 假
+        let cases = [
+            // (from, current, was_running, reachable, expect_outcome, expect_restore)
+            ("0.4.0", "0.5.0", true, true, UpdateAppliedOutcome::Applied, false),
+            ("0.4.0", "0.5.0", true, false, UpdateAppliedOutcome::Applied, true),
+            ("0.4.0", "0.5.0", false, true, UpdateAppliedOutcome::Applied, false),
+            ("0.4.0", "0.5.0", false, false, UpdateAppliedOutcome::Applied, false),
+            ("0.4.0", "0.4.0", true, true, UpdateAppliedOutcome::NotApplied, false),
+            ("0.4.0", "0.4.0", true, false, UpdateAppliedOutcome::NotApplied, true),
+            ("0.4.0", "0.4.0", false, true, UpdateAppliedOutcome::NotApplied, false),
+            ("0.4.0", "0.4.0", false, false, UpdateAppliedOutcome::NotApplied, false),
+        ];
+        for (from, current, was_running, reachable, outcome, restore) in cases {
+            let d = decide_marker_outcome(&sample_marker(from, was_running), current, reachable);
+            assert_eq!(d.outcome, outcome, "from={from} current={current} was={was_running} reach={reachable}");
+            assert_eq!(d.should_restore, restore, "from={from} current={current} was={was_running} reach={reachable}");
+        }
     }
 }
