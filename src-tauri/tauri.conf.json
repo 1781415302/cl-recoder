@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CL Recoder",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "identifier": "com.clrecoder.app",
   "build": {
-    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeDevCommand": { "script": "npm --prefix ui run dev", "cwd": ".." },
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ui run build",
+    "beforeBuildCommand": { "script": "npm --prefix ui run build", "cwd": ".." },
     "frontendDist": "../ui/dist"
   },
   "app": {
