@@ -25,6 +25,7 @@ pub mod live_input;
 pub mod mouse_motion;
 pub mod overview;
 pub mod settings;
+pub mod update;
 pub mod wp;
 
 use rusqlite::Connection;
@@ -108,6 +109,10 @@ pub fn handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         diagnostics::open_diagnostics_directory,
         // hardening-v4：只读提示（schema 过新横幅 / 旧安装迁移提示；前端无参数）
         app_notices::get_app_notices,
+        // PLAN §4.5：应用内更新（检查 / 安装流水线 / 状态轮询）
+        update::update_check,
+        update::update_install,
+        update::update_status,
     ]
 }
 

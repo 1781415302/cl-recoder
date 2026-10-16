@@ -555,6 +555,7 @@ dependencies = [
  "clrecoder-core",
  "clrecoder-diagnostics",
  "clrecoder-store",
+ "clrecoder-update",
  "dirs 6.0.0",
  "rusqlite",
  "serde",
@@ -624,6 +625,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "clrecoder-update"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

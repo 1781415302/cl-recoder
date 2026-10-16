@@ -12,6 +12,7 @@
 //! 采集器故障隔离（§1）：退出/隐藏 GUI 绝不影响采集进程；托盘"暂停-恢复"只通过
 //! 控制管道（§4.4）转发，管道不可达时打开主窗口给引导态而非报错。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 /// GUI 侧调试日志（§9.2 / §4.1-S1 适配）：stderr 部分沿用原诊断习惯——仅设置
 /// `CLRECODER_DEBUG` 环境变量时输出（与 collector 的 debug_log! 同策略）；同时把消息
@@ -60,6 +61,21 @@ const ID_QUIT: &str = "quit";
 fn show_main(app: &tauri::AppHandle) {
     webview_recovery::show(app);
 }
+
+
+/// 退出 GUI 的共用收尾（托盘「退出」与更新流水线 `launched` 共用，PLAN §4.5）。
+/// 顺序固定：webview_recovery::stopping → service.stopped → cleanup_before_exit → exit(0)。
+pub(crate) fn quit_gui_for_update(app: &tauri::AppHandle) {
+    webview_recovery::stopping(app);
+    commands::diagnostics::record_gui_event(
+        clrecoder_diagnostics::Level::Info,
+        "service.stopped",
+        "GUI 已退出",
+    );
+    app.cleanup_before_exit();
+    app.exit(0);
+}
+
 
 /// 探测 collector 是否处于暂停（`None` = 管道不可达，即未运行，§5.1）。
 fn query_paused() -> Option<bool> {
@@ -188,6 +204,12 @@ fn main() {
             // 防止同角色两个进程争轮转；AppState::new 里的 gui_log! 因此可被持久化适配。
             app.manage(commands::diagnostics::init_gui_diagnostics());
             app.manage(state::AppState::new());
+            // PLAN §4.7：托管更新运行态；诊断初始化之后消费 update-pending 标记。
+            {
+                let update_rt = commands::update::UpdateRuntime::default();
+                commands::update::process_startup_marker(&update_rt);
+                app.manage(update_rt);
+            }
             // S4b（§4.4）：共享 LiveInputClient——所有命令同一连接锁；最后 Arc 释放才 Drop。
             app.manage(std::sync::Arc::new(crate::live_input::LiveInputClient::new()));
             // S3（§4.4）：UI 活动状态（初始 revision=0/inactive），事件 + get_ui_activity 共用。
@@ -270,15 +292,9 @@ fn main() {
                     ID_TOGGLE_PAUSE => spawn_toggle_pause(app.clone(), pause_for_menu.clone()),
                     ID_AUTOSTART => toggle_gui_autostart(app, &autostart_for_menu),
                     ID_QUIT => {
-                        webview_recovery::stopping(app);
-                        commands::diagnostics::record_gui_event(
-                            clrecoder_diagnostics::Level::Info,
-                            "service.stopped",
-                            "GUI 已退出",
-                        );
                         // 退出仅结束 GUI；采集器是独立进程继续统计（§1 故障隔离）。
-                        app.cleanup_before_exit();
-                        app.exit(0);
+                        // 与更新流水线 launched 共用 quit_gui_for_update（PLAN §4.5）。
+                        quit_gui_for_update(app);
                     }
                     _ => {}
                 })

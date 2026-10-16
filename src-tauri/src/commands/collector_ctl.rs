@@ -196,6 +196,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
     let name = PCWSTR::from_raw(name_wide.as_ptr());
 
     let open = || -> windows::core::Result<HANDLE> {
+        // SAFETY: wide/name 在调用期间存活；成功句柄由本路径 CloseHandle 或移交包装类型。
         unsafe {
             CreateFileW(
                 name,
@@ -214,6 +215,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
         Err(e) => {
             let code = e.code();
             if code == ERROR_PIPE_BUSY.to_hresult() {
+                // SAFETY: wide/name 在调用期间存活；仅等待现有实例，不持有返回句柄。
                 if !unsafe { WaitNamedPipeW(name, CTL_TIMEOUT.as_millis() as u32) }.as_bool() {
                     return Err(CtlError {
                         kind: PipeFailureKind::Busy,
@@ -235,6 +237,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
 
     // HANDLE → 属主 File：后续读写全走 std::io；File Drop = CloseHandle（不重复关闭）
     let mut file =
+        // SAFETY: handle 为刚打开的管道句柄；mode 指向本栈 PIPE_READMODE_* 值。
         unsafe { std::fs::File::from_raw_handle(handle.0 as std::os::windows::io::RawHandle) };
 
     let result = (|| -> Result<CtlResponse, CtlError> {
@@ -295,6 +298,7 @@ fn raw_exchange(line: &str) -> Result<CtlResponse, CtlError> {
 fn set_pipe_byte_mode(handle: windows::Win32::Foundation::HANDLE) -> windows::core::Result<()> {
     use windows::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_BYTE};
     let mode = PIPE_READMODE_BYTE;
+    // SAFETY: handle 为刚打开的管道句柄；mode 指向本栈 PIPE_READMODE_* 值。
     unsafe { SetNamedPipeHandleState(handle, Some(&mode), None, None) }
 }
 
@@ -336,7 +340,7 @@ fn exchange_with_timeout(
 }
 
 /// typed 控制请求（§4.2 新私有入口）：500ms 守护 + typed 错误。
-fn ctl_request_typed(req: &CtlRequest) -> Result<CtlResponse, CtlError> {
+pub(crate) fn ctl_request_typed(req: &CtlRequest) -> Result<CtlResponse, CtlError> {
     let line = encode_request_line(req).map_err(|m| CtlError {
         kind: PipeFailureKind::Protocol,
         message: m,
@@ -401,7 +405,7 @@ fn status_dto_from_failure(
 // ---------------------------------------------------------------------------
 
 /// PS 字符串单引号转义（'' 表示字面单引号）。
-fn ps_quote(s: &str) -> String {
+pub(crate) fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -570,7 +574,7 @@ pub(crate) fn script_candidates(
 
 /// 定位脚本。hardening-v4 §4.2.4：发布版不搜索 CWD（提权脚本不得来自可被替换的当前目录），
 /// 仅调试构建保留 CWD 候选；用 `cfg!` 保持两种构建都编译同一代码路径。
-fn find_script(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_script(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
     let cwd = std::env::current_dir().ok();
     script_candidates(
@@ -616,7 +620,7 @@ fn normalize_win_path(p: &str) -> String {
 }
 
 /// `path` 是否位于 `dir` 之下（按分隔符边界，大小写不敏感）。
-fn win_path_is_under(path: &str, dir: &str) -> bool {
+pub(crate) fn win_path_is_under(path: &str, dir: &str) -> bool {
     let (p, d) = (normalize_win_path(path), normalize_win_path(dir));
     !d.is_empty() && p.len() > d.len() && p.starts_with(&d) && p.as_bytes()[d.len()] == b'\\'
 }
@@ -754,7 +758,7 @@ fn collector_exe_path() -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 /// `schtasks /Run` 拉起计划任务（无 UAC；任务 /RL HIGHEST 以最高权限运行）。
-fn run_scheduled_task_now() -> bool {
+pub(crate) fn run_scheduled_task_now() -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new("schtasks")
@@ -766,7 +770,7 @@ fn run_scheduled_task_now() -> bool {
 }
 
 /// 轮询等待 collector 管道就绪（启动后进程初始化需要时间，不能只看命令退出码）。
-fn wait_collector_running(timeout: Duration) -> bool {
+pub(crate) fn wait_collector_running(timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if matches!(

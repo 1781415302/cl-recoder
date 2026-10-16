@@ -357,6 +357,7 @@ fn bind_events(window: &WebviewWindow, epoch: u64) {
             if let Some(args) = args {
                 let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED;
                 // COM 回调参数只在此线程读取；向恢复线程仅传递数字/字符串和 AppHandle。
+                // SAFETY: args 为 WebView2 ProcessFailed 事件参数 COM 指针，回调期间由宿主保持有效。
                 unsafe {
                     args.ProcessFailedKind(&mut kind)?;
                 }
@@ -380,6 +381,7 @@ fn bind_events(window: &WebviewWindow, epoch: u64) {
         }));
         let mut token = 0;
         // WebView2 持有注册后的回调；销毁 controller 时随窗口一起释放。
+        // SAFETY: platform.controller() 返回的控制器在此调用期间有效；COM 方法按 WebView2 契约调用。
         let result = unsafe {
             platform
                 .controller()

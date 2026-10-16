@@ -26,6 +26,7 @@
 //! 模块边界（PLAN §2.5 禁止耦合清单）：collector 不做键名翻译、不知道 WhatPulse 存在、
 //! 无 UI、无网络。
 
+#![warn(clippy::undocumented_unsafe_blocks)]
 mod app_time;
 mod apps;
 mod device;
@@ -103,6 +104,7 @@ fn main() {
 fn hide_console_window() {
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    // SAFETY: GetConsoleWindow 返回本控制台 HWND（可能无效）；仅在 is_invalid 为假时 ShowWindow(SW_HIDE)。
     unsafe {
         let hwnd = GetConsoleWindow();
         if !hwnd.is_invalid() {
@@ -335,6 +337,7 @@ fn acquire_single_instance() -> Result<Option<SingleInstanceGuard>, String> {
     let handle = unsafe { CreateMutexW(None, false, &name) }.map_err(|e| e.to_string())?;
     // CreateMutexW 对"已存在"仍返回有效句柄，以 ERROR_ALREADY_EXISTS 区分（首个实例的
     // GetLastError 值不受 windows crate Ok 路径影响）。
+    // SAFETY: 紧接 CreateMutexW 之后读取线程 last-error；期间无其他 Win32 调用插入。
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         // SAFETY: handle 为本调用刚创建的有效句柄，立即关闭放弃。
         unsafe {
@@ -419,6 +422,7 @@ fn init_logger() {
 
 /// 实时会话 ID（§4.1：PID:启动 unix µs；每次 collector 启动不同）。
 fn live_session_id() -> String {
+    // SAFETY: 只读查询当前进程 PID，无句柄需要释放。
     let pid = unsafe { GetCurrentProcessId() };
     let unix_us = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),

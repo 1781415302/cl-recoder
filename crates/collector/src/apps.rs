@@ -97,7 +97,7 @@ pub fn spawn(tx: Sender<AggEvent>, fg: Arc<Mutex<FgState>>) -> JoinHandle<()> {
 
 /// 注册钩子并发送初始快照，然后驱动消息循环（仅 apps 线程调用一次）。
 fn run_message_loop() {
-    // SAFETY：仅在 apps 线程调用一次；钩子回调与本消息循环同线程（WINEVENT_OUTOFCONTEXT
+    // SAFETY: 仅在 apps 线程调用一次；钩子回调与本消息循环同线程（WINEVENT_OUTOFCONTEXT
     // + hmod=None 时事件经注册线程的消息队列投递）。
     let hook = unsafe {
         SetWinEventHook(
@@ -123,6 +123,7 @@ fn run_message_loop() {
     let mut msg = MSG::default();
     loop {
         // GetMessageW 返回值：0=WM_QUIT，-1=错误；禁止用 as_bool() 判断（-1 会被当真值死循环）。
+        // SAFETY: msg 为本线程栈上 MSG；hwnd 过滤为 None 表示本线程队列；调用方保证消息泵线程存活。
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         if r.0 <= 0 {
             if r.0 < 0 {
@@ -130,13 +131,14 @@ fn run_message_loop() {
             }
             break;
         }
+        // SAFETY: msg 刚由 GetMessageW 成功取出；在本线程消息泵内分发。
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 
-    // SAFETY：hook 由本线程刚注册成功且尚未被反注册。
+    // SAFETY: hook 由本线程刚注册成功且尚未被反注册。
     let _ = unsafe { UnhookWinEvent(hook) };
 }
 
@@ -145,11 +147,13 @@ fn run_message_loop() {
 /// 解析成功与否都**无条件**上报一次（force=true）：调用方（S9）构造的 FgState 初始 exe
 /// 只是占位，aggregator 需要这条事件把归属时间轴正式启动。
 fn emit_initial_foreground() {
+    // SAFETY: 仅查询当前前台窗口 HWND；返回值可能无效，调用方随即 is_invalid 校验。
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.is_invalid() {
         log::debug!("启动时无前台窗口（如无交互会话），等待首个 EVENT_SYSTEM_FOREGROUND");
         return;
     }
+    // SAFETY: hwnd 为刚取得的前台窗口；resolve 内部 OpenProcess 句柄在返回前关闭。
     let exe = unsafe { resolve_foreground_exe(hwnd) };
     let Some(ctx) = HOOK_CTX.get() else { return };
     apply_foreground(&ctx.fg, exe, true);
@@ -204,7 +208,7 @@ fn apply_foreground(fg: &Mutex<FgState>, exe: String, force: bool) {
 /// `hwnd` 必须是有效的窗口句柄；本函数仅做只读系统查询。
 unsafe fn resolve_foreground_exe(hwnd: HWND) -> String {
     let mut pid = 0u32;
-    // SAFETY：hwnd 有效性已由调用方保证。
+    // SAFETY: hwnd 有效性已由调用方保证。
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let top_image = if pid == 0 {
         None
@@ -219,6 +223,7 @@ unsafe fn resolve_foreground_exe(hwnd: HWND) -> String {
         .and_then(lowercase_basename)
         .is_some_and(|b| b == UWP_FRAME_HOST);
     let child_image = if is_frame_host {
+        // SAFETY: pid 来自 CoreWindow 子窗口查询；query_process_image 内 OpenProcess 句柄返回前关闭。
         pid_of_core_window_child(hwnd).and_then(|pid| unsafe { query_process_image(pid) })
     } else {
         None
@@ -271,11 +276,11 @@ fn lowercase_basename(path: &str) -> Option<String> {
 /// # Safety
 /// 仅做只读系统查询；`pid` 可为任意进程 id（无有效性前提）。
 unsafe fn query_process_image(pid: u32) -> Option<String> {
-    // SAFETY：只读查询；句柄在查询后立即关闭。
+    // SAFETY: 只读查询；句柄在查询后立即关闭。
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
     let mut buf = [0u16; 2048]; // 远大于常规可执行路径，溢出按失败归 "unknown"
     let mut len = buf.len() as u32;
-    // SAFETY：buf 为调用方栈上缓冲，len 为其容量（字符数）。
+    // SAFETY: buf 为调用方栈上缓冲，len 为其容量（字符数）。
     let r = unsafe {
         QueryFullProcessImageNameW(
             handle,
@@ -284,6 +289,7 @@ unsafe fn query_process_image(pid: u32) -> Option<String> {
             &mut len,
         )
     };
+    // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
     let _ = unsafe { CloseHandle(handle) };
     if r.is_err() {
         return None;
@@ -304,7 +310,7 @@ unsafe fn query_process_image(pid: u32) -> Option<String> {
 /// `host` 必须是有效的窗口句柄。
 unsafe fn pid_of_core_window_child(host: HWND) -> Option<u32> {
     let mut pid: u32 = 0;
-    // SAFETY：回调仅读取类名/进程 id 并写入本函数栈上的输出槽。
+    // SAFETY: 回调仅读取类名/进程 id 并写入本函数栈上的输出槽。
     let _ = unsafe {
         EnumChildWindows(
             Some(host),
@@ -326,9 +332,11 @@ unsafe extern "system" fn enum_core_child_proc(hwnd: HWND, lparam: LPARAM) -> BO
         return BOOL(0);
     }
     let mut buf = [0u16; 256]; // 窗口类名上限 256
+    // SAFETY: hwnd 有效；pid 指向本栈 u32，由系统写入。
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == UWP_CORE_WINDOW_CLASS {
         let mut pid = 0u32;
+        // SAFETY: hwnd 有效；pid 指向本栈 u32，由系统写入。
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         if pid != 0 {
             *slot = pid;
@@ -458,6 +466,7 @@ mod tests {
     fn query_own_process_image_smoke() {
         // 查询自身进程：OpenProcess+QueryFullProcessImageNameW 链路在本机真实可用，
         // 且结果经 lowercase_basename 归一化后与 std::env::current_exe 的 basename 一致。
+        // SAFETY: hwnd/pid 来自刚查询的前台窗口或进程；内部 OpenProcess 句柄在函数返回前关闭。
         let img = unsafe { query_process_image(std::process::id()) }.expect("查询自身镜像路径失败");
         let base = lowercase_basename(&img).expect("自身镜像路径应含 basename");
         let exe = std::env::current_exe().expect("current_exe 不可用");

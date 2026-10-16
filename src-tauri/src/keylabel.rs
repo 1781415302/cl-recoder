@@ -110,10 +110,13 @@ fn query_key_name(sc: u16) -> String {
     }
     // 第 2 次：MapVirtualKeyExW 求 VK（扩展键在 uCode 里以 0x100 位表达），
     // 用 VK 回查规范扫描码再取一次名——兜个别键扩展标志/扫描码表达不一致的情况。
+    // SAFETY: hkl 来自 GetKeyboardLayout；仅做扫码/VK 换算，无句柄所有权转移。
     let hkl = unsafe { GetKeyboardLayout(0) }; // GUI 线程 = 当前用户布局
     let sc_for_map = make | (u32::from(e0) * 0x100);
+    // SAFETY: hkl 来自 GetKeyboardLayout；仅做扫码/VK 换算，无句柄所有权转移。
     let vk = unsafe { MapVirtualKeyExW(sc_for_map, MAPVK_VSC_TO_VK_EX, Some(hkl)) };
     if vk != 0 {
+        // SAFETY: hkl 来自 GetKeyboardLayout；仅做扫码/VK 换算，无句柄所有权转移。
         let canonical = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, Some(hkl)) };
         if canonical != 0 && (canonical & 0xFF) != 0 {
             let name2 = get_key_name_text(canonical & 0xFF, e0);
@@ -138,6 +141,7 @@ fn get_key_name_text(make: u32, extended: bool) -> String {
         lparam |= 0x0100_0000;
     }
     let mut buf = [0u16; 64];
+    // SAFETY: lparam 按 API 编码扫码；buf 在调用期间存活，返回写入长度。
     let n = unsafe { GetKeyNameTextW(lparam, &mut buf) };
     if n <= 0 {
         String::new()

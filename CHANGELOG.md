@@ -34,6 +34,20 @@
 - 删除未使用的 `TopBarChart` 组件；取消对 `output/playwright/*.png` 截图的 Git 追踪并移除仓库内副本。
 - 新增 GitHub Actions CI（`frontend` / `rust` / `scripts` 三个 job）。
 
+### 应用内更新
+
+- 设置页新增「软件更新」：手动检查 GitHub Release，确认后下载、校验、停止采集器、备份统计库并以一次 UAC 拉起安装包（被动更新）；安装完成后自动重开 GUI 并尝试拉起采集器。
+- 仅安装版布局（程序位于 `%ProgramFiles%` 下）可自动安装；便携版只提供打开发布页。不启动自动检查、不后台轮询。
+- 完整性依赖 Release 资产的 GitHub `digest`（sha256）；缺失或不符时不提供自动安装。`digest` 不能防发布账号被攻破；发布物仍未代码签名。
+- 资产名约定 `CL-Recoder-<ver>-windows-x64-setup.exe`。纯逻辑在 `clrecoder-update` crate（Linux 可测），Windows 胶水与设置页 UI 接线完成。
+
+### 整改
+
+- 为既有 `unsafe` 块补充具体 `// SAFETY:` 不变量说明，并在 collector / GUI 主 crate 启用 `clippy::undocumented_unsafe_blocks` 警告。
+- 导出路径用 `enum_wire_name` 取代非测试代码中的 `unwrap`，单测对齐四类枚举线格式。
+- 将 `theme.css` 按原分节拆为 `ui/src/styles/NN-*.css`，构建产物 CSS 与拆分前逐字节一致。
+- 前端接入 eslint（flat config）与 vitest；CI frontend job 在 typecheck 后增加 `lint`。
+
 ### 兼容保留
 
 - 控制协议、脚本、按钮编码、暂停/恢复、窗口活动、DPI、鼠标距离、摇杆 R 行程与热力、日期查询、WhatPulse、明细与导出均保持原口径。

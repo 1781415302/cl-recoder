@@ -83,6 +83,8 @@ export function useLiveInput(
       target,
       systemLiveClock.nowMs(),
     );
+  // pulseTick 故意列入依赖：到期定时器触发时强制重算投影（input 可能未变）
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- pulseTick 有意触发重算
   }, [shouldRun, target, targetKey, input, pulseTick]);
 
   // 独立 pulse 到期定时器（即使下一笔快照仍在等待）

@@ -1,0 +1,119 @@
+/* ---------- 图表 ---------- */
+.legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.legend[aria-pressed="false"] {
+  opacity: 0.55;
+}
+.legend strong {
+  color: var(--text);
+}
+.legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.chart-focus {
+  border-radius: var(--radius-sm);
+}
+.chart-focus:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.chart-empty {
+  display: grid;
+  place-items: center;
+  height: 160px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 13px;
+}
+.chart-tip {
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+  font-size: 13px;
+}
+.chart-tip-label {
+  margin-bottom: 4px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.chart-tip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  font-weight: 600;
+}
+
+/* 排行 */
+.rank {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.rank-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+.rank-no {
+  color: var(--text-3);
+  font-size: 12.5px;
+  font-weight: 650;
+  text-align: right;
+}
+.rank-row[data-top] .rank-no {
+  color: var(--accent);
+  font-weight: 800;
+}
+.rank-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rank-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.rank-value {
+  flex: none;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.rank-track {
+  display: block;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.rank-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  opacity: 0.5;
+}
+.rank-row[data-top] .rank-fill {
+  opacity: 1;
+}
+

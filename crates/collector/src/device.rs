@@ -277,6 +277,7 @@ fn registry_device_name(info: &HidPathInfo) -> Option<String> {
 
 /// 打开单个实例键并读 `FriendlyName` → `DeviceDesc`。
 fn read_name_from_key(subkey: &str) -> Option<String> {
+    // SAFETY: path/HSTRING 在调用期间存活；hkey 由系统写出，成功后由本函数 RegCloseKey 关闭。
     unsafe {
         let mut hkey = HKEY::default();
         let status = RegOpenKeyExW(
@@ -307,6 +308,7 @@ fn read_friendly_or_desc(hkey: HKEY) -> Option<String> {
 
 /// 读取 REG_SZ（兼容 REG_EXPAND_SZ，不展开环境变量）字符串值。
 fn read_sz_value(hkey: HKEY, value_name: &str) -> Option<String> {
+    // SAFETY: hkey 本段已打开且未关闭；name 与输出缓冲在调用期间存活，size 由系统回填。
     unsafe {
         let name = HSTRING::from(value_name);
         let mut vtype = REG_VALUE_TYPE::default();
@@ -344,6 +346,7 @@ fn read_sz_value(hkey: HKEY, value_name: &str) -> Option<String> {
 /// 枚举注册表键的子键名（上限 32，防异常键面拖慢解析；失败/无子键返回空）。
 fn enum_subkeys(subkey: &str) -> Vec<String> {
     const MAX_SUBKEYS: u32 = 32;
+    // SAFETY: path/HSTRING 在调用期间存活；hkey 由系统写出，成功后由本函数 RegCloseKey 关闭。
     unsafe {
         let mut hkey = HKEY::default();
         let status = RegOpenKeyExW(
@@ -441,6 +444,7 @@ impl AlignedNameBuffer {
         //   视图严格取前 N 个码元，不越出已分配区、不暴露 padding；
         // - 独占：`&mut self` 保证调用期间不与底层 `words` 同时使用；调用方（Win32
         //   adapter）在 API 返回前不得释放/移动/resize 该缓冲。
+        // SAFETY: words 缓冲容量覆盖 logical_chars 个 u16；指针来自同一 Vec 且调用期间不重分配。
         unsafe {
             std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u16, self.logical_chars)
         }
@@ -498,6 +502,7 @@ fn read_device_name_with(
 /// 分配/重试/解析统一走 [`read_device_name_with`]，生产与回归共用同一 helper。
 fn raw_input_device_name(hdevice: HANDLE) -> Option<String> {
     read_device_name_with(
+        // SAFETY: hdevice 来自 raw input 事件，调用期间保持有效；探测调用 pData=None。
         || unsafe {
             // SAFETY: hdevice 来自 raw input 事件，调用期间保持有效；探测调用 pData=None。
             let mut size: u32 = 0;
@@ -509,6 +514,7 @@ fn raw_input_device_name(hdevice: HANDLE) -> Option<String> {
                 Some(size)
             }
         },
+        // SAFETY: buf 来自 AlignedNameBuffer::as_utf16_mut，逻辑长度 N 已零初始化；；pcbSize 只以切片 len 设置输入容量；指针指向该切片有效存储；；API 完成前拥有型缓冲区不释放、不移动、不 resize；此处不同时借用 words。
         |buf| unsafe {
             // SAFETY:
             // - buf 来自 AlignedNameBuffer::as_utf16_mut，逻辑长度 N 已零初始化；
@@ -1190,6 +1196,7 @@ mod tests {
     /// 独立参考读取（S2 native 冒烟共用）：足够大的 DWORD 对齐缓冲 + 尾部 canary。
     /// 只读查询，不注册 Raw Input、不启动采集、不输出设备路径。
     fn reference_device_name(hdevice: HANDLE) -> Option<String> {
+        // SAFETY: hdevice 来自 GetRawInputDeviceList 枚举；探测 pData=None。
         unsafe {
             // SAFETY: hdevice 来自 GetRawInputDeviceList 枚举；探测 pData=None。
             let mut probe: u32 = 0;
@@ -1244,6 +1251,7 @@ mod tests {
     #[test]
     #[ignore = "真实 Win32 只读验证（S2 关卡）；默认 cargo test 不执行"]
     fn collector_heap_native_name_read_smoke() {
+        // SAFETY: GetRawInputDeviceList 只读枚举；cbSize 取自本 crate 使用的类型布局。
         unsafe {
             // SAFETY: GetRawInputDeviceList 只读枚举；cbSize 取自本 crate 使用的类型布局。
             let cb_size = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;

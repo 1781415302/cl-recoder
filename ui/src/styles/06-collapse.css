@@ -1,0 +1,57 @@
+/* ---------- 折叠 ---------- */
+.fold {
+  padding: 0;
+}
+.fold-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  list-style: none;
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.fold-summary::-webkit-details-marker {
+  display: none;
+}
+.fold-summary:hover {
+  background: var(--surface-2);
+}
+.fold-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.fold-title {
+  color: var(--text-2);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.fold-chevron {
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+.fold[open] > .fold-summary .fold-chevron {
+  transform: rotate(180deg);
+}
+.fold-body {
+  padding: 0 20px 20px;
+}
+.fold--flat {
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.fold--flat .fold-summary {
+  padding: 12px 0;
+  border-radius: 0;
+}
+.fold--flat .fold-summary:hover {
+  background: transparent;
+}
+.fold--flat .fold-body {
+  padding: 0 0 4px;
+}
+

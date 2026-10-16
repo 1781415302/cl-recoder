@@ -1,0 +1,65 @@
+/* ---------- 表格 ---------- */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+.table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13.5px;
+}
+.table th {
+  padding: 8px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.table td {
+  padding: 9px 14px;
+  border-top: 1px solid var(--line);
+}
+.table tbody tr:first-child td {
+  border-top: 0;
+}
+.table tbody tr:hover td {
+  background: var(--surface-2);
+}
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+}
+.th-sort:hover,
+.th-sort[aria-pressed="true"] {
+  color: var(--text);
+}
+th[style*="right"] .th-sort {
+  flex-direction: row-reverse;
+}
+.app-exe {
+  margin-left: 8px;
+  color: var(--text-3);
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.pager .hint {
+  margin: 0;
+}
+

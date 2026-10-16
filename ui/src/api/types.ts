@@ -296,9 +296,11 @@ export interface GamepadMotionSummary {
   triggers: GamepadTriggerSummary;
 }
 
-/** hardening-v4：只读提示（get_app_notices）。schemaTooNew 非空时显示红色横幅。 */
+/** hardening-v4 + 更新：只读提示（get_app_notices）。见文件末尾 UpdateApplied 之后的完整 AppNotices。 */
 export interface AppNotices {
   schemaTooNew: { found: number; supported: number } | null;
+  /** 启动后读取 update-pending 得到；无则为 null */
+  updateApplied: UpdateApplied | null;
 }
 
 /** hardening-v4 §4.2.1：旧按用户安装位置的只读迁移提示（get_legacy_install_hints；
@@ -437,4 +439,75 @@ export interface LiveInputState {
   state: "off" | "connecting" | "ready" | "unavailable";
   reply: LiveSnapshotReply | null;
   receivedAtMs: number | null;
+}
+
+/* ===== 应用内更新（cl-recoder-update-plan §4.4；DTO camelCase，枚举 snake_case） ===== */
+
+/** 阻断自动安装的原因 */
+export type UpdateBlockReason =
+  | "portable_layout"
+  | "asset_missing"
+  | "digest_missing"
+  | "asset_too_large";
+
+/** update_check 返回：最新 Release 与是否可自动安装 */
+export interface UpdateCheck {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseUrl: string;
+  publishedAt: string | null;
+  /** 纯文本，≤4000 字符；前端只能当文本节点渲染 */
+  notes: string;
+  assetSize: number | null;
+  installable: boolean;
+  blockReason: UpdateBlockReason | null;
+}
+
+export type UpdatePhase =
+  | "idle"
+  | "downloading"
+  | "verifying"
+  | "stopping_collector"
+  | "backing_up"
+  | "launching"
+  | "launched"
+  | "failed";
+
+export type UpdateErrorCode =
+  | "busy"
+  | "not_installed_layout"
+  | "version_changed"
+  | "curl_missing"
+  | "network"
+  | "http_status"
+  | "size_mismatch"
+  | "digest_mismatch"
+  | "disk"
+  | "collector_stop_failed"
+  | "backup_failed"
+  | "uac_cancelled"
+  | "launch_failed";
+
+export interface UpdateStatus {
+  phase: UpdatePhase;
+  receivedBytes: number;
+  totalBytes: number | null;
+  errorCode: UpdateErrorCode | null;
+  /** 中文，可直接展示 */
+  message: string | null;
+  /** failed 且更新前采集器在运行时：回滚是否成功 */
+  collectorRestored: boolean | null;
+}
+
+/** 启动标记消费结果：版本是否已变化 */
+export type UpdateAppliedOutcome = "applied" | "not_applied";
+
+/** 启动后「更新已完成 / 未完成」提示（get_app_notices.updateApplied） */
+export interface UpdateApplied {
+  fromVersion: string;
+  toVersion: string;
+  collectorWasRunning: boolean;
+  collectorRestored: boolean;
+  outcome: UpdateAppliedOutcome;
 }

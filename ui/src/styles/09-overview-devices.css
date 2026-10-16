@@ -1,0 +1,316 @@
+/* ---------- 总览：设备列表 ---------- */
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.device-row {
+  --tone: var(--accent);
+  --tone-soft: var(--accent-soft);
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto 18px;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  text-align: left;
+}
+.device-row[data-kind="keyboard"] {
+  --tone: var(--kb);
+  --tone-soft: var(--kb-soft);
+}
+.device-row[data-kind="mouse"] {
+  --tone: var(--ms);
+  --tone-soft: var(--ms-soft);
+}
+.device-row[data-kind="gamepad"] {
+  --tone: var(--gp);
+  --tone-soft: var(--gp-soft);
+}
+.device-row:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+}
+.device-row-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 13px;
+  background: var(--tone-soft);
+  color: var(--tone);
+}
+.device-row-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  min-width: 0;
+}
+.device-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 650;
+}
+.device-row-meta {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.device-row-track {
+  grid-column: 1 / -1;
+  display: block;
+  height: 4px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.device-row-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--tone);
+}
+.device-row-total {
+  font-size: 19px;
+  font-weight: 750;
+}
+.device-row-unit {
+  margin-left: 3px;
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 500;
+}
+.device-row-go {
+  color: var(--text-3);
+}
+.device-row:hover .device-row-go {
+  color: var(--tone);
+}
+
+/* 设备标签 */
+.devtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.devtab {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.devtab[data-selected="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.devtab-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 8px 6px 8px 14px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.devtab-name {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.devtab-total {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+.devtab[data-selected="true"] .devtab-total {
+  color: var(--accent);
+}
+.devtab-rename {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+}
+.devtab-rename:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.devtab-edit {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.devtab-edit .input-sm {
+  width: 160px;
+}
+
+/* 来源选择 */
+.picker-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px;
+}
+.picker-main {
+  flex: 1 1 340px;
+  min-width: 0;
+}
+.picker-aside {
+  flex: 1 1 300px;
+  min-width: 0;
+}
+.picker {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.picker-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  color: var(--ms);
+  font-size: 13px;
+  font-weight: 700;
+}
+.picker .hint {
+  margin: 0;
+}
+
+/* 指标条 */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+}
+.metric {
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.card .metrics .metric,
+.card.metrics .metric {
+  background: var(--surface-2);
+}
+.metric-label {
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.metric-value {
+  margin-top: 4px;
+  font-size: 28px;
+  font-weight: 750;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.metric-hint {
+  margin-top: 4px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* 鼠标页工作区 */
+.mouse-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 18px;
+  align-items: start;
+}
+
+/* DPI */
+.dpi-panel .card-head {
+  margin-bottom: 10px;
+}
+.dpi-current {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 8px 0 14px;
+}
+.dpi-value {
+  font-size: 30px;
+  font-weight: 750;
+  line-height: 1.1;
+}
+.dpi-readonly {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.dpi-note {
+  margin-top: 8px;
+}
+.dpi-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dpi-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.dpi-guidance {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* 导入报告 */
+.report-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.report--bad {
+  border-color: var(--bad);
+}
+.report-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.report-warnings li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.wp-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+

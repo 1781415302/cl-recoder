@@ -162,6 +162,7 @@ impl HidEndpoint {
         let event = match unsafe { CreateEventW(None, false, false, None) } {
             Ok(event) => event,
             Err(e) => {
+                // SAFETY: handle/token/event 为本路径拥有的有效内核句柄，关闭后不再使用。
                 unsafe {
                     let _ = CloseHandle(handle);
                 }
@@ -577,9 +578,9 @@ fn interface_detail_path(
     set: HDEVINFO,
     ifdata: &SP_DEVICE_INTERFACE_DATA,
 ) -> Result<String, String> {
+    let mut required = 0u32;
     // SAFETY: set/ifdata 来自本函数枚举；probe 调用 detail=None 仅取必需大小
     // （预期以 ERROR_INSUFFICIENT_BUFFER 失败并填充 required）。
-    let mut required = 0u32;
     let _ = unsafe {
         SetupDiGetDeviceInterfaceDetailW(set, ifdata, None, 0, Some(&mut required), None)
     };
@@ -633,8 +634,8 @@ fn has_usb_ancestor(interface_path: &str) -> Result<bool, String> {
             return Ok(true);
         }
         let wide = HSTRING::from(id.as_str());
-        // SAFETY: wide 在调用期间存活；devinst 由本调用写出。
         let mut devinst = 0u32;
+        // SAFETY: wide 在调用期间存活；devinst 由本调用写出。
         let cr = unsafe { CM_Locate_DevNodeW(&mut devinst, &wide, CM_LOCATE_DEVNODE_NORMAL) };
         if cr != CR_SUCCESS {
             return Err(format!("定位父设备节点失败: CONFIGRET {}", cr.0));
@@ -679,9 +680,9 @@ fn interface_property_bytes(
 ) -> Result<Option<Vec<u8>>, String> {
     let wide = HSTRING::from(interface_path);
     let call = |buffer: Option<*mut u8>, size: *mut u32| {
+        let mut property_type = DEVPROPTYPE(0);
         // SAFETY: wide/key 在调用期间存活；buffer/size 由 cm_property_buffer 提供
         // 且在调用期间有效。
-        let mut property_type = DEVPROPTYPE(0);
         unsafe {
             CM_Get_Device_Interface_PropertyW(&wide, key, &mut property_type, buffer, size, 0)
         }
@@ -692,9 +693,9 @@ fn interface_property_bytes(
 /// 读 CM 设备节点属性原始字节（probe → 填充两段式）。
 fn devnode_property_bytes(devinst: u32, key: &DEVPROPKEY) -> Result<Option<Vec<u8>>, String> {
     let call = |buffer: Option<*mut u8>, size: *mut u32| {
+        let mut property_type = DEVPROPTYPE(0);
         // SAFETY: key 在调用期间存活；buffer/size 由 cm_property_buffer 提供且在
         // 调用期间有效；devinst 来自 CM_Locate_DevNodeW。
-        let mut property_type = DEVPROPTYPE(0);
         unsafe { CM_Get_DevNode_PropertyW(devinst, key, &mut property_type, buffer, size, 0) }
     };
     cm_property_buffer(call)

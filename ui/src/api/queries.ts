@@ -137,3 +137,26 @@ export function useGamepadMotion(
     enabled: deviceId !== null && policy.enabled,
   });
 }
+
+/* ===== 应用内更新状态轮询（§4.5：已提交安装后 500ms） ===== */
+
+/** update_status 轮询间隔 */
+export const POLL_UPDATE_MS = 500;
+
+/**
+ * 更新流水线状态。enabled 由调用方按 shouldPollUpdateStatus / installSubmitted 控制；
+ * 活动 gating 仍经 uiQueryPolicy。
+ */
+export function useUpdateStatus(poll: boolean) {
+  const activity = useAppActivity();
+  const policy = uiQueryPolicy(
+    activity.active,
+    poll ? POLL_UPDATE_MS : undefined,
+  );
+  return useQuery({
+    queryKey: ["updateStatus"],
+    queryFn: () => client.updateStatus(),
+    ...policy,
+    enabled: poll && policy.enabled,
+  });
+}
