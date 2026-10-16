@@ -22,7 +22,8 @@ use clrecoder_update::{
 };
 
 use super::collector_ctl::{
-    ctl_request_typed, ps_quote, run_scheduled_task_now, wait_collector_running, win_path_is_under,
+    ctl_request_typed, find_script, ps_quote, run_scheduled_task_now, wait_collector_running,
+    win_path_is_under,
 };
 use super::collector_health::PipeFailureKind;
 
@@ -429,7 +430,7 @@ fn run_installer_elevated(installer: &Path) -> Result<(), (UpdateErrorCode, Stri
 pub(crate) enum CollectorReachability {
     /// Ok 且 resp.ok —— 采集器在跑
     Running,
-    /// Err(NotFound) —— 管道不存在，视为已退出/未运行
+    /// Err(NotFound) —— 管道不存在；跳过停止（不证明进程已退出）
     Gone,
     /// 其它一切（Busy/Timeout/Io/Protocol/AccessDenied、Ok 但 !ok 等）
     Unknown,
@@ -456,22 +457,92 @@ fn probe_collector_status() -> CollectorReachability {
     })
 }
 
-fn wait_collector_unreachable(timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// 运行 `stop-collector.ps1` 的 PowerShell 参数（纯函数；顺序固定）。
+///
+/// `-File` 后路径作为独立参数传入，由 CreateProcess 负责引号，故空格/单引号路径保持原样。
+#[must_use]
+pub(crate) fn stop_collector_ps_args(script_path: &str) -> Vec<String> {
+    vec![
+        "-NoProfile".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-File".into(),
+        script_path.to_string(),
+    ]
+}
+
+const STOP_COLLECTOR_SCRIPT: &str = "stop-collector.ps1";
+const STOP_COLLECTOR_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// 以系统 PowerShell 运行打包的 stop-collector.ps1；仅退出码 0 视为进程已退出。
+///
+/// 管道消失不等于进程退出（Writer/WAL 收尾更晚）；脚本内 WaitForExit 才是依据。
+fn run_stop_collector_script(script: &Path) -> Result<(), (UpdateErrorCode, String)> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let ps = powershell_exe_path();
+    if !ps.is_file() {
+        return Err((
+            UpdateErrorCode::CollectorStopFailed,
+            "未找到系统 PowerShell，无法停止采集器，更新已中止。".into(),
+        ));
+    }
+    let args = stop_collector_ps_args(&script.to_string_lossy());
+    let mut child = std::process::Command::new(&ps)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| {
+            (
+                UpdateErrorCode::CollectorStopFailed,
+                format!("启动 stop-collector.ps1 失败: {e}。更新已中止。"),
+            )
+        })?;
+
+    let deadline = Instant::now() + STOP_COLLECTOR_TIMEOUT;
     loop {
-        match probe_collector_status() {
-            CollectorReachability::Gone => return true,
-            CollectorReachability::Running | CollectorReachability::Unknown => {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let code = status.code().unwrap_or(-1);
+                return Err((
+                    UpdateErrorCode::CollectorStopFailed,
+                    format!("停止采集器失败（退出码 {code}），更新已中止。"),
+                ));
+            }
+            Ok(None) => {
                 if Instant::now() >= deadline {
-                    return false;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err((
+                        UpdateErrorCode::CollectorStopFailed,
+                        "等待采集器退出超时（25 秒），更新已中止。".into(),
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err((
+                    UpdateErrorCode::CollectorStopFailed,
+                    format!("等待 stop-collector.ps1 失败: {e}。更新已中止。"),
+                ));
             }
         }
     }
 }
 
-fn stop_collector_gracefully() -> Result<bool, (UpdateErrorCode, String)> {
+/// 停止采集器：Gone 跳过；Unknown 重试后中止；Running 则跑 stop-collector.ps1。
+///
+/// `Ok(was_running)`；`Err((code, msg, rollback_needed))` —— 已尝试脚本停止时
+/// `rollback_needed=true`（采集器可能已停，需走回滚路径）。
+fn stop_collector_gracefully() -> Result<bool, (UpdateErrorCode, String, bool)> {
     // 先探测：Unknown 间隔 300ms 重试，最多 5 次
     let mut reach = CollectorReachability::Unknown;
     for attempt in 0..5 {
@@ -491,31 +562,24 @@ fn stop_collector_gracefully() -> Result<bool, (UpdateErrorCode, String)> {
             return Err((
                 UpdateErrorCode::CollectorStopFailed,
                 "无法确认采集器状态，更新已中止".into(),
+                false,
             ));
         }
         CollectorReachability::Running => {}
     }
-    match ctl_request_typed(&CtlRequest::Shutdown) {
-        Ok(resp) if resp.ok => {}
-        Ok(_) => {
+
+    let script = match find_script(STOP_COLLECTOR_SCRIPT) {
+        Some(p) => p,
+        None => {
             return Err((
                 UpdateErrorCode::CollectorStopFailed,
-                "采集器拒绝停止，更新已中止（采集器仍在运行）。".into(),
+                "未找到 stop-collector.ps1（应随主程序安装在 scripts\\ 下），更新已中止。".into(),
+                false,
             ));
         }
-        Err(e) => {
-            return Err((
-                UpdateErrorCode::CollectorStopFailed,
-                format!("停止采集器失败: {}。更新已中止。", e.message),
-            ));
-        }
-    }
-    if !wait_collector_unreachable(Duration::from_secs(15)) {
-        return Err((
-            UpdateErrorCode::CollectorStopFailed,
-            "等待采集器退出超时（15 秒），更新已中止（采集器可能仍在运行）。".into(),
-        ));
-    }
+    };
+    // 已 Running：脚本失败时采集器可能已收到 shutdown，需回滚
+    run_stop_collector_script(&script).map_err(|(c, m)| (c, m, true))?;
     Ok(true)
 }
 
@@ -756,9 +820,10 @@ fn run_install_pipeline(app: tauri::AppHandle, rt: &UpdateRuntime, want_version:
     });
     let collector_was_running = match stop_collector_gracefully() {
         Ok(v) => v,
-        Err((code, msg)) => {
+        Err((code, msg, rollback)) => {
+            let restored = rollback_collector_if_needed(rollback);
             drop(locked);
-            mark_fail(rt, code, msg, None);
+            mark_fail(rt, code, msg, restored);
             return;
         }
     };
@@ -919,5 +984,30 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn stop_collector_ps_args_order_and_paths() {
+        let space = stop_collector_ps_args(r"C:\Program Files\CL Recoder\scripts\stop-collector.ps1");
+        assert_eq!(
+            space,
+            vec![
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                r"C:\Program Files\CL Recoder\scripts\stop-collector.ps1",
+            ]
+        );
+        let odd = stop_collector_ps_args(r"C:\odd'name\scripts\stop-collector.ps1");
+        assert_eq!(odd[0], "-NoProfile");
+        assert_eq!(odd[1], "-ExecutionPolicy");
+        assert_eq!(odd[2], "Bypass");
+        assert_eq!(odd[3], "-File");
+        assert_eq!(odd[4], r"C:\odd'name\scripts\stop-collector.ps1");
+        assert_eq!(odd.len(), 5);
+        // 路径保持原样（含空格与单引号），不做 PowerShell 转义
+        assert!(odd[4].contains('\''));
+        assert!(space[4].contains(' '));
     }
 }

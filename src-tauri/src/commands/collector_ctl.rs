@@ -574,7 +574,7 @@ pub(crate) fn script_candidates(
 
 /// 定位脚本。hardening-v4 §4.2.4：发布版不搜索 CWD（提权脚本不得来自可被替换的当前目录），
 /// 仅调试构建保留 CWD 候选；用 `cfg!` 保持两种构建都编译同一代码路径。
-fn find_script(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_script(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
     let cwd = std::env::current_dir().ok();
     script_candidates(
