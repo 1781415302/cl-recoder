@@ -587,8 +587,12 @@ export async function mockStartNow(): Promise<void> {
   state.collectorRunning = true;
   state.startedAt = new Date().toISOString();
 }
-export async function mockSetDeviceNickname(_id: number, _nickname: string | null): Promise<void> {
+export async function mockSetDeviceNickname(id: number, nickname: string | null): Promise<void> {
   await sleep(120);
+  // 精确按 id 查找；不用 profileOf（其找不到时回退到首个设备，会改错行）
+  const profile = PROFILES.find((p) => p.row.id === id);
+  if (!profile) throw new Error("设备不存在");
+  profile.row.nickname = nickname === null ? null : (nickname.trim() || null);
 }
 /** 自有鼠标移动距离：按收到的 [from, to] 逐日生成（可重复 fixture），total = 各日之和 */
 export async function mockMouseDistance(from: string, to: string): Promise<import("./types").MouseDistance> {

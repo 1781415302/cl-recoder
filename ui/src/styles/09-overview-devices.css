@@ -197,6 +197,56 @@
   margin: 0;
 }
 
+/* 型号昵称行内编辑 */
+.nick-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 8px;
+}
+.nick-editor-label {
+  color: var(--text-3);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.nick-editor-value {
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+/* 外观与 .devtab-rename 一致（同值重复声明，不改原规则） */
+.nick-editor-edit {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-3);
+}
+.nick-editor-edit:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.nick-editor .input {
+  width: 160px;
+  max-width: 100%;
+}
+.nick-editor-hint {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+@media (max-width: 600px) {
+  .nick-editor .input {
+    flex: 1 1 160px;
+    width: auto;
+  }
+}
+
 /* 指标条 */
 .metrics {
   display: grid;

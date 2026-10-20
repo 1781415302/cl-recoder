@@ -33,6 +33,7 @@ import {
   type MotionSummaryItem,
 } from "../components/MotionSummary";
 import { MouseSourcePicker } from "../components/MouseSourcePicker";
+import { DeviceNicknameEditor } from "../components/DeviceNicknameEditor";
 import { LiveDeviceControls } from "../components/LiveDeviceControls";
 import { SkeletonCard, SkeletonCards } from "../components/Skeleton";
 import { IconPlug } from "../components/icons";
@@ -530,6 +531,21 @@ export function Mouse() {
     </DetailCard>
   );
 
+  // 改名目标：当前选择对应的鼠标型号行（来源项、型号历史项、needs_upgrade 均按 deviceId）
+  const nickTarget =
+    deviceId === null
+      ? undefined
+      : (devices.data ?? []).find(
+          (d) => d.id === deviceId && d.kind === "mouse",
+        );
+  // 昵称写入后并行失效相关查询并等待刷新
+  const refreshAfterRename = (): Promise<void> =>
+    Promise.all([
+      qc.invalidateQueries({ queryKey: ["devices"] }),
+      qc.invalidateQueries({ queryKey: ["mouseSources"] }),
+      qc.invalidateQueries({ queryKey: ["overview"] }),
+    ]).then(() => undefined);
+
   return (
     <>
       <PageHeader
@@ -557,6 +573,15 @@ export function Mouse() {
                 selection={pickerSelection}
                 onSelect={setPicked}
               />
+              {nickTarget !== undefined ? (
+                <DeviceNicknameEditor
+                  key={deviceId}
+                  deviceId={nickTarget.id}
+                  name={nickTarget.name}
+                  nickname={nickTarget.nickname}
+                  onSaved={refreshAfterRename}
+                />
+              ) : null}
             </div>
             {sources.isError ? (
               <div className="card picker-aside" role="alert">
