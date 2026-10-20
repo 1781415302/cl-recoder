@@ -4,6 +4,7 @@ import type { DeviceRow } from "../api/types";
 import * as client from "../api/client";
 import { IconEdit } from "./icons";
 import { fmtCompact } from "../lib/format";
+import { NICKNAME_MAX, normalizeNickname } from "../lib/nickname";
 
 interface DeviceTabsProps {
   devices: DeviceRow[];
@@ -20,9 +21,8 @@ export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceT
   const [error, setError] = useState<string | null>(null);
 
   async function saveNickname(id: number) {
-    const nick = draft.trim();
     try {
-      await client.setDeviceNickname(id, nick === "" ? null : nick);
+      await client.setDeviceNickname(id, normalizeNickname(draft));
       setEditingId(null);
       setError(null);
       onRenamed?.();
@@ -44,12 +44,13 @@ export function DeviceTabs({ devices, selectedId, onSelect, onRenamed }: DeviceT
                 className="input input-sm"
                 value={draft}
                 autoFocus
-                maxLength={32}
+                maxLength={NICKNAME_MAX}
                 aria-label={`为 ${d.name} 设置昵称`}
                 placeholder={d.name}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void saveNickname(d.id);
+                  // IME 组合输入中的回车用于选词，不提交
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing) void saveNickname(d.id);
                   if (e.key === "Escape") setEditingId(null);
                 }}
               />
