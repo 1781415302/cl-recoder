@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "cl-recoder"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "clrecoder-core",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-collector"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "clrecoder-core",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "serde",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-diagnostics"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "log",
@@ -610,14 +610,14 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "clrecoder-core",
 ]
 
 [[package]]
 name = "clrecoder-store"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "clrecoder-core",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "clrecoder-update"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
